@@ -117,7 +117,6 @@ export interface Settings {
 	branchSummary?: BranchSummarySettings;
 	retry?: RetrySettings;
 	hideThinkingBlock?: boolean;
-	toolDisplay?: "full" | "compact" | "hidden"; // default: "compact" - full shows args and preview, compact one header line, hidden nothing until expanded
 	showCacheMissNotices?: boolean; // default: false - show cache cost and provider recovery notices
 	externalEditor?: string; // Command for Ctrl+G external editor; takes precedence over VISUAL/EDITOR
 	shellPath?: string; // Custom shell path (e.g., for Cygwin users on Windows); supports leading ~ expansion
@@ -1188,10 +1187,6 @@ export class SettingsManager {
 
 	getShowImages(): boolean {
 		return this.settings.terminal?.showImages ?? true;
-	}
-
-	getToolDisplay(): "full" | "compact" | "hidden" {
-		return this.settings.toolDisplay ?? "compact";
 	}
 
 	setShowImages(show: boolean): void {
