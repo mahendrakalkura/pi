@@ -39,17 +39,40 @@ type ModelScope = "all" | "scoped";
 // providers as <owner>-<vendor>. Unlabeled ids sort and display with an empty client column.
 const ACCOUNT_OWNERS = new Set(["jg", "mk", "nr"]);
 const NATURAL_ORDER = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
-// Anthropic model tiers in preferred order, so Claude models sort fable, opus, sonnet, haiku
-// rather than the alphabetical fable, haiku, opus, sonnet.
-const CLAUDE_TIERS = ["fable", "opus", "sonnet", "haiku"];
+// Tier keywords, highest capability first. Ordering applies only between models that share the
+// stem before the keyword, so a family sorts by tier then version while different families keep
+// natural id order (e.g. claude-fable < claude-opus < claude-sonnet < claude-haiku, and
+// gpt-5.6-terra < gpt-5.6-sol < gpt-5.6-luna).
+const TIER_ORDER = [
+	"fable",
+	"opus",
+	"ultra",
+	"astra",
+	"pro",
+	"max",
+	"terra",
+	"sol",
+	"sonnet",
+	"codex",
+	"plus",
+	"luna",
+	"turbo",
+	"flash",
+	"haiku",
+	"mini",
+	"nano",
+	"lite",
+];
 
-function claudeTierRank(id: string): number | undefined {
-	const lower = id.toLowerCase();
-	if (!lower.includes("claude")) return undefined;
-	for (let i = 0; i < CLAUDE_TIERS.length; i++) {
-		if (lower.includes(CLAUDE_TIERS[i])) return i;
+function tierInfo(id: string): { stem: string; tier: number } | undefined {
+	const tokens = id.toLowerCase().split(/[^a-z0-9]+/);
+	let best: { index: number; tier: number } | undefined;
+	for (let i = 0; i < tokens.length; i++) {
+		const tier = TIER_ORDER.indexOf(tokens[i]);
+		if (tier !== -1 && (best === undefined || tier < best.tier)) best = { index: i, tier };
 	}
-	return CLAUDE_TIERS.length;
+	if (!best) return undefined;
+	return { stem: tokens.slice(0, best.index).join(""), tier: best.tier };
 }
 // Rows of the selector that are not table rows: borders, spacers, search input, hint, table head and frame.
 const SELECTOR_CHROME_ROWS = 12;
@@ -252,18 +275,21 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.refreshAbortController.abort();
 	}
 
-	// Client, then vendor, then model. Within the Claude family, tier order (fable, opus, sonnet,
-	// haiku) beats id order; everything else sorts by id in natural order (4-5 before 5, 5.6 before 5.10).
+	// Client, then vendor, then model. Within a family (shared stem before a tier keyword), tier
+	// order beats id order; different families and untiered models sort by id in natural order
+	// (4-5 before 5, 5.6 before 5.10).
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		return [...models].sort((a, b) => {
 			const left = splitProvider(a.provider);
 			const right = splitProvider(b.provider);
-			const leftTier = claudeTierRank(a.id);
-			const rightTier = claudeTierRank(b.id);
+			const leftTier = tierInfo(a.id);
+			const rightTier = tierInfo(b.id);
+			const tierCompare =
+				leftTier && rightTier && leftTier.stem === rightTier.stem ? leftTier.tier - rightTier.tier : 0;
 			return (
 				NATURAL_ORDER.compare(left.client, right.client) ||
 				NATURAL_ORDER.compare(left.vendor, right.vendor) ||
-				(leftTier !== undefined && rightTier !== undefined ? leftTier - rightTier : 0) ||
+				tierCompare ||
 				NATURAL_ORDER.compare(a.id, b.id)
 			);
 		});
@@ -309,8 +335,6 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.updateList();
 	}
 
-	// Every filtered model is rendered as one row of an aligned ASCII table; nothing scrolls and no
-	// per-selection detail line is shown. Errors from the catalog refresh still surface below the table.
 	// A box-drawn table (cli-table3) of the filtered models, windowed to the rows the terminal can show
 	// with the selection kept in view. No per-selection detail line; refresh errors surface below.
 	private updateList(): void {
