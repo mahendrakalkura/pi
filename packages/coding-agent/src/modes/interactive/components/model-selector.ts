@@ -14,7 +14,7 @@ import { refreshModelCatalogs } from "../model-catalog-refresh.ts";
 import { getModelSelectorSearchText } from "../model-search.ts";
 import { theme } from "../theme/theme.ts";
 import { DynamicBorder } from "./dynamic-border.ts";
-import { keyDisplayText, keyHint } from "./keybinding-hints.ts";
+import { keyDisplayText } from "./keybinding-hints.ts";
 
 interface ModelItem {
 	provider: string;
@@ -61,14 +61,10 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private onSelectAsDefaultCallback?: (model: Model<any>) => void;
 	private onCancelCallback: () => void;
 	private errorMessage?: string;
-	private refreshStatusMessage = "Refreshing model catalogs…";
-	private refreshStatusSuccess = false;
 	private tui: TUI;
 	private scopedModels: ReadonlyArray<ScopedModelItem>;
 	private defaultModel?: DefaultModelReference;
 	private scope: ModelScope = "all";
-	private scopeText?: Text;
-	private scopeHintText?: Text;
 	private readonly refreshAbortController = new AbortController();
 	private refreshTimeout?: ReturnType<typeof setTimeout>;
 	private closed = false;
@@ -100,17 +96,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.addChild(new DynamicBorder());
 		this.addChild(new Spacer(1));
 
-		// Add hint about model filtering
-		if (scopedModels.length > 0) {
-			this.scopeText = new Text(this.getScopeText(), 0, 0);
-			this.addChild(this.scopeText);
-			this.scopeHintText = new Text(this.getScopeHintText(), 0, 0);
-			this.addChild(this.scopeHintText);
-		} else {
+		// The scoped list (settings.enabledModels) is the only view; there is no toggle to the full catalog.
+		if (scopedModels.length === 0) {
 			const hintText = "Only showing models from configured providers. Use /login to add providers.";
 			this.addChild(new Text(theme.fg("warning", hintText), 0, 0));
+			this.addChild(new Spacer(1));
 		}
-		this.addChild(new Spacer(1));
 
 		// Create search input
 		this.searchInput = new Input();
@@ -191,7 +182,6 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		try {
 			const result = await refreshModelCatalogs(this.modelRuntime, this.refreshAbortController.signal);
 			if (this.closed) return;
-			this.refreshStatusMessage = "";
 			if (result.aborted && timedOut) {
 				this.errorMessage = "Model refresh timed out; showing cached models.";
 			} else if (result.errors.size === 1) {
@@ -200,17 +190,12 @@ export class ModelSelectorComponent extends Container implements Focusable {
 				this.errorMessage = `Could not refresh ${result.errors.size} model catalogs (${[...result.errors.keys()].join(", ")}); showing cached models.`;
 			} else {
 				this.errorMessage = this.modelRuntime.getError();
-				if (!this.errorMessage) {
-					this.refreshStatusMessage = "Model catalogs refreshed.";
-					this.refreshStatusSuccess = true;
-				}
 			}
 			this.loadModelsFromSnapshot();
 			this.filterModels(this.searchInput.getValue());
 			this.tui.requestRender();
 		} catch (error) {
 			if (this.closed) return;
-			this.refreshStatusMessage = "";
 			this.errorMessage = timedOut
 				? "Model refresh timed out; showing cached models."
 				: `Could not refresh model catalogs: ${error instanceof Error ? error.message : String(error)}`;
@@ -245,16 +230,6 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		return sorted;
 	}
 
-	private getScopeText(): string {
-		const allText = this.scope === "all" ? theme.fg("accent", "all") : theme.fg("muted", "all");
-		const scopedText = this.scope === "scoped" ? theme.fg("accent", "scoped") : theme.fg("muted", "scoped");
-		return `${theme.fg("muted", "Scope: ")}${allText}${theme.fg("muted", " | ")}${scopedText}`;
-	}
-
-	private getScopeHintText(): string {
-		return keyHint("tui.input.tab", "scope") + theme.fg("muted", " (all/scoped)");
-	}
-
 	private isDefaultModel(model: Model<any>): boolean {
 		return this.defaultModel?.provider === model.provider && this.defaultModel.id === model.id;
 	}
@@ -262,18 +237,6 @@ export class ModelSelectorComponent extends Container implements Focusable {
 	private isDefaultSearch(query: string): boolean {
 		const normalized = query.trim().toLowerCase();
 		return normalized.length > 0 && "default".startsWith(normalized);
-	}
-
-	private setScope(scope: ModelScope): void {
-		if (this.scope === scope) return;
-		this.scope = scope;
-		this.activeModels = this.scope === "scoped" ? this.scopedModelItems : this.allModels;
-		const currentIndex = this.activeModels.findIndex((item) => modelsAreEqual(this.currentModel, item.model));
-		this.selectedIndex = currentIndex >= 0 ? currentIndex : 0;
-		this.filterModels(this.searchInput.getValue());
-		if (this.scopeText) {
-			this.scopeText.setText(this.getScopeText());
-		}
 	}
 
 	private filterModels(query: string): void {
@@ -302,73 +265,49 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.updateList();
 	}
 
+	// Every filtered model is rendered as one row of an aligned ASCII table; nothing scrolls and no
+	// per-selection detail line is shown. Errors from the catalog refresh still surface below the table.
 	private updateList(): void {
 		this.listContainer.clear();
 
-		const maxVisible = 10;
-		const startIndex = Math.max(
-			0,
-			Math.min(this.selectedIndex - Math.floor(maxVisible / 2), this.filteredModels.length - maxVisible),
-		);
-		const endIndex = Math.min(startIndex + maxVisible, this.filteredModels.length);
+		if (this.filteredModels.length > 0) {
+			const headers = ["Model", "Provider", "Default"];
+			const rows = this.filteredModels.map((item) => [
+				item.id,
+				item.provider,
+				this.isDefaultModel(item.model) ? "default" : "",
+			]);
+			const widths = headers.map((header, column) =>
+				Math.max(header.length, ...rows.map((row) => row[column].length)),
+			);
+			const line = (cells: string[]): string => cells.map((cell, column) => cell.padEnd(widths[column])).join(" | ");
+			const rule = widths.map((width) => "-".repeat(width)).join("-+-");
 
-		// Show visible slice of filtered models
-		for (let i = startIndex; i < endIndex; i++) {
-			const item = this.filteredModels[i];
-			if (!item) continue;
-
-			const isSelected = i === this.selectedIndex;
-			const isCurrent = modelsAreEqual(this.currentModel, item.model);
-			const isDefault = this.isDefaultModel(item.model);
-			const defaultBadge = isDefault ? theme.fg("muted", " · default") : "";
-
-			const cursor = isSelected ? theme.fg("accent", "→ ") : "  ";
-			const currentMarker = isCurrent ? theme.fg("accent", "✓ ") : "  ";
-			const modelText = isSelected ? theme.fg("accent", item.id) : item.id;
-			const providerBadge = theme.fg("muted", `[${item.provider}]`);
-			const line = `${cursor}${currentMarker}${modelText} ${providerBadge}${defaultBadge}`;
-
-			this.listContainer.addChild(new Text(line, 0, 0));
+			this.listContainer.addChild(new Text(theme.fg("muted", `    ${line(headers)}`), 0, 0));
+			this.listContainer.addChild(new Text(theme.fg("muted", `    ${rule}`), 0, 0));
+			for (const [index, item] of this.filteredModels.entries()) {
+				const isSelected = index === this.selectedIndex;
+				const cursor = isSelected ? theme.fg("accent", "→ ") : "  ";
+				const currentMarker = modelsAreEqual(this.currentModel, item.model) ? theme.fg("accent", "✓ ") : "  ";
+				const modelCell = item.id.padEnd(widths[0]);
+				const cells = `${isSelected ? theme.fg("accent", modelCell) : modelCell} | ${rows[index][1].padEnd(widths[1])} | ${rows[index][2].padEnd(widths[2])}`;
+				this.listContainer.addChild(new Text(`${cursor}${currentMarker}${cells}`, 0, 0));
+			}
 		}
 
-		// Add scroll indicator if needed
-		if (startIndex > 0 || endIndex < this.filteredModels.length) {
-			const scrollInfo = theme.fg("muted", `  (${this.selectedIndex + 1}/${this.filteredModels.length})`);
-			this.listContainer.addChild(new Text(scrollInfo, 0, 0));
-		}
-
-		// Show error message or "no results" if empty
 		if (this.errorMessage) {
-			// Show error in red
-			const errorLines = this.errorMessage.split("\n");
-			for (const line of errorLines) {
+			for (const line of this.errorMessage.split("\n")) {
 				this.listContainer.addChild(new Text(theme.fg("error", line), 0, 0));
 			}
 		} else if (this.filteredModels.length === 0) {
 			this.listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
-		} else {
-			const selected = this.filteredModels[this.selectedIndex];
-			this.listContainer.addChild(new Spacer(1));
-			this.listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${selected.model.name}`), 0, 0));
-		}
-		if (this.refreshStatusMessage) {
-			this.listContainer.addChild(new Spacer(1));
-			this.listContainer.addChild(
-				new Text(theme.fg(this.refreshStatusSuccess ? "success" : "muted", `  ${this.refreshStatusMessage}`), 0, 0),
-			);
 		}
 	}
 
 	handleInput(keyData: string): void {
 		const kb = getKeybindings();
+		// Tab used to toggle between the scoped list and the full catalog; the scoped list is now the only view.
 		if (kb.matches(keyData, "tui.input.tab")) {
-			if (this.scopedModelItems.length > 0) {
-				const nextScope: ModelScope = this.scope === "all" ? "scoped" : "all";
-				this.setScope(nextScope);
-				if (this.scopeHintText) {
-					this.scopeHintText.setText(this.getScopeHintText());
-				}
-			}
 			return;
 		}
 		// Up arrow - wrap to bottom when at top
