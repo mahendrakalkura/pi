@@ -4,7 +4,6 @@
 
 ### Added
 
-- Added automatic clipboard copying for each non-empty settled assistant response while preserving shutdown checks and reporting clipboard failures.
 - Added `ctx.modelRegistry.stream()` and `streamSimple()` for extension model calls through configured providers with resolved authentication ([#8964](https://github.com/earendil-works/pi/issues/8964)).
 - Added per-model `reserveTokens` and `keepRecentTokens` settings through `compaction.modelOverrides`, with ordinary compaction settings as fallback ([#8133](https://github.com/earendil-works/pi-mono/issues/8133)).
 
