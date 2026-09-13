@@ -26,7 +26,6 @@ export interface ToolExecutionOptions {
 	showImages?: boolean;
 	imageWidthCells?: number;
 	outputPad?: number;
-	toolDisplay?: "full" | "compact" | "hidden";
 }
 
 export class ToolExecutionComponent extends Container {
@@ -49,7 +48,6 @@ export class ToolExecutionComponent extends Container {
 	private showImages: boolean;
 	private imageWidthCells: number;
 	private outputPad: number;
-	private toolDisplay: "full" | "compact" | "hidden";
 	private isPartial = true;
 	private toolDefinition?: ToolRenderers;
 	private ui: TUI;
@@ -81,7 +79,6 @@ export class ToolExecutionComponent extends Container {
 		this.showImages = options.showImages ?? true;
 		this.imageWidthCells = options.imageWidthCells ?? 60;
 		this.outputPad = options.outputPad ?? 1;
-		this.toolDisplay = options.toolDisplay ?? "full";
 		this.ui = ui;
 		this.cwd = cwd;
 
@@ -271,36 +268,6 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
-		// Hidden: nothing renders until the component is expanded (Ctrl+O or a click).
-		if (this.toolDisplay === "hidden" && !this.expanded) {
-			this.hideComponent = true;
-			return;
-		}
-
-		// Compact: a single tool-name header line, no args, result, or images, until expanded.
-		if (this.toolDisplay === "compact" && !this.expanded) {
-			this.hideComponent = false;
-			const bgFn = this.isPartial
-				? (text: string) => theme.bg("toolPendingBg", text)
-				: this.result?.isError
-					? (text: string) => theme.bg("toolErrorBg", text)
-					: (text: string) => theme.bg("toolSuccessBg", text);
-			for (const image of this.imageComponents) this.removeChild(image);
-			this.imageComponents = [];
-			for (const spacer of this.imageSpacers) this.removeChild(spacer);
-			this.imageSpacers = [];
-			if (this.hasRendererDefinition()) {
-				const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
-				if (renderContainer instanceof Box) renderContainer.setBgFn(bgFn);
-				renderContainer.clear();
-				renderContainer.addChild(this.createResultRegion(this.createCallFallback()));
-			} else {
-				this.contentText.setCustomBgFn(bgFn);
-				this.contentText.setText(theme.fg("toolTitle", theme.bold(this.toolName)));
-			}
-			return;
-		}
-
 		const bgFn = this.isPartial
 			? (text: string) => theme.bg("toolPendingBg", text)
 			: this.result?.isError
