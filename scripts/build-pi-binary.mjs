@@ -2,17 +2,26 @@
 /**
  * Compile the Pi binary with Bun, optionally baking extensions into it.
  *
- * Replaces the `bun build --compile ...` step of `build:binary`. Without PI_BUNDLE_DIR the output is
- * identical to upstream. With PI_BUNDLE_DIR set to a directory holding a package.json, every module
- * listed in that manifest's `pi.extensions`, plus every dependency that ships its own `pi.extensions`
- * manifest, is imported statically from `src/bun/bundled-extensions.ts` and passed to `main()` as an
- * inline extension. Their `@earendil-works/*` and `typebox` imports are aliased onto the copies already
- * inside the bundle, so the binary holds exactly one instance of Pi.
+ * Replaces the `bun build --compile ...` step of `build:binary`. Without PI_BUNDLE_EXTENSIONS and
+ * without an installed `packages/coding-agent/bundle/node_modules` the output is identical to upstream.
  *
- * Usage: bun scripts/build-pi-binary.mjs   (cwd: packages/coding-agent)
+ * - PI_BUNDLE_DIR (default: packages/coding-agent/bundle) holds a package.json whose dependencies are
+ *   published Pi extension packages; every dependency that ships a `pi.extensions` manifest is bundled.
+ *   It is also where third-party dependencies of local extensions are declared.
+ * - PI_BUNDLE_EXTENSIONS names a directory of local `*.ts` / `*.js` extension sources; each top-level
+ *   file is bundled, in name order.
+ *
+ * Everything found is imported statically from `src/bun/bundled-extensions.ts` and passed to `main()`
+ * as an inline extension. `@earendil-works/*` and `typebox` imports from outside the repository are
+ * aliased onto the copies already inside the bundle, so the binary holds exactly one instance of Pi.
+ *
+ * Usage: bun scripts/build-pi-binary.mjs                  compile the binary (cwd: packages/coding-agent)
+ *        bun scripts/build-pi-binary.mjs --test <dir>     bundle the *.test.ts files of <dir> with the same
+ *                                                         aliasing and run `bun test` on the result, so local
+ *                                                         extension tests see the modules the binary contains
  */
 
-import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -21,6 +30,8 @@ const repoRoot = resolve(scriptDir, "..");
 const codingAgentDir = join(repoRoot, "packages", "coding-agent");
 const bundledModulePath = join(codingAgentDir, "src", "bun", "bundled-extensions.ts");
 const outfile = join(codingAgentDir, "dist", "pi");
+const defaultBundleDir = join(codingAgentDir, "bundle");
+const EXTENSION_SOURCE = /\.(ts|js|mjs)$/;
 
 // Specifiers that must resolve to the bundle's own copy rather than to a second install next to an extension.
 const ALIASED_IMPORT = /^(@earendil-works\/|typebox(\/|$)|@sinclair\/typebox(\/|$))/;
@@ -43,26 +54,32 @@ function manifestEntries(packageDir) {
 	}));
 }
 
-/** Local manifest entries first, then one group per dependency that is itself a Pi extension package. */
-function collectBundledExtensions(bundleDir) {
+/** Top-level extension source files of a directory, in name order, mirroring Pi's own directory discovery. */
+function localExtensions(extensionsDir) {
+	if (!existsSync(extensionsDir) || !statSync(extensionsDir).isDirectory()) {
+		throw new Error(`PI_BUNDLE_EXTENSIONS is not a directory: ${extensionsDir}`);
+	}
+	return readdirSync(extensionsDir)
+		.filter((name) => EXTENSION_SOURCE.test(name) && !name.endsWith(".d.ts"))
+		.sort()
+		.map((name) => ({ name: name.replace(EXTENSION_SOURCE, ""), path: join(extensionsDir, name) }));
+}
+
+/** One entry group per dependency of the bundle manifest that is itself a Pi extension package. */
+function packagedExtensions(bundleDir) {
 	const manifestPath = join(bundleDir, "package.json");
 	if (!existsSync(manifestPath)) {
 		throw new Error(`PI_BUNDLE_DIR has no package.json: ${bundleDir}`);
 	}
 	const manifest = readJson(manifestPath);
-	const local = manifestEntries(bundleDir).map((entry) => ({
-		name: basename(entry.path).replace(/\.(ts|js|mjs)$/, ""),
-		path: entry.path,
-	}));
-
 	const dependencies = Object.keys(manifest.dependencies ?? {}).sort();
-	const packaged = dependencies.flatMap((dependency) => manifestEntries(join(bundleDir, "node_modules", dependency)));
+	const entries = dependencies.flatMap((dependency) => manifestEntries(join(bundleDir, "node_modules", dependency)));
 
-	const missing = [...local, ...packaged].filter((entry) => !existsSync(entry.path));
+	const missing = entries.filter((entry) => !existsSync(entry.path));
 	if (missing.length > 0) {
-		throw new Error(`Bundled extension entries do not exist:\n${missing.map((entry) => `  ${entry.path}`).join("\n")}`);
+		throw new Error(`Bundled extension entries do not exist (run npm install in ${bundleDir}):\n${missing.map((entry) => `  ${entry.path}`).join("\n")}`);
 	}
-	return [...local, ...packaged];
+	return entries;
 }
 
 /** Source of the replacement `bundled-extensions.ts` module. */
@@ -112,19 +129,22 @@ function resolveCodingAgentImport(specifier, aliases) {
 	throw new Error(`Cannot map ${specifier} onto the coding-agent sources`);
 }
 
-function isInsideRepo(path) {
-	const rel = relative(repoRoot, path);
+function isInside(root, path) {
+	const rel = relative(root, path);
 	return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
 }
 
-function aliasPlugin() {
+function aliasPlugin(bundleDir) {
 	const aliases = codingAgentPathAliases();
 	return {
 		name: "pi-alias-external-extension-imports",
 		setup(build) {
 			build.onResolve({ filter: ALIASED_IMPORT }, (args) => {
-				// Files inside the monorepo already resolve through the workspace; only outside importers need help.
-				if (!args.importer || isInsideRepo(realpathSync(args.importer))) return undefined;
+				// Monorepo sources already resolve through the workspace. Extension sources outside the repository
+				// and packages installed under the bundle directory would otherwise pull in their own copies.
+				if (!args.importer) return undefined;
+				const importer = realpathSync(args.importer);
+				if (isInside(repoRoot, importer) && !isInside(bundleDir, importer)) return undefined;
 
 				let specifier = args.path.replace(/^@sinclair\/typebox/, "typebox");
 				if (specifier === CODING_AGENT_PACKAGE || specifier.startsWith(`${CODING_AGENT_PACKAGE}/`)) {
@@ -177,17 +197,50 @@ function bundledExtensionsPlugin(entries) {
 	};
 }
 
-const bundleDir = process.env.PI_BUNDLE_DIR ? resolve(process.env.PI_BUNDLE_DIR) : undefined;
-const entries = bundleDir ? collectBundledExtensions(bundleDir) : [];
-if (bundleDir) {
-	console.log(`Bundling ${entries.length} extensions from ${bundleDir}:`);
+const bundleDir = resolve(process.env.PI_BUNDLE_DIR ?? defaultBundleDir);
+
+// --test <dir>: bundle the test files, then run them in place inside the bundle directory.
+const testFlag = process.argv.indexOf("--test");
+if (testFlag !== -1) {
+	const testsDir = resolve(process.argv[testFlag + 1] ?? "");
+	if (!existsSync(testsDir) || !statSync(testsDir).isDirectory()) {
+		throw new Error(`--test expects a directory of *.test.ts files: ${testsDir}`);
+	}
+	const testFiles = readdirSync(testsDir)
+		.filter((name) => /\.test\.(ts|js|mjs)$/.test(name))
+		.sort()
+		.map((name) => join(testsDir, name));
+	if (testFiles.length === 0) throw new Error(`No test files in ${testsDir}`);
+
+	const outdir = join(bundleDir, ".tests");
+	rmSync(outdir, { force: true, recursive: true });
+	mkdirSync(outdir, { recursive: true });
+	const built = await Bun.build({
+		entrypoints: testFiles,
+		external: ["bun:test"],
+		outdir,
+		plugins: [aliasPlugin(bundleDir), pinRequireResolvePlugin(bundleDir)],
+		target: "bun",
+	});
+	if (!built.success) {
+		for (const log of built.logs) console.error(String(log));
+		process.exit(1);
+	}
+	const run = Bun.spawnSync(["bun", "test", outdir], { stderr: "inherit", stdout: "inherit" });
+	process.exit(run.exitCode ?? 1);
+}
+const extensionsDir = process.env.PI_BUNDLE_EXTENSIONS ? resolve(process.env.PI_BUNDLE_EXTENSIONS) : undefined;
+const bundling = extensionsDir !== undefined || existsSync(join(bundleDir, "node_modules"));
+const entries = bundling ? [...(extensionsDir ? localExtensions(extensionsDir) : []), ...packagedExtensions(bundleDir)] : [];
+if (bundling) {
+	console.log(`Bundling ${entries.length} extensions (packages from ${bundleDir}${extensionsDir ? `, sources from ${extensionsDir}` : ""}):`);
 	for (const entry of entries) console.log(`  ${entry.name}  ${entry.path}`);
 }
 
 const result = await Bun.build({
 	compile: { autoloadBunfig: false, outfile },
 	entrypoints: [join(codingAgentDir, "src", "bun", "cli.ts"), join(codingAgentDir, "src", "utils", "image-resize-worker.ts")],
-	plugins: bundleDir ? [aliasPlugin(), pinRequireResolvePlugin(bundleDir), bundledExtensionsPlugin(entries)] : [],
+	plugins: bundling ? [aliasPlugin(bundleDir), pinRequireResolvePlugin(bundleDir), bundledExtensionsPlugin(entries)] : [],
 	target: "bun",
 });
 
