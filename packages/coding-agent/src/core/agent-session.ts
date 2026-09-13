@@ -1802,7 +1802,7 @@ export class AgentSession {
 		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
 
 		const skill = this.resourceLoader.getSkills().skills.find((s) => s.name === skillName);
-		if (!skill || skill.disableModelInvocation) return text; // Unknown or disabled, pass through
+		if (!skill) return text; // Unknown skill, pass through
 
 		try {
 			const content = readFileSync(skill.filePath, "utf-8");
