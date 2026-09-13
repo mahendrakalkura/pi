@@ -39,6 +39,18 @@ type ModelScope = "all" | "scoped";
 // providers as <owner>-<vendor>. Unlabeled ids sort and display with an empty client column.
 const ACCOUNT_OWNERS = new Set(["jg", "mk", "nr"]);
 const NATURAL_ORDER = new Intl.Collator("en", { numeric: true, sensitivity: "base" });
+// Anthropic model tiers in preferred order, so Claude models sort fable, opus, sonnet, haiku
+// rather than the alphabetical fable, haiku, opus, sonnet.
+const CLAUDE_TIERS = ["fable", "opus", "sonnet", "haiku"];
+
+function claudeTierRank(id: string): number | undefined {
+	const lower = id.toLowerCase();
+	if (!lower.includes("claude")) return undefined;
+	for (let i = 0; i < CLAUDE_TIERS.length; i++) {
+		if (lower.includes(CLAUDE_TIERS[i])) return i;
+	}
+	return CLAUDE_TIERS.length;
+}
 // Rows of the selector that are not table rows: borders, spacers, search input, hint, table head and frame.
 const SELECTOR_CHROME_ROWS = 12;
 const MIN_TABLE_ROWS = 5;
@@ -240,14 +252,18 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		this.refreshAbortController.abort();
 	}
 
-	// Client, then vendor, then model id in natural order (4-5 sorts before 5, 5.6 before 5.10).
+	// Client, then vendor, then model. Within the Claude family, tier order (fable, opus, sonnet,
+	// haiku) beats id order; everything else sorts by id in natural order (4-5 before 5, 5.6 before 5.10).
 	private sortModels(models: ModelItem[]): ModelItem[] {
 		return [...models].sort((a, b) => {
 			const left = splitProvider(a.provider);
 			const right = splitProvider(b.provider);
+			const leftTier = claudeTierRank(a.id);
+			const rightTier = claudeTierRank(b.id);
 			return (
 				NATURAL_ORDER.compare(left.client, right.client) ||
 				NATURAL_ORDER.compare(left.vendor, right.vendor) ||
+				(leftTier !== undefined && rightTier !== undefined ? leftTier - rightTier : 0) ||
 				NATURAL_ORDER.compare(a.id, b.id)
 			);
 		});
