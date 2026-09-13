@@ -144,6 +144,8 @@ cd ~/Repositories/github.com/earendil-works/pi
 DOTFILES=~/Repositories/gitlab.kalkura.com/mahendra-kalkura/dotfiles
 
 # 1. Fetch upstream and rebase the patch series onto it. rerere replays earlier conflict resolutions.
+#    Upstream owns the rest of this AGENTS.md; when upstream edits it, the rebase conflicts at the
+#    appended "Fork Maintenance" section. Resolve by keeping both sides; rerere replays that thereafter.
 git fetch origin fork
 git switch mahendra
 git rebase origin/main
