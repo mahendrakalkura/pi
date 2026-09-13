@@ -76,7 +76,7 @@ describe("issue #6999 models.json hot reload", () => {
 
 		await renderedAfterRefresh;
 		const rendered = stripAnsi(selector.render(120).join("\n"));
-		expect(rendered).toMatch(/new-model\s+\|\s+new-provider/);
-		expect(rendered).not.toMatch(/old-model\s+\|\s+old-provider/);
+		expect(rendered).toMatch(/new-provider\s+│\s+new-model/);
+		expect(rendered).not.toMatch(/old-provider\s+│\s+old-model/);
 	});
 });
