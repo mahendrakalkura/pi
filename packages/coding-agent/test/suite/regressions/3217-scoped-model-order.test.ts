@@ -75,8 +75,10 @@ describe("issue #3217 scoped model ordering", () => {
 		const modelOne = harness.getModel("faux-1")!;
 		const modelTwo = harness.getModel("faux-2")!;
 		const modelThree = harness.getModel("faux-3")!;
+		const tui = createFakeTui();
+		const requestRender = vi.spyOn(tui, "requestRender");
 		const selector = new ModelSelectorComponent(
-			createFakeTui(),
+			tui,
 			modelOne,
 			harness.session.modelRuntime,
 			[{ model: modelTwo }, { model: modelOne }, { model: modelThree }],
@@ -84,17 +86,12 @@ describe("issue #3217 scoped model ordering", () => {
 			() => {},
 		);
 
-		await vi.waitFor(() => {
-			const rendered = stripAnsi(selector.render(120).join("\n"));
-			expect(rendered).toContain(`[${modelOne.provider}]`);
-			expect(rendered).toContain("Model catalogs refreshed.");
-		});
-
+		await vi.waitFor(() => expect(requestRender).toHaveBeenCalledTimes(2));
 		const renderedLines = stripAnsi(selector.render(120).join("\n"))
 			.split("\n")
-			.filter((line) => line.includes(`[${modelOne.provider}]`));
+			.filter((line) => line.includes(` | ${modelOne.provider} `));
 		const orderedIds = renderedLines.slice(0, 3).map((line) => {
-			const [modelId] = line.trim().replace(/^→\s*/, "").split(" [");
+			const [modelId] = line.trim().replace(/^→\s*/, "").split(" | ");
 			return modelId?.replace(/^✓\s*/, "").trim() ?? "";
 		});
 

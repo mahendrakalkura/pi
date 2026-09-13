@@ -134,7 +134,6 @@ This checkout is `github.com/mahendrakalkura/pi`, branch `mahendra`, with upstre
 - `packages/coding-agent/bundle/`: pinned extension packages and their `node_modules`. `node_modules` must stay on disk after the build because `pi-browser-use` spawns `chrome-devtools-mcp` from it as a Node process.
 - `packages/coding-agent/src/modes/interactive/components/model-selector.ts`: the `/model` picker shows only `settings.enabledModels`, disables the all/scoped Tab toggle, renders every matching model at once in an aligned `Model | Provider | Default` table, and hides the row counter, selected model name, and successful refresh notice. Refresh failures remain visible.
 - `packages/ai/src/api/google-shared.ts`: `FinishReason.TOO_MANY_TOOL_CALLS` case, needed for `tsgo --noEmit` with `@google/genai` 2.21.0.
-- `packages/coding-agent/src/modes/interactive/components/model-selector.ts`: the scoped model list renders as one aligned table with every row visible; no all/scoped toggle, Model Name footer, or refresh notice.
 
 ### Weekly sync and rebuild
 
