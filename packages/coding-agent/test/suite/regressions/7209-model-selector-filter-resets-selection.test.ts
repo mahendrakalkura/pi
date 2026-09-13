@@ -15,7 +15,7 @@ function selectedModelId(rendered: string): string | undefined {
 	const line = rendered.split("\n").find((l) => l.startsWith("→ "));
 	if (!line) return undefined;
 	const rest = line.replace(/^→\s*/, "");
-	const id = rest.split(" [")[0]?.replace(/^✓\s*/, "");
+	const id = rest.split(" | ")[0]?.replace(/^✓\s*/, "");
 	return id?.trim() || undefined;
 }
 
@@ -36,7 +36,7 @@ describe("model selector filter resets selection to top", () => {
 		}
 	});
 
-	it("moves selection to the first row in the All tab when typing a query", async () => {
+	it("moves selection to the first catalog row when typing a query", async () => {
 		const harness = await createHarness({
 			models: [
 				{ id: "alpha-1", name: "Alpha One", reasoning: true },
@@ -48,8 +48,10 @@ describe("model selector filter resets selection to top", () => {
 		harnesses.push(harness);
 
 		const current = harness.getModel("alpha-1")!;
+		const tui = createFakeTui();
+		const requestRender = vi.spyOn(tui, "requestRender");
 		const selector = new ModelSelectorComponent(
-			createFakeTui(),
+			tui,
 			current,
 			harness.session.modelRuntime,
 			[],
@@ -57,10 +59,7 @@ describe("model selector filter resets selection to top", () => {
 			() => {},
 		);
 
-		await vi.waitFor(() => {
-			const rendered = stripAnsi(selector.render(120).join("\n"));
-			expect(rendered).toContain("Model catalogs refreshed.");
-		});
+		await vi.waitFor(() => expect(requestRender).toHaveBeenCalledTimes(2));
 
 		// Current model (alpha-1) is sorted first, so selection starts on row 0.
 		expect(selectedModelId(stripAnsi(selector.render(120).join("\n")))).toBe("alpha-1");
@@ -82,7 +81,7 @@ describe("model selector filter resets selection to top", () => {
 		expect(rendered).not.toContain("beta-1");
 	});
 
-	it("moves selection to the first row in the Scoped tab when typing a query", async () => {
+	it("moves selection to the first scoped row when typing a query", async () => {
 		const harness = await createHarness({
 			models: [
 				{ id: "alpha-1", name: "Alpha One", reasoning: true },
@@ -98,8 +97,10 @@ describe("model selector filter resets selection to top", () => {
 
 		// Scoped list is intentionally not in current-model-first order; the
 		// current model (alpha-1) sits at index 2.
+		const tui = createFakeTui();
+		const requestRender = vi.spyOn(tui, "requestRender");
 		const selector = new ModelSelectorComponent(
-			createFakeTui(),
+			tui,
 			alpha1,
 			harness.session.modelRuntime,
 			[{ model: alpha2 }, { model: alpha3 }, { model: alpha1 }],
@@ -107,10 +108,7 @@ describe("model selector filter resets selection to top", () => {
 			() => {},
 		);
 
-		await vi.waitFor(() => {
-			const rendered = stripAnsi(selector.render(120).join("\n"));
-			expect(rendered).toContain("Model catalogs refreshed.");
-		});
+		await vi.waitFor(() => expect(requestRender).toHaveBeenCalledTimes(2));
 
 		// Selection starts on the current model (alpha-1), which is row 2 here.
 		expect(selectedModelId(stripAnsi(selector.render(120).join("\n")))).toBe("alpha-1");
