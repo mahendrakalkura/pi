@@ -43,16 +43,18 @@ describe("model selector", () => {
 			() => {},
 		);
 
+		// Rows are table cells separated by " | "; only the leading markers and the first cell matter here.
 		const getModelRow = (id: string): string | undefined =>
 			stripAnsi(selector.render(120).join("\n"))
 				.split("\n")
-				.find((line) => line.includes(`${id} [`))
-				?.trimEnd();
+				.find((line) => line.includes(` ${id} `))
+				?.split(" | ")[0]
+				.trimEnd();
 
-		expect(getModelRow("current-model")).toBe(`→ ✓ current-model [${currentModel.provider}]`);
+		expect(getModelRow("current-model")).toBe("→ ✓ current-model");
 		selector.handleInput("\x1b[B");
-		expect(getModelRow("current-model")).toBe(`  ✓ current-model [${currentModel.provider}]`);
-		expect(getModelRow("browsed-model")).toBe(`→   browsed-model [${currentModel.provider}]`);
+		expect(getModelRow("current-model")).toBe("  ✓ current-model");
+		expect(getModelRow("browsed-model")).toBe("→   browsed-model");
 		selector.dispose();
 	});
 
