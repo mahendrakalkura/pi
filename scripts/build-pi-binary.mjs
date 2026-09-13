@@ -257,6 +257,7 @@ if (testFlag !== -1) {
 		process.exit(1);
 	}
 	const run = Bun.spawnSync(["bun", "test", outdir], { stderr: "inherit", stdout: "inherit" });
+	rmSync(outdir, { force: true, recursive: true });
 	process.exit(run.exitCode ?? 1);
 }
 const extensionsDir = process.env.PI_BUNDLE_EXTENSIONS ? resolve(process.env.PI_BUNDLE_EXTENSIONS) : undefined;
