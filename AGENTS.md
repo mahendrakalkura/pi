@@ -133,7 +133,9 @@ This checkout is `github.com/mahendrakalkura/pi`, branch `mahendra`, with upstre
 - `scripts/build-pi-binary.mjs`: `Bun.build({ compile })` wrapper used by `build:binary`. Compiles every `*.ts` under `PI_BUNDLE_EXTENSIONS` and every package pinned in `packages/coding-agent/bundle/package.json` into the binary as inline extensions. `--test <dir>` bundles a directory of `*.test.ts` files the same way and runs `bun test` on the result.
 - `packages/coding-agent/src/bun/cli.ts` and `src/bun/bundled-extensions.ts`: the Bun entry passes the compiled-in extensions to `main()`; the module is empty in source and replaced at build time.
 - `packages/coding-agent/bundle/`: pinned extension packages and their `node_modules`. `node_modules` must stay on disk after the build because `pi-browser-use` spawns `chrome-devtools-mcp` from it as a Node process.
+- `packages/coding-agent/src/modes/interactive/components/model-selector.ts`: the `/model` picker shows only `settings.enabledModels`, disables the all/scoped Tab toggle, renders every matching model at once in an aligned `Model | Provider | Default` table, and hides the row counter, selected model name, and successful refresh notice. Refresh failures remain visible.
 - `packages/ai/src/api/google-shared.ts`: `FinishReason.TOO_MANY_TOOL_CALLS` case, needed for `tsgo --noEmit` with `@google/genai` 2.21.0.
+- `packages/coding-agent/src/modes/interactive/components/model-selector.ts`: the scoped model list renders as one aligned table with every row visible; no all/scoped toggle, Model Name footer, or refresh notice.
 
 ### Weekly sync and rebuild
 
@@ -165,7 +167,9 @@ mise exec node@24 -- npm run check:shrinkwrap
 mise exec node@24 -- npm run check:install-lock:coding-agent
 mise exec node@24 -- npm exec -- tsgo --noEmit
 mise exec node@24 -- npm run check:browser-smoke
-mise exec node@24 -- bash ./test.sh
+env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
+# test.sh must not see the provider API keys the Fish shell exports: with keys present, Pi's
+# test harness sees hundreds of available models and the selector tests assert on a short list.
 
 # 4. Extension packages, then the binary with the dotfiles extensions compiled in.
 (cd packages/coding-agent/bundle && mise exec node@24 -- npm install --no-audit --no-fund)
