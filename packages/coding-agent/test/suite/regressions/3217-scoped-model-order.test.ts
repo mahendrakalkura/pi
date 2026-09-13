@@ -13,6 +13,14 @@ function createFakeTui(): TUI {
 	} as unknown as TUI;
 }
 
+// A box-table data row splits into cells around "│"; drop the two empty ends.
+function rowCells(line: string): string[] {
+	return line
+		.split("│")
+		.slice(1, -1)
+		.map((cell) => cell.trim());
+}
+
 describe("issue #3217 scoped model ordering", () => {
 	const harnesses: Harness[] = [];
 
@@ -62,7 +70,7 @@ describe("issue #3217 scoped model ordering", () => {
 		expect(changes).toEqual([[orderedIds[1], orderedIds[0], orderedIds[2]]]);
 	});
 
-	it("preserves scoped model order in the /model scoped tab", async () => {
+	it("sorts scoped models by id in the /model picker", async () => {
 		const harness = await createHarness({
 			models: [
 				{ id: "faux-1", name: "One", reasoning: true },
@@ -89,12 +97,9 @@ describe("issue #3217 scoped model ordering", () => {
 		await vi.waitFor(() => expect(requestRender).toHaveBeenCalledTimes(2));
 		const renderedLines = stripAnsi(selector.render(120).join("\n"))
 			.split("\n")
-			.filter((line) => line.includes(` | ${modelOne.provider} `));
-		const orderedIds = renderedLines.slice(0, 3).map((line) => {
-			const [modelId] = line.trim().replace(/^→\s*/, "").split(" | ");
-			return modelId?.replace(/^✓\s*/, "").trim() ?? "";
-		});
+			.filter((line) => line.includes(" faux-"));
+		const orderedIds = renderedLines.slice(0, 3).map((line) => rowCells(line)[3]);
 
-		expect(orderedIds).toEqual([modelTwo.id, modelOne.id, modelThree.id]);
+		expect(orderedIds).toEqual([modelOne.id, modelTwo.id, modelThree.id]);
 	});
 });
