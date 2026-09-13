@@ -3794,16 +3794,6 @@ export class InteractiveMode {
 				// The session records deferred user bash results when the run settles; show them there too.
 				this.flushPendingBashComponents();
 				this.ui.requestRender();
-				{
-					const text = this.session.getLastAssistantText();
-					if (text) {
-						try {
-							await copyToClipboard(text);
-						} catch (error) {
-							this.showError(error instanceof Error ? error.message : String(error));
-						}
-					}
-				}
 				await this.checkShutdownRequested();
 				break;
 
