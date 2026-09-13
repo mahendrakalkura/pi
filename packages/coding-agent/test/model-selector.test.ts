@@ -10,6 +10,14 @@ function createFakeTui(): TUI {
 	return { requestRender: () => {} } as unknown as TUI;
 }
 
+// A box-table data row splits into cells around "│"; drop the two empty ends.
+function rowCells(line: string): string[] {
+	return line
+		.split("│")
+		.slice(1, -1)
+		.map((cell) => cell.trim());
+}
+
 describe("model selector", () => {
 	let harness: Harness | undefined;
 
@@ -44,18 +52,18 @@ describe("model selector", () => {
 			() => {},
 		);
 
-		// Rows are table cells separated by " | "; only the leading markers and the first cell matter here.
-		const getModelRow = (id: string): string | undefined =>
-			stripAnsi(selector.render(120).join("\n"))
+		// The marker cell is the first cell of the box-table row.
+		const getModelRow = (id: string): string | undefined => {
+			const line = stripAnsi(selector.render(120).join("\n"))
 				.split("\n")
-				.find((line) => line.includes(` ${id} `))
-				?.split(" | ")[0]
-				.trimEnd();
+				.find((candidate) => candidate.includes(` ${id} `));
+			return line ? rowCells(line)[0] : undefined;
+		};
 
-		expect(getModelRow("current-model")).toBe("→ ✓ current-model");
+		expect(getModelRow("current-model")).toBe("→ ✓");
 		selector.handleInput("\x1b[B");
-		expect(getModelRow("current-model")).toBe("  ✓ current-model");
-		expect(getModelRow("browsed-model")).toBe("→   browsed-model");
+		expect(getModelRow("current-model")).toBe("✓");
+		expect(getModelRow("browsed-model")).toBe("→");
 		selector.dispose();
 	});
 
