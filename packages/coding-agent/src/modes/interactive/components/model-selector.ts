@@ -305,7 +305,7 @@ export class ModelSelectorComponent extends Container implements Focusable {
 			const start = windowStart(this.selectedIndex, size, this.filteredModels.length);
 			const table = new Table({
 				head: ["", "Client", "Provider", "Model", "Name", "Default"],
-				style: { head: [], border: [], "padding-left": 1, "padding-right": 1 },
+				style: { head: [], border: [], compact: true, "padding-left": 1, "padding-right": 1 },
 			});
 			for (const [index, item] of this.filteredModels.slice(start, start + size).entries()) {
 				const absolute = start + index;
