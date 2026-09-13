@@ -34,11 +34,12 @@ describe("model selector", () => {
 			],
 		});
 		const currentModel = harness.getModel("current-model")!;
+		const browsedModel = harness.getModel("browsed-model")!;
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			currentModel,
 			harness.session.modelRuntime,
-			[],
+			[{ model: currentModel }, { model: browsedModel }],
 			() => {},
 			() => {},
 		);
@@ -55,6 +56,39 @@ describe("model selector", () => {
 		selector.handleInput("\x1b[B");
 		expect(getModelRow("current-model")).toBe("  ✓ current-model");
 		expect(getModelRow("browsed-model")).toBe("→   browsed-model");
+		selector.dispose();
+	});
+
+	it("renders every scoped model without scope controls or status lines", async () => {
+		const models = Array.from({ length: 12 }, (_, index) => ({
+			id: `model-${String(index).padStart(2, "0")}`,
+			name: `Model ${index}`,
+			reasoning: true,
+		}));
+		harness = await createHarness({
+			models: [...models, { id: "catalog-only", name: "Catalog Only", reasoning: true }],
+		});
+		const scopedModels = models.map(({ id }) => ({ model: harness!.getModel(id)! }));
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			scopedModels[0].model,
+			harness.session.modelRuntime,
+			scopedModels,
+			() => {},
+			() => {},
+		);
+
+		selector.handleInput("\t");
+		const rendered = stripAnsi(selector.render(160).join("\n"));
+		for (const { id } of models) expect(rendered).toContain(id);
+		expect(rendered).not.toContain("catalog-only");
+		expect(rendered).toContain("Model");
+		expect(rendered).toContain("Provider");
+		expect(rendered).toContain("Default");
+		expect(rendered).not.toContain("Scope:");
+		expect(rendered).not.toContain("(1/12)");
+		expect(rendered).not.toContain("Model Name:");
+		expect(rendered).not.toContain("Model catalogs refreshed.");
 		selector.dispose();
 	});
 
