@@ -21,7 +21,7 @@
  *                                                         extension tests see the modules the binary contains
  */
 
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -55,14 +55,23 @@ function manifestEntries(packageDir) {
 }
 
 /** Top-level extension source files of a directory, in name order, mirroring Pi's own directory discovery. */
-function localExtensions(extensionsDir) {
+function localExtensions(extensionsDir, bundleDir) {
 	if (!existsSync(extensionsDir) || !statSync(extensionsDir).isDirectory()) {
 		throw new Error(`PI_BUNDLE_EXTENSIONS is not a directory: ${extensionsDir}`);
 	}
+	// Copy under the bundle so bare third-party imports resolve through node_modules walking. A plugin
+	// whose filter merely matches bare specifiers corrupts Bun's compile output, so the binary build must
+	// not intercept these resolutions; the test build keeps externalDependencyPlugin instead.
+	const localDir = join(bundleDir, ".local-extensions");
+	rmSync(localDir, { force: true, recursive: true });
+	mkdirSync(localDir, { recursive: true });
 	return readdirSync(extensionsDir)
 		.filter((name) => EXTENSION_SOURCE.test(name) && !name.endsWith(".d.ts"))
 		.sort()
-		.map((name) => ({ name: name.replace(EXTENSION_SOURCE, ""), path: join(extensionsDir, name) }));
+		.map((name) => {
+			copyFileSync(join(extensionsDir, name), join(localDir, name));
+			return { name: name.replace(EXTENSION_SOURCE, ""), path: join(localDir, name) };
+		});
 }
 
 /** One entry group per dependency of the bundle manifest that is itself a Pi extension package. */
@@ -161,6 +170,27 @@ function aliasPlugin(bundleDir) {
  * `createRequire(import.meta.url)`; inside the binary `import.meta.url` is virtual, so pin each static
  * call to the absolute path it resolves to at build time. Only files under the bundle directory are touched.
  */
+/** Local extension sources live outside any node_modules tree; the test bundle resolves their bare imports
+ * (third-party libraries) against the bundle directory first and the coding-agent package second. This is
+ * safe under target "bun" but corrupts compile output, so the binary build resolves them by copying instead. */
+function externalDependencyPlugin(bundleDir) {
+	const BARE_SPECIFIER = /^(?![./]|node:|bun:|bun$|@earendil-works\/|typebox(\/|$)|@sinclair\/typebox(\/|$))[^:]+$/;
+	return {
+		name: "pi-external-extension-dependencies",
+		setup(build) {
+			build.onResolve({ filter: BARE_SPECIFIER }, (args) => {
+				if (!args.importer || isInside(repoRoot, realpathSync(args.importer))) return undefined;
+				for (const root of [bundleDir, codingAgentDir]) {
+					try {
+						return { path: Bun.resolveSync(args.path, root) };
+					} catch {}
+				}
+				throw new Error(`Cannot resolve ${args.path} imported by ${args.importer}; declare it in ${join(bundleDir, "package.json")}`);
+			});
+		},
+	};
+}
+
 function pinRequireResolvePlugin(bundleDir) {
 	const escaped = bundleDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 	const STATIC_REQUIRE_RESOLVE = /require\.resolve\((['"])([^'"]+)\1\)/g;
@@ -219,7 +249,7 @@ if (testFlag !== -1) {
 		entrypoints: testFiles,
 		external: ["bun:test"],
 		outdir,
-		plugins: [aliasPlugin(bundleDir), pinRequireResolvePlugin(bundleDir)],
+		plugins: [aliasPlugin(bundleDir), externalDependencyPlugin(bundleDir), pinRequireResolvePlugin(bundleDir)],
 		target: "bun",
 	});
 	if (!built.success) {
@@ -231,7 +261,7 @@ if (testFlag !== -1) {
 }
 const extensionsDir = process.env.PI_BUNDLE_EXTENSIONS ? resolve(process.env.PI_BUNDLE_EXTENSIONS) : undefined;
 const bundling = extensionsDir !== undefined || existsSync(join(bundleDir, "node_modules"));
-const entries = bundling ? [...(extensionsDir ? localExtensions(extensionsDir) : []), ...packagedExtensions(bundleDir)] : [];
+const entries = bundling ? [...(extensionsDir ? localExtensions(extensionsDir, bundleDir) : []), ...packagedExtensions(bundleDir)] : [];
 if (bundling) {
 	console.log(`Bundling ${entries.length} extensions (packages from ${bundleDir}${extensionsDir ? `, sources from ${extensionsDir}` : ""}):`);
 	for (const entry of entries) console.log(`  ${entry.name}  ${entry.path}`);
