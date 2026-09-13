@@ -1209,10 +1209,6 @@ export class SettingsManager {
 		return this.settings.terminal?.showImages ?? SETTINGS_DEFAULTS.terminal.showImages;
 	}
 
-	getToolDisplay(): "full" | "compact" | "hidden" {
-		return this.settings.toolDisplay ?? "compact";
-	}
-
 	setShowImages(show: boolean): void {
 		if (!this.globalSettings.terminal) {
 			this.globalSettings.terminal = {};
