@@ -21,7 +21,7 @@
  *                                                         extension tests see the modules the binary contains
  */
 
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -65,13 +65,36 @@ function localExtensions(extensionsDir, bundleDir) {
 	const localDir = join(bundleDir, ".local-extensions");
 	rmSync(localDir, { force: true, recursive: true });
 	mkdirSync(localDir, { recursive: true });
-	return readdirSync(extensionsDir)
-		.filter((name) => EXTENSION_SOURCE.test(name) && !name.endsWith(".d.ts"))
-		.sort()
-		.map((name) => {
-			copyFileSync(join(extensionsDir, name), join(localDir, name));
-			return { name: name.replace(EXTENSION_SOURCE, ""), path: join(localDir, name) };
-		});
+
+	const entries = [];
+	for (const name of readdirSync(extensionsDir).sort()) {
+		const source = join(extensionsDir, name);
+		const stat = statSync(source);
+
+		// Top-level extension source files.
+		if (stat.isFile() && EXTENSION_SOURCE.test(name) && !name.endsWith(".d.ts")) {
+			copyFileSync(source, join(localDir, name));
+			entries.push({ name: name.replace(EXTENSION_SOURCE, ""), path: join(localDir, name) });
+			continue;
+		}
+
+		// Vendored extension packages: a subdirectory with a pi.extensions manifest or an index entry.
+		if (!stat.isDirectory() || name.startsWith(".") || name === "node_modules") continue;
+		const manifestPath = join(source, "package.json");
+		const manifest = existsSync(manifestPath) ? readJson(manifestPath) : undefined;
+		const declared = manifest?.pi?.extensions;
+		const entrySources = Array.isArray(declared) && declared.length > 0
+			? declared.map((entry) => resolve(source, entry))
+			: ["index.ts", "index.js"].map((candidate) => join(source, candidate)).filter((candidate) => existsSync(candidate));
+		if (entrySources.length === 0) continue;
+
+		const localPackageDir = join(localDir, name);
+		cpSync(source, localPackageDir, { recursive: true });
+		for (const entrySource of entrySources) {
+			entries.push({ name: manifest?.name ?? name, path: join(localPackageDir, relative(source, entrySource)) });
+		}
+	}
+	return entries;
 }
 
 /** One entry group per dependency of the bundle manifest that is itself a Pi extension package. */
