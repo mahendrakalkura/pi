@@ -3224,6 +3224,7 @@ export class InteractiveMode {
 						undefined,
 						this.hideThinkingBlock,
 						this.getMarkdownThemeWithSettings(),
+						this.hiddenThinkingLabel,
 						this.outputPad,
 						this.getMarkdownTransformers(),
 					);
@@ -3659,6 +3660,7 @@ export class InteractiveMode {
 					message,
 					this.hideThinkingBlock,
 					this.getMarkdownThemeWithSettings(),
+					this.hiddenThinkingLabel,
 					this.outputPad,
 					this.getMarkdownTransformers(),
 				);
