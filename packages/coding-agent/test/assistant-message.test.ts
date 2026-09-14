@@ -70,11 +70,11 @@ describe("AssistantMessageComponent", () => {
 		);
 		const rendered = component.render(80).join("\n");
 
-		expect(rendered).toContain("Thinking...");
+		expect(rendered).not.toContain("Thinking...");
 		expect(rendered).toContain("Response was truncated before completion.");
 	});
 
-	test("coalesces adjacent thinking blocks into one hidden thinking label", () => {
+	test("hides adjacent thinking blocks entirely", () => {
 		initTheme("dark");
 
 		const component = new AssistantMessageComponent(
@@ -88,7 +88,7 @@ describe("AssistantMessageComponent", () => {
 		);
 		const rendered = stripAnsi(component.render(80).join("\n"));
 
-		expect(rendered.match(/Thinking\.\.\./g)).toHaveLength(1);
+		expect(rendered).not.toContain("Thinking...");
 		expect(rendered).toContain("answer");
 	});
 
@@ -123,7 +123,7 @@ describe("AssistantMessageComponent", () => {
 
 		const collapsed = stripAnsi(component.render(width).join("\n"));
 		expect(collapsed).not.toContain("first reasoning");
-		expect(collapsed).toContain("Thinking...");
+		expect(collapsed).not.toContain("Thinking...");
 		expect(collapsed).toContain("second reasoning");
 	});
 
@@ -137,7 +137,6 @@ describe("AssistantMessageComponent", () => {
 			]),
 			false,
 			undefined,
-			"Thinking...",
 			1,
 		);
 		const lines = component.render(80).map((line) => stripAnsi(line));
@@ -155,7 +154,7 @@ describe("AssistantMessageComponent", () => {
 		initTheme("dark");
 		const calls: string[] = [];
 		const message = createAssistantMessage([{ type: "text", text: "The result is $x^2$." }]);
-		const component = new AssistantMessageComponent(message, false, undefined, "Thinking...", 1, [
+		const component = new AssistantMessageComponent(message, false, undefined, 1, [
 			(markdown, context) => {
 				calls.push("formula");
 				expect(context).toEqual({ messageType: "assistant", isStreaming: false, availableWidth: 78 });
@@ -175,7 +174,7 @@ describe("AssistantMessageComponent", () => {
 		initTheme("dark");
 		const streamingStates: boolean[] = [];
 		const message = createAssistantMessage([{ type: "text", text: "partial" }]);
-		const component = new AssistantMessageComponent(undefined, false, undefined, "Thinking...", 1, [
+		const component = new AssistantMessageComponent(undefined, false, undefined, 1, [
 			(markdown, context) => {
 				streamingStates.push(context.isStreaming);
 				return context.isStreaming ? markdown : `${markdown} transformed`;
@@ -197,7 +196,6 @@ describe("AssistantMessageComponent", () => {
 			createAssistantMessage([{ type: "text", text: "answer" }]),
 			false,
 			undefined,
-			"Thinking...",
 			1,
 			[
 				(markdown, context) => {
@@ -220,7 +218,6 @@ describe("AssistantMessageComponent", () => {
 			createAssistantMessage([{ type: "text", text: "still visible" }]),
 			false,
 			undefined,
-			"Thinking...",
 			1,
 			[
 				(markdown) => {
@@ -248,7 +245,7 @@ describe("AssistantMessageComponent", () => {
 			{ type: "text", text: "answer" },
 			{ type: "thinking", thinking: "reasoning" },
 		]);
-		const component = new AssistantMessageComponent(message, false, undefined, "Thinking...", 1, [
+		const component = new AssistantMessageComponent(message, false, undefined, 1, [
 			(markdown, { messageType }) => {
 				return `${messageType}:${markdown}`;
 			},
