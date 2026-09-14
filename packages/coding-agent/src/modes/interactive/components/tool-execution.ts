@@ -8,9 +8,9 @@ import {
 	MouseRegion,
 	Spacer,
 	Text,
-	TruncatedText,
 	type TUI,
 	type TuiMouseEvent,
+	truncateToWidth,
 } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../../../core/extensions/types.ts";
 import type { Theme } from "../theme/theme.ts";
@@ -36,7 +36,6 @@ export interface ToolRenderers {
 import { getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
 import { convertToPng } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
-import { DynamicBorder } from "./dynamic-border.ts";
 import { keyHint } from "./keybinding-hints.ts";
 
 const FALLBACK_PREVIEW_LINES = 10;
@@ -47,7 +46,6 @@ export interface ToolExecutionOptions {
 }
 
 export class ToolExecutionComponent extends Container {
-	private bottomBorder: DynamicBorder;
 	private contentBox: Box;
 	private contentText: Text;
 	private contentTextRegion: MouseRegion;
@@ -97,13 +95,13 @@ export class ToolExecutionComponent extends Container {
 		this.ui = ui;
 		this.cwd = cwd;
 
-		this.bottomBorder = new DynamicBorder((str) => theme.fg("border", str));
+		this.addChild(new Spacer(1));
 
 		// Always create all shell variants. contentBox is used for default renderer-based composition.
 		// selfRenderContainer is used when the tool renders its own framing.
 		// contentText is reserved for generic fallback rendering when no tool definition exists.
-		this.contentBox = new Box(0, 0, (text: string) => theme.bg("toolPendingBg", text));
-		this.contentText = new Text("", 0, 0, (text: string) => theme.bg("toolPendingBg", text));
+		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
 		this.contentTextRegion = this.createResultRegion(this.contentText);
 		this.selfRenderContainer = new Container();
 
@@ -153,7 +151,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private createCallFallback(): Component {
-		return new TruncatedText(this.formatCollapsedHeader(), 0, 0);
+		return new Text(this.formatCollapsedHeader(), 0, 0);
 	}
 
 	private formatCollapsedHeader(): string {
@@ -161,7 +159,9 @@ export class ToolExecutionComponent extends Container {
 		const command = isShell ? (this.args?.command as string | undefined) : undefined;
 		const firstLine = typeof command === "string" ? command.split(/\r\n|\r|\n/)[0]?.trim() : "";
 		if (firstLine) {
-			return theme.fg("toolTitle", `${theme.bold(this.toolName)}: ${firstLine}`);
+			const maxWidth = Math.max(20, this.ui.terminal.columns - 2);
+			const header = theme.fg("toolTitle", `${theme.bold(this.toolName)}: ${firstLine}`);
+			return truncateToWidth(header, maxWidth, "...");
 		}
 		return theme.fg("toolTitle", theme.bold(this.toolName));
 	}
@@ -269,7 +269,6 @@ export class ToolExecutionComponent extends Container {
 			return [];
 		}
 
-		let lines: string[];
 		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
 			const contentLines = this.selfRenderContainer.render(width);
 			this.selfRenderHeight = contentLines.length;
@@ -277,8 +276,9 @@ export class ToolExecutionComponent extends Container {
 				return [];
 			}
 
-			lines = [];
+			const lines: string[] = [];
 			if (contentLines.length > 0) {
+				lines.push("");
 				lines.push(...contentLines);
 			}
 			for (let i = 0; i < this.imageComponents.length; i++) {
@@ -291,22 +291,18 @@ export class ToolExecutionComponent extends Container {
 					lines.push(...imageComponent.render(width));
 				}
 			}
-		} else {
-			lines = super.render(width);
+			return lines;
 		}
 
-		if (lines.length > 0) {
-			lines.push(...this.bottomBorder.render(width));
-		}
-		return lines;
+		return super.render(width);
 	}
 
 	override handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
 		if (!this.hasRendererDefinition() || this.getRenderShell() !== "self") return super.handleMouse(event);
-		if (event.y < 0 || event.y >= this.selfRenderHeight) return undefined;
+		if (event.y <= 0 || event.y > this.selfRenderHeight) return undefined;
 		return this.selfRenderContainer.handleMouse({
 			...event,
-			y: event.y,
+			y: event.y - 1,
 			height: this.selfRenderHeight,
 		});
 	}
