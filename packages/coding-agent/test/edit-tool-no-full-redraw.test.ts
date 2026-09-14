@@ -110,7 +110,6 @@ describe("edit tool TUI rendering", () => {
 			tui,
 			process.cwd(),
 		);
-		component.setExpanded(true);
 		root.addChild(component);
 		tui.addChild(root);
 		tui.start();
@@ -180,7 +179,6 @@ describe("edit tool TUI rendering", () => {
 			tui,
 			process.cwd(),
 		);
-		component.setExpanded(true);
 		tui.addChild(component);
 		tui.start();
 		await waitForRender();
