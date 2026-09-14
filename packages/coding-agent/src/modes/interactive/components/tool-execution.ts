@@ -305,32 +305,6 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private updateDisplay(): void {
-		// Finished tool calls collapse to a single tool-name header line; Ctrl+O or a click
-		// expands to the full args and result rendering. Running calls (partial output) stay
-		// expanded so live progress remains visible.
-		if (!this.expanded && !this.isPartial) {
-			this.hideComponent = false;
-			const bgFn = this.isPartial
-				? (text: string) => theme.bg("toolPendingBg", text)
-				: this.result?.isError
-					? (text: string) => theme.bg("toolErrorBg", text)
-					: (text: string) => theme.bg("toolSuccessBg", text);
-			for (const image of this.imageComponents) this.removeChild(image);
-			this.imageComponents = [];
-			for (const spacer of this.imageSpacers) this.removeChild(spacer);
-			this.imageSpacers = [];
-			if (this.hasRendererDefinition()) {
-				const renderContainer = this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox;
-				if (renderContainer instanceof Box) renderContainer.setBgFn(bgFn);
-				renderContainer.clear();
-				renderContainer.addChild(this.createResultRegion(this.createCallFallback()));
-			} else {
-				this.contentText.setCustomBgFn(bgFn);
-				this.contentText.setText(theme.fg("toolTitle", theme.bold(this.toolName)));
-			}
-			return;
-		}
-
 		const bgFn = this.isPartial
 			? (text: string) => theme.bg("toolPendingBg", text)
 			: this.result?.isError
