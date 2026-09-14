@@ -10,7 +10,6 @@ import {
 	Text,
 	type TUI,
 	type TuiMouseEvent,
-	truncateToWidth,
 } from "@earendil-works/pi-tui";
 import type { ToolDefinition, ToolRenderContext, ToolRenderResultOptions } from "../../../core/extensions/types.ts";
 import type { Theme } from "../theme/theme.ts";
@@ -154,19 +153,7 @@ export class ToolExecutionComponent extends Container {
 	}
 
 	private createCallFallback(): Component {
-		return new Text(this.formatCollapsedHeader(), 0, 0);
-	}
-
-	private formatCollapsedHeader(): string {
-		const isShell = this.toolName === "bash" || this.toolName === "powershell";
-		const command = isShell ? (this.args?.command as string | undefined) : undefined;
-		const firstLine = typeof command === "string" ? command.split(/\r\n|\r|\n/)[0]?.trim() : "";
-		if (firstLine) {
-			const maxWidth = Math.max(20, this.ui.terminal.columns - 2);
-			const header = theme.fg("toolTitle", `${theme.bold(this.toolName)}: ${firstLine}`);
-			return truncateToWidth(header, maxWidth, "...");
-		}
-		return theme.fg("toolTitle", theme.bold(this.toolName));
+		return new Text(theme.fg("toolTitle", theme.bold(this.toolName)), 0, 0);
 	}
 
 	private createResultFallback(): Component | undefined {
