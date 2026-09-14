@@ -6,7 +6,7 @@
  * tool definition, so the tool's public shape is unchanged.
  */
 
-import { Container, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import { Container, Text, TruncatedText, truncateToWidth } from "@earendil-works/pi-tui";
 import { keyHint } from "../../../modes/interactive/components/keybinding-hints.ts";
 import { truncateToVisualLines } from "../../../modes/interactive/components/visual-truncate.ts";
 import { theme } from "../../../modes/interactive/theme/theme.ts";
@@ -78,7 +78,7 @@ function rebuildBashResultRenderComponent(
 			.join("\n");
 
 		if (options.expanded) {
-			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
+			component.addChild(new Text(styledOutput, 0, 0));
 		} else {
 			component.addChild({
 				render: (width: number) => {
@@ -92,9 +92,9 @@ function rebuildBashResultRenderComponent(
 						const hint =
 							theme.fg("muted", `... (${state.cachedSkipped} earlier lines,`) +
 							` ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
-						return ["", truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
+						return [truncateToWidth(hint, width, "..."), ...(state.cachedLines ?? [])];
 					}
-					return ["", ...(state.cachedLines ?? [])];
+					return [...(state.cachedLines ?? [])];
 				},
 				invalidate: () => {
 					state.cachedWidth = undefined;
@@ -119,13 +119,13 @@ function rebuildBashResultRenderComponent(
 				);
 			}
 		}
-		component.addChild(new Text(`\n${theme.fg("warning", `[${warnings.join(". ")}]`)}`, 0, 0));
+		component.addChild(new Text(theme.fg("warning", `[${warnings.join(". ")}]`), 0, 0));
 	}
 
 	if (startedAt !== undefined) {
 		const label = options.isPartial ? "Elapsed" : "Took";
 		const endTime = endedAt ?? Date.now();
-		component.addChild(new Text(`\n${theme.fg("muted", `${label} ${formatDuration(endTime - startedAt)}`)}`, 0, 0));
+		component.addChild(new Text(theme.fg("muted", `${label} ${formatDuration(endTime - startedAt)}`), 0, 0));
 	}
 }
 
@@ -138,9 +138,11 @@ export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, a
 				state.startedAt = Date.now();
 				state.endedAt = undefined;
 			}
-			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
-			text.setText(formatShellCall(args as { command?: string; timeout?: number } | undefined, prompt));
-			return text;
+			return new TruncatedText(
+				formatShellCall(args as { command?: string; timeout?: number } | undefined, prompt),
+				0,
+				0,
+			);
 		},
 		renderResult(result, options, _theme, context) {
 			const state = context.state;
