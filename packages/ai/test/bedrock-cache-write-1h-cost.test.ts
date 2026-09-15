@@ -72,7 +72,9 @@ describe("Bedrock 1h cache write cost", () => {
 
 		expect(result.usage.cacheWrite).toBe(1_000_000);
 		expect(result.usage.cacheWrite1h).toBe(400_000);
-		// 600k * 6.25/Mtok + 400k * 10/Mtok = 3.75 + 4.0 = 7.75
-		expect(result.usage.cost.cacheWrite).toBeCloseTo(7.75, 10);
+		// Five-minute writes use cacheWrite; one-hour writes cost twice the input rate.
+		const fiveMinuteCost = 0.6 * model.cost.cacheWrite;
+		const oneHourCost = 0.4 * model.cost.input * 2;
+		expect(result.usage.cost.cacheWrite).toBeCloseTo(fiveMinuteCost + oneHourCost, 10);
 	});
 });
