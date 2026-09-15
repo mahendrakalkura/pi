@@ -11,19 +11,21 @@ function createFakeTui(): TUI {
 	return { requestRender: () => {} } as unknown as TUI;
 }
 
-function selectedModelId(selector: ModelSelectorComponent): string | undefined {
-	const row = stripAnsi(selector.render(120).join("\n"))
-		.split("\n")
-		.find((line) => line.startsWith("→"));
-	return row?.replace(/^→\s*(✓\s*)?/, "").split(" ")[0];
-}
-
 // A box-table data row splits into cells around "│"; drop the two empty ends.
 function rowCells(line: string): string[] {
 	return line
 		.split("│")
 		.slice(1, -1)
 		.map((cell) => cell.trim());
+}
+
+// The Model cell of the row the selection marker is on.
+function selectedModelId(selector: ModelSelectorComponent): string | undefined {
+	const row = stripAnsi(selector.render(120).join("\n"))
+		.split("\n")
+		.map(rowCells)
+		.find((cells) => cells[0]?.startsWith("→"));
+	return row?.[3];
 }
 
 describe("model selector", () => {
@@ -69,8 +71,45 @@ describe("model selector", () => {
 		};
 
 		expect(getModelRow("current-model")).toBe("→ ✓");
-		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[A");
 		expect(getModelRow("current-model")).toBe("✓");
+		expect(getModelRow("browsed-model")).toBe("→");
+		selector.dispose();
+	});
+
+	it("stops at the list ends instead of wrapping", async () => {
+		harness = await createHarness({
+			models: [
+				{ id: "current-model", name: "Current Model", reasoning: true },
+				{ id: "browsed-model", name: "Browsed Model", reasoning: true },
+			],
+		});
+		const currentModel = harness.getModel("current-model")!;
+		const browsedModel = harness.getModel("browsed-model")!;
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			currentModel,
+			harness.session.modelRuntime,
+			[{ model: currentModel }, { model: browsedModel }],
+			() => {},
+			() => {},
+		);
+
+		const getModelRow = (id: string): string | undefined => {
+			const line = stripAnsi(selector.render(120).join("\n"))
+				.split("\n")
+				.find((candidate) => candidate.includes(` ${id} `));
+			return line ? rowCells(line)[0] : undefined;
+		};
+
+		// Sorted list is [browsed-model, current-model]; selection starts on current-model (bottom).
+		// Down at the bottom stays at the bottom.
+		selector.handleInput("\x1b[B");
+		expect(getModelRow("current-model")).toBe("→ ✓");
+		// Up moves to the top; up again at the top stays at the top.
+		selector.handleInput("\x1b[A");
+		expect(getModelRow("browsed-model")).toBe("→");
+		selector.handleInput("\x1b[A");
 		expect(getModelRow("browsed-model")).toBe("→");
 		selector.dispose();
 	});
@@ -204,9 +243,9 @@ describe("model selector", () => {
 			);
 			const finishRefresh = async () => {
 				resolve({ aborted: false, errors: new Map() });
-				await vi.waitFor(() => {
-					expect(stripAnsi(selector.render(120).join("\n"))).toContain("Model catalogs refreshed.");
-				});
+				// The selector shows no notice for a successful refresh; one macrotask lets its continuation run.
+				await promise;
+				await new Promise((done) => setTimeout(done, 0));
 			};
 			return { activeHarness, selector, finishRefresh };
 		}
@@ -248,7 +287,7 @@ describe("model selector", () => {
 			await finishRefresh();
 
 			expect(selectedModelId(selector)).toBe("alpha-2");
-			selector.handleInput("\x1b[A");
+			// Rows sort by client, provider and model, so the row above alpha-2 is alpha-1.
 			selector.handleInput("\x1b[A");
 			expect(selectedModelId(selector)).toBe("alpha-1");
 			selector.dispose();
