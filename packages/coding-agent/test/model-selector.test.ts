@@ -61,8 +61,45 @@ describe("model selector", () => {
 		};
 
 		expect(getModelRow("current-model")).toBe("→ ✓");
-		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[A");
 		expect(getModelRow("current-model")).toBe("✓");
+		expect(getModelRow("browsed-model")).toBe("→");
+		selector.dispose();
+	});
+
+	it("stops at the list ends instead of wrapping", async () => {
+		harness = await createHarness({
+			models: [
+				{ id: "current-model", name: "Current Model", reasoning: true },
+				{ id: "browsed-model", name: "Browsed Model", reasoning: true },
+			],
+		});
+		const currentModel = harness.getModel("current-model")!;
+		const browsedModel = harness.getModel("browsed-model")!;
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			currentModel,
+			harness.session.modelRuntime,
+			[{ model: currentModel }, { model: browsedModel }],
+			() => {},
+			() => {},
+		);
+
+		const getModelRow = (id: string): string | undefined => {
+			const line = stripAnsi(selector.render(120).join("\n"))
+				.split("\n")
+				.find((candidate) => candidate.includes(` ${id} `));
+			return line ? rowCells(line)[0] : undefined;
+		};
+
+		// Sorted list is [browsed-model, current-model]; selection starts on current-model (bottom).
+		// Down at the bottom stays at the bottom.
+		selector.handleInput("\x1b[B");
+		expect(getModelRow("current-model")).toBe("→ ✓");
+		// Up moves to the top; up again at the top stays at the top.
+		selector.handleInput("\x1b[A");
+		expect(getModelRow("browsed-model")).toBe("→");
+		selector.handleInput("\x1b[A");
 		expect(getModelRow("browsed-model")).toBe("→");
 		selector.dispose();
 	});
