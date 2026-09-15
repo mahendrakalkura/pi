@@ -122,3 +122,78 @@ For release preparation, publishing, verification, or recovery, load and follow 
 ## User Override
 
 If the user's instructions conflict with any rule in this document, ask for explicit confirmation before overriding. Only then execute their instructions.
+
+## Fork Maintenance
+
+This checkout is `github.com/mahendrakalkura/pi`, branch `mahendra`, with upstream `github.com/earendil-works/pi` as `origin`. Every local patch lives on `mahendra`; the binary that runs on the machine is `packages/coding-agent/dist/pi`, linked from `~/.local/bin/pi`. Pi configuration and the custom extension sources live in the dotfiles repository at `~/Repositories/gitlab.kalkura.com/mahendra-kalkura/dotfiles/.pi`.
+
+### What the fork carries
+
+- `scripts/build-pi-binary.mjs`: `Bun.build({ compile })` wrapper used by `build:binary`. Compiles every `*.ts` under `PI_BUNDLE_EXTENSIONS` and every package pinned in `packages/coding-agent/bundle/package.json` into the binary as inline extensions. `--test <dir>` bundles a directory of `*.test.ts` files the same way and runs `bun test` on the result.
+- `packages/coding-agent/src/bun/cli.ts` and `src/bun/bundled-extensions.ts`: the Bun entry passes the compiled-in extensions to `main()`; the module is empty in source and replaced at build time.
+- `packages/coding-agent/bundle/`: pinned extension packages and their `node_modules`. `node_modules` must stay on disk after the build because `pi-browser-use` spawns `chrome-devtools-mcp` from it as a Node process.
+- `packages/coding-agent/src/modes/interactive/components/model-selector.ts`: the `/model` picker shows only `settings.enabledModels`, disables the all/scoped Tab toggle, renders a box-drawn `cli-table3` table (`Client | Provider | Model | Name | Default`) sorted by client, provider, then model, windowed to the rows the terminal can show with the selection kept in view, and hides the row counter, selected model name, and successful refresh notice. Refresh failures remain visible.
+- `packages/coding-agent/package.json` carries `cli-table3`, shared by the selector and the custom `accounts` extension.
+- `packages/ai/src/api/google-shared.ts`: `FinishReason.TOO_MANY_TOOL_CALLS` case, needed for `tsgo --noEmit` with `@google/genai` 2.21.0.
+
+### Weekly sync and rebuild
+
+Run from the checkout root. Stop at the first failing step; nothing after it is safe to skip.
+
+```bash
+cd ~/Repositories/github.com/earendil-works/pi
+DOTFILES=~/Repositories/gitlab.kalkura.com/mahendra-kalkura/dotfiles
+
+# 1. Fetch upstream and rebase the patch series onto it. rerere replays earlier conflict resolutions.
+#    Upstream owns the rest of this AGENTS.md; when upstream edits it, the rebase conflicts at the
+#    appended "Fork Maintenance" section. Resolve by keeping both sides; rerere replays that thereafter.
+git fetch origin fork
+git switch mahendra
+git rebase origin/main
+# On a conflict: fix, `git add`, `git rebase --continue`. To abandon: `git rebase --abort`.
+
+# 2. Dependencies and generated model data (both change with upstream).
+mise exec node@24 -- npm install --ignore-scripts
+mise exec node@24 -- npm run hydrate:model-data
+
+# 3. Upstream gate. Any failure here is either an upstream regression or a patch that needs updating.
+mise exec node@24 -- npm exec -- biome check --error-on-warnings .
+mise exec node@24 -- npm run check:pinned-deps
+mise exec node@24 -- npm run check:runtime-deps
+mise exec node@24 -- npm run check:ts-imports
+mise exec node@24 -- npm run check:entry-graphs
+mise exec node@24 -- npm run check:shrinkwrap
+mise exec node@24 -- npm run check:install-lock:coding-agent
+mise exec node@24 -- npm exec -- tsgo --noEmit
+mise exec node@24 -- npm run check:browser-smoke
+env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
+# test.sh must not see the provider API keys the Fish shell exports: with keys present, Pi's
+# test harness sees hundreds of available models and the selector tests assert on a short list.
+
+# 4. Extension packages, then the binary with the dotfiles extensions compiled in.
+(cd packages/coding-agent/bundle && mise exec node@24 -- npm install --no-audit --no-fund)
+mise exec node@24 -- npm --prefix packages/chord run build
+PI_BUNDLE_EXTENSIONS="$DOTFILES/.pi/agent/extensions" mise exec node@24 -- npm --prefix packages/coding-agent run build:binary
+packages/coding-agent/dist/pi --version
+
+# 5. Extension tests against the modules the binary contains, then a smoke run.
+(cd packages/coding-agent && bun ../../scripts/build-pi-binary.mjs --test "$DOTFILES/.pi/tests")
+(cd /tmp && PI_TIMING=1 pi -p "reply ok" --model nr-deepseek/deepseek-v4-flash --thinking off)
+
+# 6. Publish the rebased branch. The rebase rewrote history, so a lease-protected force push is required.
+git push --force-with-lease fork mahendra
+```
+
+`~/.local/bin/pi` already points at `packages/coding-agent/dist/pi`, so the new binary is live as soon as step 4 finishes; there is nothing to relink.
+
+### Bumping an extension package
+
+Edit the version in `packages/coding-agent/bundle/package.json`, then run steps 4 and 5 and commit `package.json` and `package-lock.json`. A package that stops working inside the binary (typically one that resolves files through `import.meta.url` at import time) is replaced by a custom extension under `dotfiles/.pi/agent/extensions/` rather than patched here.
+
+### Changing a custom extension
+
+Edit under `dotfiles/.pi/agent/extensions/`, run steps 4 (the `build:binary` line only) and 5, and commit in dotfiles. Third-party imports a custom extension needs are declared in `packages/coding-agent/bundle/package.json`.
+
+### Bringing a patch back to upstream
+
+Rebase interactively to isolate the commit, `git switch -c <topic> origin/main`, `git cherry-pick <sha>`, push the topic branch to `fork`, and open the pull request against `earendil-works/pi`. When it merges, the next weekly rebase drops the local copy automatically.
