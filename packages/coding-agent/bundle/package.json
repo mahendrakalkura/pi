@@ -6,6 +6,7 @@
   "dependencies": {
     "@juicesharp/rpiv-ask-user-question": "2.10.0",
     "@tintinweb/pi-subagents": "file:../../../../../tintinweb/pi-subagents",
+    "pi-tool-display": "file:../../../../../MasuRii/pi-tool-display",
     "pi-ast-grep": "0.1.0",
     "pi-browser-use": "0.11.6",
     "pi-lsp-adapter": "0.1.3",
