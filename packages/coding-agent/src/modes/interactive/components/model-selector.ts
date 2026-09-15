@@ -379,16 +379,16 @@ export class ModelSelectorComponent extends Container implements Focusable {
 		if (kb.matches(keyData, "tui.input.tab")) {
 			return;
 		}
-		// Up arrow - wrap to bottom when at top
+		// Up arrow - stop at top
 		if (kb.matches(keyData, "tui.select.up")) {
 			if (this.filteredModels.length === 0) return;
-			this.selectedIndex = this.selectedIndex === 0 ? this.filteredModels.length - 1 : this.selectedIndex - 1;
+			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
 			this.updateList();
 		}
-		// Down arrow - wrap to top when at bottom
+		// Down arrow - stop at bottom
 		else if (kb.matches(keyData, "tui.select.down")) {
 			if (this.filteredModels.length === 0) return;
-			this.selectedIndex = this.selectedIndex === this.filteredModels.length - 1 ? 0 : this.selectedIndex + 1;
+			this.selectedIndex = Math.min(this.filteredModels.length - 1, this.selectedIndex + 1);
 			this.updateList();
 		}
 		// Enter
