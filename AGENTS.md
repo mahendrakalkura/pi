@@ -154,6 +154,12 @@ git rebase origin/main
 # On a conflict: fix, `git add`, `git rebase --continue`. To abandon: `git rebase --abort`.
 
 # 2. Dependencies and generated model data (both change with upstream).
+#    `package-lock.json` conflicts are resolved by taking upstream and regenerating afterwards with
+#    `npm install --package-lock-only --ignore-scripts`; never hand-merge lockfile hunks.
+#    `hydrate:model-data` fails with "Cannot hydrate missing providers: <id>" when models.dev stops
+#    serving a catalog the committed shards still import. Do not delete the provider: `src/providers/data/`
+#    is gitignored, so the tree cannot be repaired locally, and upstream restores it within a release.
+#    Rebase onto a newer origin/main first, which is what actually clears it.
 mise exec node@24 -- npm install --ignore-scripts
 mise exec node@24 -- npm run hydrate:model-data
 
