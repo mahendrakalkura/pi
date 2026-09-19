@@ -148,7 +148,9 @@ DOTFILES=~/Repositories/gitlab.kalkura.com/mahendra-kalkura/dotfiles
 # 1. Fetch upstream and rebase the patch series onto it. rerere replays earlier conflict resolutions.
 #    Upstream owns the rest of this AGENTS.md; when upstream edits it, the rebase conflicts at the
 #    appended "Fork Maintenance" section. Resolve by keeping both sides; rerere replays that thereafter.
-git fetch origin fork
+#    `--multiple` is required: `git fetch origin fork` reads `fork` as a refspec on `origin`, fails with
+#    "couldn't find remote ref fork", and fetches nothing, so the rebase below silently becomes a no-op.
+git fetch --multiple origin fork
 git switch mahendra
 git rebase origin/main
 # On a conflict: fix, `git add`, `git rebase --continue`. To abandon: `git rebase --abort`.
