@@ -30,6 +30,8 @@ type StartupNoticesContext = {
 	chatContainer: Container;
 	settingsManager: SettingsManager;
 	mermaidMarkdownTransformer: MarkdownTransformer;
+	options: { verbose?: boolean };
+	outputPad: number;
 	session: { extensionRunner: { getMarkdownTransformers(): MarkdownTransformer[] } };
 };
 
@@ -204,6 +206,8 @@ describe("InteractiveMode startup notices", () => {
 			chatContainer: new Container(),
 			settingsManager: SettingsManager.fromStorage(new InMemorySettingsStorage()),
 			mermaidMarkdownTransformer: (markdown) => markdown,
+			options: {},
+			outputPad: 1,
 			session: {
 				extensionRunner: {
 					getMarkdownTransformers: () => ExtensionRunner.prototype.getMarkdownTransformers.call(runner),
