@@ -167,6 +167,10 @@ mise exec node@24 -- npm install --ignore-scripts
 mise exec node@24 -- npm run hydrate:model-data
 
 # 3. Upstream gate. Any failure here is either an upstream regression or a patch that needs updating.
+#    `check:ts-imports` walks every directory except `.git`, `coverage`, `dist`, and `node_modules`, so the
+#    previous build's `.local-extensions/` copy of `browser-use.ts` trips it on its deliberate relative
+#    `../node_modules/pi-browser-use/dist/*.js` imports. Step 4 recreates the directory, so remove it first.
+gio trash packages/coding-agent/bundle/.local-extensions 2>/dev/null || true
 mise exec node@24 -- npm exec -- biome check --error-on-warnings .
 mise exec node@24 -- npm run check:pinned-deps
 mise exec node@24 -- npm run check:runtime-deps
