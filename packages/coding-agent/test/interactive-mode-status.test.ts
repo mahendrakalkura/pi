@@ -84,6 +84,7 @@ describe("InteractiveMode.showStatus", () => {
 			ui: { requestRender: vi.fn() },
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
+			outputPad: 1,
 		};
 
 		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_ONE");
@@ -103,6 +104,7 @@ describe("InteractiveMode.showStatus", () => {
 			ui: { requestRender: vi.fn() },
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
+			outputPad: 1,
 		};
 
 		(InteractiveMode as any).prototype.showStatus.call(fakeThis, "STATUS_ONE");
@@ -129,6 +131,7 @@ describe("InteractiveMode.showManagedToolStatus", () => {
 			managedToolStatusStarted: false,
 			lastStatusSpacer: undefined,
 			lastStatusText: undefined,
+			outputPad: 1,
 		};
 		const showManagedToolStatus = (InteractiveMode as any).prototype.showManagedToolStatus;
 
