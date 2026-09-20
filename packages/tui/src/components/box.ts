@@ -28,7 +28,7 @@ export class Box implements Component {
 	private cache?: RenderCache;
 	private childLines?: ChildLines;
 
-	constructor(paddingX = 1, paddingY = 1, bgFn?: (text: string) => string) {
+	constructor(paddingX = 0, paddingY = 1, bgFn?: (text: string) => string) {
 		this.paddingX = paddingX;
 		this.paddingY = paddingY;
 		this.bgFn = bgFn;
