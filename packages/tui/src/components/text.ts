@@ -15,7 +15,7 @@ export class Text implements Component {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(text: string = "", paddingX: number = 1, paddingY: number = 1, customBgFn?: (text: string) => string) {
+	constructor(text: string = "", paddingX: number = 0, paddingY: number = 1, customBgFn?: (text: string) => string) {
 		this.text = text;
 		this.paddingX = paddingX;
 		this.paddingY = paddingY;
