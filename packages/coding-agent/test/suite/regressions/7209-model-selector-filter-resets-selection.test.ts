@@ -12,11 +12,16 @@ function createFakeTui(): TUI {
 
 /** Return the model id of the highlighted (→) row in the rendered selector. */
 function selectedModelId(rendered: string): string | undefined {
-	const line = rendered.split("\n").find((l) => l.startsWith("→ "));
-	if (!line) return undefined;
-	const rest = line.replace(/^→\s*/, "");
-	const id = rest.split(" [")[0]?.replace(/^✓\s*/, "");
-	return id?.trim() || undefined;
+	const line = rendered.split("\n").find((candidate) => candidate.includes("│ →"));
+	return line ? rowCells(line)[3] : undefined;
+}
+
+// A box-table data row splits into cells around "│"; drop the two empty ends.
+function rowCells(line: string): string[] {
+	return line
+		.split("│")
+		.slice(1, -1)
+		.map((cell) => cell.trim());
 }
 
 describe("model selector filter resets selection to top", () => {
@@ -36,7 +41,7 @@ describe("model selector filter resets selection to top", () => {
 		}
 	});
 
-	it("moves selection to the first row in the All tab when typing a query", async () => {
+	it("moves selection to the first catalog row when typing a query", async () => {
 		const harness = await createHarness({
 			models: [
 				{ id: "alpha-1", name: "Alpha One", reasoning: true },
@@ -48,8 +53,10 @@ describe("model selector filter resets selection to top", () => {
 		harnesses.push(harness);
 
 		const current = harness.getModel("alpha-1")!;
+		const tui = createFakeTui();
+		const requestRender = vi.spyOn(tui, "requestRender");
 		const selector = new ModelSelectorComponent(
-			createFakeTui(),
+			tui,
 			current,
 			harness.session.modelRuntime,
 			[],
@@ -57,10 +64,7 @@ describe("model selector filter resets selection to top", () => {
 			() => {},
 		);
 
-		await vi.waitFor(() => {
-			const rendered = stripAnsi(selector.render(120).join("\n"));
-			expect(rendered).toContain("Model catalogs refreshed.");
-		});
+		await vi.waitFor(() => expect(requestRender).toHaveBeenCalledTimes(2));
 
 		// Current model (alpha-1) is sorted first, so selection starts on row 0.
 		expect(selectedModelId(stripAnsi(selector.render(120).join("\n")))).toBe("alpha-1");
@@ -82,7 +86,7 @@ describe("model selector filter resets selection to top", () => {
 		expect(rendered).not.toContain("beta-1");
 	});
 
-	it("moves selection to the first row in the Scoped tab when typing a query", async () => {
+	it("moves selection to the first scoped row when typing a query", async () => {
 		const harness = await createHarness({
 			models: [
 				{ id: "alpha-1", name: "Alpha One", reasoning: true },
@@ -96,10 +100,11 @@ describe("model selector filter resets selection to top", () => {
 		const alpha2 = harness.getModel("alpha-2")!;
 		const alpha3 = harness.getModel("alpha-3")!;
 
-		// Scoped list is intentionally not in current-model-first order; the
-		// current model (alpha-1) sits at index 2.
+		// The scoped list is sorted by id, so the current model (alpha-1) is row 0.
+		const tui = createFakeTui();
+		const requestRender = vi.spyOn(tui, "requestRender");
 		const selector = new ModelSelectorComponent(
-			createFakeTui(),
+			tui,
 			alpha1,
 			harness.session.modelRuntime,
 			[{ model: alpha2 }, { model: alpha3 }, { model: alpha1 }],
@@ -107,20 +112,20 @@ describe("model selector filter resets selection to top", () => {
 			() => {},
 		);
 
-		await vi.waitFor(() => {
-			const rendered = stripAnsi(selector.render(120).join("\n"));
-			expect(rendered).toContain("Model catalogs refreshed.");
-		});
+		await vi.waitFor(() => expect(requestRender).toHaveBeenCalledTimes(2));
 
-		// Selection starts on the current model (alpha-1), which is row 2 here.
+		// Selection starts on the current model (alpha-1), row 0 of the sorted list.
 		expect(selectedModelId(stripAnsi(selector.render(120).join("\n")))).toBe("alpha-1");
 
-		// Type a query matching all three scoped models. Selection must move to
-		// the top row (alpha-2), not stay clamped at index 2 (alpha-1).
+		// Move two rows down to alpha-3, then narrow with a query matching all three.
+		selector.handleInput("\x1b[B");
+		selector.handleInput("\x1b[B");
+		expect(selectedModelId(stripAnsi(selector.render(120).join("\n")))).toBe("alpha-3");
+
 		for (const char of "alpha") {
 			selector.handleInput(char);
 		}
 
-		expect(selectedModelId(stripAnsi(selector.render(120).join("\n")))).toBe("alpha-2");
+		expect(selectedModelId(stripAnsi(selector.render(120).join("\n")))).toBe("alpha-1");
 	});
 });
