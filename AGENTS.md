@@ -189,13 +189,17 @@ env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
 
 # 4. Extension packages, then the binary with the dotfiles extensions compiled in.
 (cd packages/coding-agent/bundle && mise exec node@24 -- npm install --no-audit --no-fund)
+#    `build:binary` does not build `pi-codemode` or `pi-mcp`, and `tsc` in coding-agent fails on their
+#    missing `dist/` without these two lines.
 mise exec node@24 -- npm --prefix packages/chord run build
+mise exec node@24 -- npm --prefix packages/codemode run build
+mise exec node@24 -- npm --prefix packages/mcp run build
 PI_BUNDLE_EXTENSIONS="$DOTFILES/.pi/agent/extensions" mise exec node@24 -- npm --prefix packages/coding-agent run build:binary
 packages/coding-agent/dist/pi --version
 
 # 5. Extension tests against the modules the binary contains, then a smoke run.
 (cd packages/coding-agent && bun ../../scripts/build-pi-binary.mjs --test "$DOTFILES/.pi/tests")
-(cd /tmp && PI_TIMING=1 pi -p "reply ok" --model nr-deepseek/deepseek-v4-flash --thinking off)
+(cd /tmp && PI_TIMING=1 pi -p "reply ok" --model nr-deepseek/deepseek-flash --thinking off)
 
 # 6. Publish the rebased branch. The rebase rewrote history, so a lease-protected force push is required.
 git push --force-with-lease fork mahendra
