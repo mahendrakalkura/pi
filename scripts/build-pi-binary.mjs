@@ -293,8 +293,16 @@ if (bundling) {
 
 const result = await Bun.build({
 	compile: { autoloadBunfig: false, autoloadDotenv: false, outfile },
-	entrypoints: [join(codingAgentDir, "src", "bun", "cli.ts"), join(codingAgentDir, "src", "utils", "image-resize-worker.ts")],
+	// Workers are embedded only as explicit entrypoints, at their path relative to `root`. Upstream's
+	// main entry is dist/bun/cli.js, which puts that root at the package directory; config.ts and
+	// image-resize.ts look the workers up under ./src/ accordingly, so the root is pinned to match.
+	entrypoints: [
+		join(codingAgentDir, "src", "bun", "cli.ts"),
+		join(codingAgentDir, "src", "extensions", "codemode", "worker.ts"),
+		join(codingAgentDir, "src", "utils", "image-resize-worker.ts"),
+	],
 	plugins: bundling ? [aliasPlugin(bundleDir), pinRequireResolvePlugin(bundleDir), bundledExtensionsPlugin(entries)] : [],
+	root: codingAgentDir,
 	target: "bun",
 });
 
