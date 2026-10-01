@@ -182,7 +182,10 @@ mise exec node@24 -- npm exec -- tsc --noEmit
 mise exec node@24 -- npm run check:browser-smoke
 # Child-process tests such as 2791-fswatch-error-crash import `@earendil-works/pi-tui` through its
 # `dist/`, so a stale build fails them with a missing-export SyntaxError. Rebuild it first.
+# The experimental durable tests import `@earendil-works/pi-durable/tools` the same way and fail with
+# "Cannot find package" on a stale `packages/durable/dist`.
 mise exec node@24 -- npm --prefix packages/tui run build
+mise exec node@24 -- npm --prefix packages/durable run build
 env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
 # test.sh must not see the provider API keys the Fish shell exports: with keys present, Pi's
 # test harness sees hundreds of available models and the selector tests assert on a short list.
