@@ -214,6 +214,15 @@ function hasLinkDefinitions(tokens: Token[]): boolean {
 }
 
 /**
+ * A copy of `text` that shares no memory with the string it was cut from. (Engines make a part of a string, and a part of
+ * a concatenation with it, out of the string's own memory; what JSON.parse() returns is a new string, the same text
+ * whatever is in it.)
+ */
+function ownString(text: string): string {
+	return JSON.parse(JSON.stringify(text)) as string;
+}
+
+/**
  * The tokens of `source`, which is `previous.source` with text added at its end. Where a top-level block ends depends on the
  * line that follows it and on nothing after that line. The last block may still be on its first line ("2" turning into "2."
  * makes it an item of the list before it), so the block before it is not settled either: the blocks before those two are
@@ -235,7 +244,10 @@ function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | un
 	for (let i = 0; i < last; i++) {
 		offset += previous.tokens[i].raw.length;
 	}
-	const added = markdownParser.lexer(source.slice(offset));
+	// The text of a token is a part of the string that was lexed, and keeps all of that string in memory. Lexing the end
+	// of `source` as a part of it would leave every block of a long message holding the whole message as it was when
+	// the block was lexed, megabytes for each answer: the end is lexed as a string of its own.
+	const added = markdownParser.lexer(ownString(source.slice(offset)));
 	if (hasLinkDefinitions(added)) {
 		return undefined;
 	}
@@ -299,6 +311,40 @@ function lexMarkdown(source: string): Token[] {
 		lexedMarkdown.shift();
 	}
 	return tokens;
+}
+
+/** Texts whose tabs were replaced last, most recent last, and what they became. */
+const textsWithoutTabs: Array<{ text: string; replaced: string }> = [];
+const TEXTS_WITHOUT_TABS_KEPT = 4;
+
+/**
+ * `text` with each tab replaced by three spaces. A message that is streaming in is rendered again each time it grows: what
+ * was replaced in it the last time is kept, and only the text added since is gone through.
+ */
+function replaceTabs(text: string): string {
+	if (!text.includes("\t")) {
+		return text;
+	}
+	if (!markdownCaching) {
+		return text.replace(/\t/g, "   ");
+	}
+	let replaced: string | undefined;
+	for (let i = textsWithoutTabs.length - 1; i >= 0 && replaced === undefined; i--) {
+		const entry = textsWithoutTabs[i];
+		if (text.length >= entry.text.length && text.startsWith(entry.text)) {
+			replaced =
+				text.length === entry.text.length
+					? entry.replaced
+					: entry.replaced + text.slice(entry.text.length).replace(/\t/g, "   ");
+			textsWithoutTabs.splice(i, 1);
+		}
+	}
+	replaced ??= text.replace(/\t/g, "   ");
+	textsWithoutTabs.push({ text, replaced });
+	if (textsWithoutTabs.length > TEXTS_WITHOUT_TABS_KEPT) {
+		textsWithoutTabs.shift();
+	}
+	return replaced;
 }
 
 /** What a top-level block was rendered to, and everything that went into it besides the token. */
@@ -537,7 +583,7 @@ export class Markdown implements Component {
 		const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
 
 		// Don't render anything if there's no actual text
-		if (!text || text.trim() === "") {
+		if (!text || !/\S/.test(text)) {
 			const result: string[] = [];
 			// Update cache
 			this.cachedText = this.text;
@@ -547,7 +593,7 @@ export class Markdown implements Component {
 		}
 
 		// Replace tabs with 3 spaces for consistent rendering
-		const normalizedText = text.replace(/\t/g, "   ");
+		const normalizedText = replaceTabs(text);
 
 		// Parse markdown to HTML-like tokens
 		const cached = this.cachedTokens?.deref();
