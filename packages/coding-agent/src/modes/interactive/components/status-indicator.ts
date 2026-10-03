@@ -8,6 +8,7 @@ export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSu
 
 export class StatusIndicator extends Loader {
 	readonly kind: StatusIndicatorKind;
+	private lastBorderLine: { line: string; width: number; text: string } | undefined;
 
 	constructor(
 		kind: StatusIndicatorKind,
@@ -23,7 +24,12 @@ export class StatusIndicator extends Loader {
 
 	renderInBorder(width: number): string {
 		const line = super.render(width + 2)[1] ?? "";
-		return truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
+		// The editor draws its border on every frame; the line changes with the spinner, a few times a second.
+		const last = this.lastBorderLine;
+		if (last && last.line === line && last.width === width) return last.text;
+		const text = truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
+		this.lastBorderLine = { line, width, text };
+		return text;
 	}
 
 	renderSpinnerInBorder(width: number): string {
