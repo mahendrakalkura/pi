@@ -67,6 +67,11 @@ export function createMermaidMarkdownTransformer(options: MermaidTransformerOpti
 		) {
 			return markdown;
 		}
+		// A Mermaid block names its language: without the word there is none, and no need to lex the text (again for every
+		// chunk of a message that streams in) to find that out.
+		if (!/mermaid/i.test(markdown)) {
+			return markdown;
+		}
 
 		return markdownParser
 			.lexer(markdown)

@@ -923,6 +923,68 @@ function getCliHighlightTheme(t: Theme): CliHighlightTheme {
 	return cachedCliHighlightTheme;
 }
 
+// Code highlighted lately, by language and text, for the theme it was highlighted with (most recent last). A message that is
+// streaming in is rendered again each time it grows, with every code block in it; all but the one being written are here.
+const HIGHLIGHTED_CODE_KEPT = 64;
+const HIGHLIGHTED_CODE_MAX_LENGTH = 512 * 1024;
+const highlightedCode = new Map<string, string[]>();
+let highlightedCodeLength = 0;
+let highlightedCodeTheme: Theme | undefined;
+let lastHighlightedKey: string | undefined;
+
+function rememberHighlightedCode(key: string, lines: string[]): void {
+	if (key.length > HIGHLIGHTED_CODE_MAX_LENGTH / 4) {
+		return;
+	}
+	// The block being written: its shorter self of a moment ago is not coming back.
+	if (
+		lastHighlightedKey !== undefined &&
+		key.length > lastHighlightedKey.length &&
+		key.startsWith(lastHighlightedKey)
+	) {
+		highlightedCode.delete(lastHighlightedKey);
+		highlightedCodeLength -= lastHighlightedKey.length;
+	}
+	highlightedCode.set(key, lines);
+	highlightedCodeLength += key.length;
+	lastHighlightedKey = key;
+	for (const oldest of highlightedCode.keys()) {
+		if (highlightedCode.size <= HIGHLIGHTED_CODE_KEPT && highlightedCodeLength <= HIGHLIGHTED_CODE_MAX_LENGTH) {
+			break;
+		}
+		highlightedCode.delete(oldest);
+		highlightedCodeLength -= oldest.length;
+	}
+}
+
+/**
+ * The lines of `code` highlighted as `lang`, a language that is supported, from what is kept or highlighted now and kept.
+ * Throws what highlight() throws.
+ */
+function highlightedLines(code: string, lang: string): string[] {
+	// (`theme` is a proxy: the theme in use is what it reads.)
+	const themeInUse = (globalThis as Record<symbol, Theme>)[THEME_KEY];
+	if (highlightedCodeTheme !== themeInUse) {
+		highlightedCodeTheme = themeInUse;
+		highlightedCode.clear();
+		highlightedCodeLength = 0;
+		lastHighlightedKey = undefined;
+	}
+	const key = `${lang}\n${code}`;
+	const known = highlightedCode.get(key);
+	if (known) {
+		// (Most recent last.)
+		highlightedCode.delete(key);
+		highlightedCode.set(key, known);
+		return known.slice();
+	}
+	const lines = highlight(code, { language: lang, ignoreIllegals: true, theme: getCliHighlightTheme(theme) }).split(
+		"\n",
+	);
+	rememberHighlightedCode(key, lines);
+	return lines.slice();
+}
+
 /**
  * Highlight code with syntax coloring based on file extension or language.
  * Returns array of highlighted lines.
@@ -936,13 +998,8 @@ export function highlightCode(code: string, lang?: string): string[] {
 	if (!validLang) {
 		return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
 	}
-	const opts = {
-		language: validLang,
-		ignoreIllegals: true,
-		theme: getCliHighlightTheme(theme),
-	};
 	try {
-		return highlight(code, opts).split("\n");
+		return highlightedLines(code, validLang);
 	} catch {
 		return code.split("\n");
 	}
@@ -1044,13 +1101,8 @@ export function getMarkdownTheme(): MarkdownTheme {
 			if (!validLang) {
 				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
 			}
-			const opts = {
-				language: validLang,
-				ignoreIllegals: true,
-				theme: getCliHighlightTheme(theme),
-			};
 			try {
-				return highlight(code, opts).split("\n");
+				return highlightedLines(code, validLang);
 			} catch {
 				return code.split("\n").map((line) => theme.fg("mdCodeBlock", line));
 			}

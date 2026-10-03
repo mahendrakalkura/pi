@@ -8,6 +8,9 @@ const OSC133_ZONE_START = "\x1b]133;A\x07";
 const OSC133_ZONE_END = "\x1b]133;B\x07";
 const OSC133_ZONE_FINAL = "\x1b]133;C\x07";
 
+// One function for every render: the Markdown component keeps what it rendered for as long as its style is the same.
+const thinkingTextColor = (text: string): string => theme.fg("thinkingText", text);
+
 /**
  * Component that renders a complete assistant message
  */
@@ -161,7 +164,7 @@ export class AssistantMessageComponent extends Container {
 							0,
 							this.markdownTheme,
 							{
-								color: (text: string) => theme.fg("thinkingText", text),
+								color: thinkingTextColor,
 								italic: true,
 							},
 							{
