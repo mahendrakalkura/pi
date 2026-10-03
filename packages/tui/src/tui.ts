@@ -4,6 +4,7 @@
 
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
+import { invalidateRenderedMarkdown } from "./rendered-markdown.ts";
 import type { Terminal } from "./terminal.ts";
 import {
 	parseOscColorResponse,
@@ -943,6 +944,8 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	override invalidate(): void {
+		// (Also when no Markdown component is mounted to be told: what was rendered before may be taken up by a later one.)
+		invalidateRenderedMarkdown();
 		for (const root of this.getMountedRoots()) root.invalidate();
 		for (const overlay of this.overlayStack) overlay.component.invalidate();
 	}

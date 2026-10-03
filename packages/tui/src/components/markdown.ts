@@ -1,6 +1,7 @@
 import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens } from "marked";
 import markedCjkFriendly from "marked-cjk-friendly";
 import { renderLatex } from "../latex.ts";
+import { invalidateRenderedMarkdown, renderedMarkdownGeneration } from "../rendered-markdown.ts";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
 import type { Component } from "../tui.ts";
 import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
@@ -196,6 +197,144 @@ markdownParser.use({
 	extensions: [...LATEX_MARKDOWN_EXTENSIONS],
 });
 
+interface LexedMarkdown {
+	source: string;
+	tokens: Token[];
+	/** Whether lexing can go on from these tokens when text is added to the source. */
+	resumable: boolean;
+}
+
+/** The sources lexed last, most recent last: a message that is streaming in is lexed again each time it grows. */
+const lexedMarkdown: LexedMarkdown[] = [];
+const LEXED_MARKDOWN_KEPT = 8;
+
+function hasLinkDefinitions(tokens: Token[]): boolean {
+	const links = (tokens as Partial<{ links: Record<string, unknown> }>).links;
+	return links !== undefined && Object.keys(links).length > 0;
+}
+
+/**
+ * The tokens of `source`, which is `previous.source` with text added at its end. Where a top-level block ends depends on the
+ * line that follows it and on nothing after that line. The last block may still be on its first line ("2" turning into "2."
+ * makes it an item of the list before it), so the block before it is not settled either: the blocks before those two are
+ * what they were, and the text from the last two on is lexed.
+ * Undefined when that would not give what lexing all of it gives: link definitions change how links before them read.
+ */
+function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | undefined {
+	let last = previous.tokens.length;
+	for (let blocks = 0; blocks < 2; blocks++) {
+		last--;
+		while (last >= 0 && previous.tokens[last].type === "space") {
+			last--;
+		}
+	}
+	if (last <= 0) {
+		return undefined;
+	}
+	let offset = 0;
+	for (let i = 0; i < last; i++) {
+		offset += previous.tokens[i].raw.length;
+	}
+	const added = markdownParser.lexer(source.slice(offset));
+	if (hasLinkDefinitions(added)) {
+		return undefined;
+	}
+	const tokens = previous.tokens.slice(0, last);
+	let length = offset;
+	for (const token of added) {
+		tokens.push(token);
+		length += token.raw.length;
+	}
+	// (As in lexMarkdown(): the next time, each token has to begin where the ones before it add up to.)
+	return length === source.length ? tokens : undefined;
+}
+
+/**
+ * Lexes Markdown, reusing what was lexed before when `source` is a source lexed earlier or one with text added at its end
+ * (a message streaming in), so that the cost of a new chunk does not grow with the length of the message.
+ */
+function lexMarkdown(source: string): Token[] {
+	if (!markdownCaching) {
+		const tokens = markdownParser.lexer(source);
+		trimPartialClosingFences(tokens);
+		return tokens;
+	}
+	let previous = -1;
+	for (let i = lexedMarkdown.length - 1; i >= 0; i--) {
+		const entry = lexedMarkdown[i];
+		if (entry.source === source) {
+			lexedMarkdown.splice(i, 1);
+			lexedMarkdown.push(entry);
+			return entry.tokens;
+		}
+		if (
+			entry.resumable &&
+			source.length > entry.source.length &&
+			(previous < 0 || entry.source.length > lexedMarkdown[previous].source.length) &&
+			source.startsWith(entry.source)
+		) {
+			previous = i;
+		}
+	}
+
+	let tokens = previous >= 0 ? lexAddedMarkdown(lexedMarkdown[previous], source) : undefined;
+	let resumable = tokens !== undefined;
+	if (!tokens) {
+		tokens = markdownParser.lexer(source);
+		let length = 0;
+		for (const token of tokens) {
+			length += token.raw.length;
+		}
+		// (The lexer rewrites line endings: only when the tokens add up to the source is it known where each begins.)
+		resumable = !hasLinkDefinitions(tokens) && length === source.length;
+	}
+	trimPartialClosingFences(tokens);
+
+	if (previous >= 0) {
+		// The shorter source is not coming back.
+		lexedMarkdown.splice(previous, 1);
+	}
+	lexedMarkdown.push({ source, tokens, resumable });
+	if (lexedMarkdown.length > LEXED_MARKDOWN_KEPT) {
+		lexedMarkdown.shift();
+	}
+	return tokens;
+}
+
+/** What a top-level block was rendered to, and everything that went into it besides the token. */
+interface RenderedBlock {
+	generation: number;
+	width: number;
+	paddingX: number;
+	nextTokenType: string | undefined;
+	theme: MarkdownTheme;
+	color: DefaultTextStyle["color"];
+	bgColor: DefaultTextStyle["bgColor"];
+	bold: boolean | undefined;
+	italic: boolean | undefined;
+	strikethrough: boolean | undefined;
+	underline: boolean | undefined;
+	preserveOrderedListMarkers: boolean | undefined;
+	preserveBackslashEscapes: boolean | undefined;
+	renderLatex: boolean | undefined;
+	capabilities: ReturnType<typeof getCapabilities>;
+	lines: string[];
+}
+
+const renderedBlocks = new WeakMap<Token, RenderedBlock>();
+
+let markdownCaching = true;
+
+/** For tests: with caching off, every render lexes and renders all of its text, taking and keeping nothing. */
+export function setMarkdownCachingForTest(enabled: boolean): void {
+	markdownCaching = enabled;
+}
+
+/** For tests: lexes as render() does. */
+export function lexMarkdownForTest(source: string): Token[] {
+	return lexMarkdown(source);
+}
+
 /**
  * Default text styling for markdown content.
  * Applied to all text unless overridden by markdown formatting.
@@ -291,13 +430,100 @@ export class Markdown implements Component {
 
 	setText(text: string): void {
 		this.text = text;
-		this.invalidate();
+		this.cachedText = undefined;
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
 	}
 
 	invalidate(): void {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		// What the theme's functions give may have changed: nothing rendered with them is good any more.
+		invalidateRenderedMarkdown();
+	}
+
+	/**
+	 * The lines of one top-level block: rendered, wrapped, with margins and background. Kept with the token, which stays the
+	 * same object while the text before the last blocks of a message stays the same (lexMarkdown()).
+	 */
+	private renderBlock(token: Token, nextTokenType: string | undefined, width: number, contentWidth: number): string[] {
+		const style = this.defaultTextStyle;
+		const capabilities = getCapabilities();
+		const known = markdownCaching ? renderedBlocks.get(token) : undefined;
+		if (
+			known &&
+			known.generation === renderedMarkdownGeneration() &&
+			known.width === width &&
+			known.paddingX === this.paddingX &&
+			known.nextTokenType === nextTokenType &&
+			known.theme === this.theme &&
+			known.color === style?.color &&
+			known.bgColor === style?.bgColor &&
+			known.bold === style?.bold &&
+			known.italic === style?.italic &&
+			known.strikethrough === style?.strikethrough &&
+			known.underline === style?.underline &&
+			known.preserveOrderedListMarkers === this.options.preserveOrderedListMarkers &&
+			known.preserveBackslashEscapes === this.options.preserveBackslashEscapes &&
+			known.renderLatex === this.options.renderLatex &&
+			known.capabilities === capabilities
+		) {
+			return known.lines;
+		}
+
+		const leftMargin = " ".repeat(this.paddingX);
+		const rightMargin = " ".repeat(this.paddingX);
+		const bgFn = style?.bgColor;
+		const lines: string[] = [];
+		const add = (line: string) => {
+			if (isImageLine(line)) {
+				lines.push(line);
+				return;
+			}
+			const lineWithMargins = leftMargin + line + rightMargin;
+			if (bgFn) {
+				lines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
+			} else {
+				// No background - just pad to width
+				const visibleLen = visibleWidth(lineWithMargins);
+				const paddingNeeded = Math.max(0, width - visibleLen);
+				lines.push(lineWithMargins + " ".repeat(paddingNeeded));
+			}
+		};
+		for (const line of this.renderToken(token, contentWidth, nextTokenType)) {
+			// Wrap lines (NO padding, NO background yet)
+			if (isImageLine(line)) {
+				add(line);
+			} else {
+				for (const wrappedLine of wrapTextWithAnsi(line, contentWidth)) {
+					add(wrappedLine);
+				}
+			}
+		}
+		flattenLines(lines);
+		if (!markdownCaching) {
+			return lines;
+		}
+		renderedBlocks.set(token, {
+			generation: renderedMarkdownGeneration(),
+			width,
+			paddingX: this.paddingX,
+			nextTokenType,
+			theme: this.theme,
+			color: style?.color,
+			bgColor: style?.bgColor,
+			bold: style?.bold,
+			italic: style?.italic,
+			strikethrough: style?.strikethrough,
+			underline: style?.underline,
+			preserveOrderedListMarkers: this.options.preserveOrderedListMarkers,
+			preserveBackslashEscapes: this.options.preserveBackslashEscapes,
+			renderLatex: this.options.renderLatex,
+			capabilities,
+			lines,
+		});
+		return lines;
 	}
 
 	render(width: number): string[] {
@@ -327,56 +553,17 @@ export class Markdown implements Component {
 		const cached = this.cachedTokens?.deref();
 		let tokens = cached?.source === normalizedText ? cached.tokens : undefined;
 		if (!tokens) {
-			tokens = markdownParser.lexer(normalizedText);
-			trimPartialClosingFences(tokens);
+			tokens = lexMarkdown(normalizedText);
 			this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
 		}
 
-		// Convert tokens to styled terminal output
-		const renderedLines: string[] = [];
-
-		for (let i = 0; i < tokens.length; i++) {
-			const token = tokens[i];
-			const nextToken = tokens[i + 1];
-			const tokenLines = this.renderToken(token, contentWidth, nextToken?.type);
-			for (const tokenLine of tokenLines) {
-				renderedLines.push(tokenLine);
-			}
-		}
-
-		// Wrap lines (NO padding, NO background yet)
-		const wrappedLines: string[] = [];
-		for (const line of renderedLines) {
-			if (isImageLine(line)) {
-				wrappedLines.push(line);
-			} else {
-				for (const wrappedLine of wrapTextWithAnsi(line, contentWidth)) {
-					wrappedLines.push(wrappedLine);
-				}
-			}
-		}
-
-		// Add margins and background to each wrapped line
-		const leftMargin = " ".repeat(this.paddingX);
-		const rightMargin = " ".repeat(this.paddingX);
+		// Convert tokens to styled terminal output, wrapped, with margins and background: block by block, each from what it
+		// was rendered to the last time when nothing it depends on has changed.
 		const bgFn = this.defaultTextStyle?.bgColor;
 		const contentLines: string[] = [];
-
-		for (const line of wrappedLines) {
-			if (isImageLine(line)) {
+		for (let i = 0; i < tokens.length; i++) {
+			for (const line of this.renderBlock(tokens[i], tokens[i + 1]?.type, width, contentWidth)) {
 				contentLines.push(line);
-				continue;
-			}
-
-			const lineWithMargins = leftMargin + line + rightMargin;
-
-			if (bgFn) {
-				contentLines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
-			} else {
-				// No background - just pad to width
-				const visibleLen = visibleWidth(lineWithMargins);
-				const paddingNeeded = Math.max(0, width - visibleLen);
-				contentLines.push(lineWithMargins + " ".repeat(paddingNeeded));
 			}
 		}
 
@@ -389,8 +576,9 @@ export class Markdown implements Component {
 		}
 
 		// Combine top padding, content, and bottom padding
+		// (The lines of the blocks are flat already: renderBlock().)
+		flattenLines(emptyLines);
 		const result = emptyLines.concat(contentLines, emptyLines);
-		flattenLines(result);
 
 		// Update cache
 		this.cachedText = this.text;
