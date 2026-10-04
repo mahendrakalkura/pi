@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
-import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { getFileRevision, normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
@@ -165,6 +165,8 @@ export interface SettingsManagerCreateOptions {
 
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
+	/** What withLock() would hand its callback, for a caller that only reads. Optional: withLock() is used without it. */
+	read?(scope: SettingsScope): string | undefined;
 }
 
 export interface SettingsError {
@@ -182,6 +184,11 @@ function toSettingsError(scope: SettingsScope, error: unknown, path?: string): S
 		error: error instanceof Error ? error : new Error(String(error)),
 	};
 }
+
+// What each settings file held when it was last read under its lock, with the file's revision at that time. A start reads
+// settings.json four times (three SettingsManagers and a reload), and every read took the lock: a directory made and
+// removed beside the file. An unchanged file is now read once.
+const settingsFileReads = new Map<string, { revision: string; content: string }>();
 
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
@@ -219,6 +226,31 @@ export class FileSettingsStorage implements SettingsStorage {
 		}
 
 		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
+	}
+
+	read(scope: SettingsScope): string | undefined {
+		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+		const revision = getFileRevision(path);
+		if (revision === undefined) {
+			settingsFileReads.delete(path);
+			return undefined;
+		}
+		const cached = settingsFileReads.get(path);
+		if (cached?.revision === revision) {
+			return cached.content;
+		}
+		let content: string | undefined;
+		this.withLock(scope, (current) => {
+			content = current;
+			return undefined;
+		});
+		// Kept only if the file is what it was before it was read.
+		if (content !== undefined && getFileRevision(path) === revision) {
+			settingsFileReads.set(path, { revision, content });
+		} else {
+			settingsFileReads.delete(path);
+		}
+		return content;
 	}
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
@@ -369,10 +401,14 @@ export class SettingsManager {
 		}
 
 		let content: string | undefined;
-		storage.withLock(scope, (current) => {
-			content = current;
-			return undefined;
-		});
+		if (storage.read) {
+			content = storage.read(scope);
+		} else {
+			storage.withLock(scope, (current) => {
+				content = current;
+				return undefined;
+			});
+		}
 
 		if (!content) {
 			return {};
