@@ -103,6 +103,26 @@ describe("remote catalog provider", () => {
 		expect(requested.searchParams.get("types")).toBe(REMOTE_CATALOG_MODEL_TYPES.join(","));
 	});
 
+	it("gives each caller its own list of the models, and the models as they are after a refresh", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(JSON.stringify({ dynamic: model("dynamic") }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const provider = testProvider();
+		const before = provider.getModels();
+		expect(before.map((entry) => entry.id)).toEqual(["static"]);
+		(before as Model<"openai-completions">[]).push(model("pushed by a caller"));
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static"]);
+		expect(provider.getModels()).not.toBe(provider.getModels());
+
+		await refreshProvider(provider, new InMemoryModelsStore());
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
+		expect(provider.getAllModels?.().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
+	});
+
 	it("overlays image and classifier models and drops unknown model types", async () => {
 		vi.spyOn(globalThis, "fetch").mockImplementation(
 			async () =>
