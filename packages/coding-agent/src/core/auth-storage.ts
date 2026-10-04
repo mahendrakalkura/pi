@@ -10,7 +10,7 @@ import lockfile from "proper-lockfile";
 import { setTimeout as sleep } from "timers/promises";
 import { getAgentDir } from "../config.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
-import { getFileRevision, normalizePath } from "../utils/paths.ts";
+import { getFileRevision, getFileRevisionThisTurn, normalizePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { isCommandConfigValue, resolveConfigValue } from "./resolve-config-value.ts";
 
@@ -405,7 +405,7 @@ export class AuthStorage implements CredentialStore {
 			const reload = this.reloadFromStorageAsync(options);
 			return options?.signal ? reload : reload.catch(() => this.readState.data);
 		}
-		const revision = getFileRevision(this.authPath);
+		const revision = getFileRevisionThisTurn(this.authPath);
 		if (revision !== undefined && revision === this.readState.revision) return this.readState.data;
 		if (!this.readState.reload) {
 			const controller = new AbortController();

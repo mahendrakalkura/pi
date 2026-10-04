@@ -6,6 +6,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	canonicalizePath,
 	getCwdRelativePath,
+	getFileRevision,
+	getFileRevisionThisTurn,
 	isLocalPath,
 	normalizePath,
 	normalizeWindowsShellPath,
@@ -180,5 +182,42 @@ describe("isLocalPath", () => {
 
 	it("returns false for https: protocol", () => {
 		expect(isLocalPath("https://example.com")).toBe(false);
+	});
+});
+
+describe("getFileRevisionThisTurn", () => {
+	it("looks a file up once in a turn, and again in the next", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-revision-"));
+		try {
+			const file = join(dir, "auth.json");
+			writeFileSync(file, "{}");
+			const first = getFileRevisionThisTurn(file);
+			expect(first).toBe(getFileRevision(file));
+			writeFileSync(file, '{"changed": true}');
+			// The same turn: what was looked up.
+			expect(getFileRevisionThisTurn(file)).toBe(first);
+			await Promise.resolve();
+			// The next: the file as it is.
+			const next = getFileRevisionThisTurn(file);
+			expect(next).not.toBe(first);
+			expect(next).toBe(getFileRevision(file));
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("follows a revision read again with getFileRevision() in the same turn", () => {
+		const dir = mkdtempSync(join(tmpdir(), "pi-revision-"));
+		try {
+			const file = join(dir, "models-store.json");
+			writeFileSync(file, "{}");
+			const first = getFileRevisionThisTurn(file);
+			writeFileSync(file, '{"changed": true}');
+			const fresh = getFileRevision(file);
+			expect(fresh).not.toBe(first);
+			expect(getFileRevisionThisTurn(file)).toBe(fresh);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 });
