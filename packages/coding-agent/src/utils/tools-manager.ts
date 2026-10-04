@@ -1,7 +1,18 @@
 import { type SpawnSyncReturns, spawnSync } from "child_process";
-import { chmodSync, createWriteStream, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "fs";
+import {
+	accessSync,
+	chmodSync,
+	constants,
+	createWriteStream,
+	existsSync,
+	mkdirSync,
+	readdirSync,
+	renameSync,
+	rmSync,
+	statSync,
+} from "fs";
 import { arch, platform } from "os";
-import { join } from "path";
+import { delimiter, join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
 import { getBinDir, VERSION } from "../config.ts";
@@ -58,7 +69,21 @@ const TOOLS: Record<string, ToolConfig> = {
 };
 
 // Check if a command exists in PATH by trying to run it
+// Whether cmd is an executable file in PATH, which is what spawning it finds. Elsewhere than on Windows it is looked up rather
+// than run as `cmd --version`: Pi asks for rg and fd before its first frame, and spawning one held the start for milliseconds.
 function commandExists(cmd: string): boolean {
+	if (platform() !== "win32") {
+		for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+			if (!dir) continue;
+			const file = join(dir, cmd);
+			try {
+				if (!statSync(file).isFile()) continue;
+				accessSync(file, constants.X_OK);
+				return true;
+			} catch {}
+		}
+		return false;
+	}
 	try {
 		const result = spawnSync(cmd, ["--version"], { stdio: "pipe" });
 		// Check for ENOENT error (command not found)
