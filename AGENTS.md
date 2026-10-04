@@ -176,7 +176,6 @@ mise exec node@24 -- npm run check:pinned-deps
 mise exec node@24 -- npm run check:runtime-deps
 mise exec node@24 -- npm run check:ts-imports
 mise exec node@24 -- npm run check:entry-graphs
-mise exec node@24 -- npm run check:shrinkwrap
 mise exec node@24 -- npm run check:install-lock:coding-agent
 mise exec node@24 -- npm exec -- tsc --noEmit
 mise exec node@24 -- npm run check:browser-smoke
