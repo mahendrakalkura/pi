@@ -449,6 +449,18 @@ function asciiVisibleWidth(str: string): number {
 			const length = ansiCodeLength(str, i);
 			if (length === 0) return -1;
 			i += length;
+		} else if (
+			(code >= 0xa0 && code <= 0x2ff && code !== 0xad) ||
+			(code >= 0x2500 && code <= 0x25fc) ||
+			(code >= 0x2010 && code <= 0x2027) ||
+			(code >= 0x2190 && code <= 0x22ff)
+		) {
+			// Latin-1 and Latin Extended letters and signs, typographic punctuation, arrows and mathematical operators,
+			// box drawing, block elements and geometric shapes: each is a grapheme of its own, one cell wide, whatever
+			// is beside it here (anything that would join it, such as a combining mark or a variation selector, is
+			// outside these ranges and takes the general path).
+			width++;
+			i++;
 		} else {
 			return -1;
 		}
@@ -1151,6 +1163,12 @@ export function truncateToWidth(
 			return pad ? " ".repeat(maxWidth) : "";
 		}
 		return finalizeTruncatedResult("", 0, clippedEllipsis.text, clippedEllipsis.width, maxWidth, pad);
+	}
+
+	// Text of single-cell characters and escape sequences that fits is returned as it is, without segmenting it.
+	const simpleWidth = asciiVisibleWidth(text);
+	if (simpleWidth !== -1 && simpleWidth <= maxWidth) {
+		return pad ? text + " ".repeat(maxWidth - simpleWidth) : text;
 	}
 
 	if (isPrintableAscii(text)) {
