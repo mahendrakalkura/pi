@@ -126,7 +126,13 @@ import type { TruncationResult } from "../../core/tools/truncate.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "../../core/trust-manager.ts";
 import { getUsageCostBreakdown } from "../../core/usage-totals.ts";
 import { addMcpServerConfig } from "../../extensions/mcp/config.ts";
-import { getChangelogPath, getNewEntries, normalizeChangelogLinks, parseChangelog } from "../../utils/changelog.ts";
+import {
+	getChangelogPath,
+	getNewEntries,
+	isVersionAtLeast,
+	normalizeChangelogLinks,
+	parseChangelog,
+} from "../../utils/changelog.ts";
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
 import { parseGitUrl } from "../../utils/git.ts";
@@ -134,8 +140,7 @@ import { ensurePngTranscoder } from "../../utils/image-convert.ts";
 import { getCwdRelativePath, shortenHomePath } from "../../utils/paths.ts";
 import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
-import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.ts";
-import { stripBom } from "../../utils/text.ts";
+import { loadAllHighlightLanguagesOnDemand } from "../../utils/syntax-highlight.ts";
 import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
 import { reportBug } from "./bug-report.ts";
@@ -1161,7 +1166,7 @@ export class InteractiveMode {
 
 		// Flush the completed startup state before loading the remaining syntax grammars.
 		this.ui.renderNow();
-		void loadAllHighlightLanguages().then(() => {
+		loadAllHighlightLanguagesOnDemand(() => {
 			if (!this.isInitialized) return;
 			this.ui.invalidate();
 			this.ui.requestRender();
@@ -1389,8 +1394,6 @@ export class InteractiveMode {
 		}
 
 		const lastVersion = this.settingsManager.getLastChangelogVersion();
-		const changelogPath = getChangelogPath();
-		const entries = parseChangelog(changelogPath);
 
 		if (!lastVersion) {
 			// Fresh install - record the version, send telemetry, don't show changelog
@@ -1398,6 +1401,15 @@ export class InteractiveMode {
 			this.reportInstallTelemetry(VERSION);
 			return undefined;
 		}
+
+		// The changelog of a version has no entry newer than that version: once this version's entries have been shown
+		// (every start but the first after an update), there is nothing to look for, and the file (600 KB) is not read.
+		if (isVersionAtLeast(lastVersion, VERSION)) {
+			return undefined;
+		}
+
+		const changelogPath = getChangelogPath();
+		const entries = parseChangelog(changelogPath);
 
 		const newEntries = getNewEntries(entries, lastVersion);
 		if (!newEntries) {
