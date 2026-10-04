@@ -188,6 +188,7 @@ import {
 	getEditorTheme,
 	getMarkdownTheme,
 	getThemeByName,
+	liveTheme,
 	onThemeChange,
 	SYSTEM_THEME_NAME,
 	setRegisteredThemes,
@@ -2774,7 +2775,7 @@ export class InteractiveMode {
 			setEditorComponent: (factory) => this.setCustomEditorComponent(factory),
 			getEditorComponent: () => this.editorComponentFactory,
 			get theme() {
-				return theme;
+				return liveTheme;
 			},
 			getAllThemes: () => getAvailableThemesWithPaths(),
 			getTheme: (name) => getThemeByName(name),
