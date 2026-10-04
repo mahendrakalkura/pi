@@ -1092,16 +1092,28 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 	const baselineModels = input.models;
 	let dynamicModels: readonly ProviderModel<TApi>[] = [];
 	const fetchModels = input.fetchModels;
-	const currentModels = (): readonly ProviderModel<TApi>[] => {
-		const merged = [...baselineModels];
+	// The models as they are merged for the dynamic models of the moment: asked for hundreds of times as Pi starts (for every
+	// provider, each time any provider's models change), and merged again only when the dynamic models change. Each caller
+	// gets an array of its own, as before.
+	let merged:
+		| { dynamic: readonly ProviderModel<TApi>[]; all: ProviderModel<TApi>[]; chat?: Model<TApi>[] }
+		| undefined;
+	const mergedModels = () => {
+		if (merged?.dynamic === dynamicModels) return merged;
+		const all = [...baselineModels];
 		for (const model of dynamicModels) {
-			const index = merged.findIndex(
-				(entry) => getModelType(entry) === getModelType(model) && entry.id === model.id,
-			);
-			if (index >= 0) merged[index] = model;
-			else merged.push(model);
+			const index = all.findIndex((entry) => getModelType(entry) === getModelType(model) && entry.id === model.id);
+			if (index >= 0) all[index] = model;
+			else all.push(model);
 		}
+		merged = { dynamic: dynamicModels, all };
 		return merged;
+	};
+	const currentModels = (): readonly ProviderModel<TApi>[] => [...mergedModels().all];
+	const chatModels = (): Model<TApi>[] => {
+		const models = mergedModels();
+		models.chat ??= models.all.filter((model): model is Model<TApi> => isModelType(model, "chat"));
+		return [...models.chat];
 	};
 	const apiFor = (model: Model<Api>): ProviderStreams | undefined => single ?? byApi?.[model.api];
 
@@ -1124,7 +1136,7 @@ export function createProvider<TApi extends Api = Api>(input: CreateProviderOpti
 		baseUrl: input.baseUrl,
 		headers: input.headers,
 		auth: input.auth,
-		getModels: () => currentModels().filter((model): model is Model<TApi> => isModelType(model, "chat")),
+		getModels: chatModels,
 		getAllModels: currentModels,
 		refreshModels: fetchModels
 			? async (context) => {
