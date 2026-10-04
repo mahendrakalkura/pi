@@ -648,9 +648,9 @@ export function getTerminalTheme(): TerminalTheme {
 const THEME_KEY = Symbol.for("@earendil-works/pi-coding-agent:theme");
 const THEME_KEY_OLD = Symbol.for("@mariozechner/pi-coding-agent:theme");
 
-// Export theme as a getter that reads from globalThis
+// A theme that reads from globalThis
 // This ensures all module instances (node, jiti) see the same theme
-export const theme: Theme = new Proxy({} as Theme, {
+export const liveTheme: Theme = new Proxy({} as Theme, {
 	get(_target, prop) {
 		const t = (globalThis as Record<symbol, Theme>)[THEME_KEY];
 		if (!t) throw new Error("Theme not initialized. Call initTheme() first.");
@@ -658,9 +658,15 @@ export const theme: Theme = new Proxy({} as Theme, {
 	},
 });
 
+// The theme in use. In the module instance that sets it, this binding is the theme itself: theme.fg() and the like run on
+// every line of every frame, and through the proxy each was a trap and a lookup on globalThis. Another instance of this module
+// (one an extension loaded) never sets it, and keeps the proxy.
+export let theme: Theme = liveTheme;
+
 function setGlobalTheme(t: Theme): void {
 	(globalThis as Record<symbol, Theme>)[THEME_KEY] = t;
 	(globalThis as Record<symbol, Theme>)[THEME_KEY_OLD] = t;
+	theme = t;
 }
 
 let currentThemeName: string | undefined;
