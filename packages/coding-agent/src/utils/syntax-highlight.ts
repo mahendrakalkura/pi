@@ -214,6 +214,23 @@ export function highlight(code: string, options: HighlightOptions = {}): string 
 	return renderHighlightedHtml(html, options.theme);
 }
 
+let onDemandLoaded: (() => void) | undefined;
+
+/**
+ * Has the grammars outside the eager set load when a language among them is first asked for, instead of at every start
+ * (190 grammar definitions run, about 1.4 ms and 1 MB). `onLoaded` runs once they are there: what was drawn without
+ * highlighting can then be drawn again.
+ */
+export function loadAllHighlightLanguagesOnDemand(onLoaded: () => void): void {
+	onDemandLoaded = onLoaded;
+}
+
 export function supportsLanguage(name: string): boolean {
-	return hljs.getLanguage(name) !== undefined;
+	if (hljs.getLanguage(name) !== undefined) {
+		return true;
+	}
+	if (onDemandLoaded && !allLanguagesPromise) {
+		void loadAllHighlightLanguages().then(() => onDemandLoaded?.());
+	}
+	return false;
 }
