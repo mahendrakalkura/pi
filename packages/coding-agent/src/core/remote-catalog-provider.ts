@@ -29,7 +29,12 @@ function isSupportedModelType(model: { type?: unknown }): boolean {
 	);
 }
 
-function mergeModels<TModel extends AnyModel>(baseline: readonly TModel[], dynamic: readonly TModel[]): TModel[] {
+function mergeModels<TModel extends AnyModel>(
+	baseline: readonly TModel[],
+	dynamic: readonly TModel[],
+): readonly TModel[] {
+	// Nothing to merge in (no catalog newer than the built-in one): the provider's models as they are.
+	if (dynamic.length === 0) return baseline;
 	const merged = new Map<string, TModel>();
 	for (const model of [...baseline, ...dynamic]) merged.set(`${getModelType(model)}\0${model.id}`, model);
 	return [...merged.values()];
@@ -50,7 +55,7 @@ function memoizedMerge<TModel extends AnyModel>(): (
 	baseline: readonly TModel[],
 	dynamic: readonly AnyModel[],
 ) => TModel[] {
-	let last: { baseline: readonly TModel[]; dynamic: readonly AnyModel[]; merged: TModel[] } | undefined;
+	let last: { baseline: readonly TModel[]; dynamic: readonly AnyModel[]; merged: readonly TModel[] } | undefined;
 	return (baseline, dynamic) => {
 		if (!last || last.dynamic !== dynamic || !sameModels(last.baseline, baseline)) {
 			last = { baseline, dynamic, merged: mergeModels(baseline, dynamic as readonly TModel[]) };

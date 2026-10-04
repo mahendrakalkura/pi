@@ -212,7 +212,7 @@ export class ModelRuntime implements Models {
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
-		this.rebuildProviders();
+		// (create() composes the providers: once the radius ones are configured.)
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
@@ -247,8 +247,11 @@ export class ModelRuntime implements Models {
 			providers,
 			process.env.PI_OFFLINE === undefined,
 		);
-		runtime.configureRadiusProviders();
-		runtime.rebuildProviders();
+		// refresh() configures and composes the providers itself, first thing.
+		if (options.refreshOnCreate === false) {
+			runtime.configureRadiusProviders();
+			runtime.rebuildProviders();
+		}
 		const refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true;
 		const controller =
 			refreshFromNetwork && options.modelRefreshTimeoutMs !== undefined ? new AbortController() : undefined;
