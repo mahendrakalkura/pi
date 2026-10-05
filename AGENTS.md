@@ -188,13 +188,18 @@ mise exec node@24 -- npm --prefix packages/durable run build
 # The pi-env tests spawn the Rust daemon and fail with "Build the daemon first" when
 # `packages/env/daemon/target/debug/pi-env` is missing. CI builds it the same way before `npm test`.
 mise exec node@24 -- npm run build:daemon --workspace packages/env
-# `packages/env/test/ssh.test.ts` "starts the daemon through the login shell only when asked" fails with
-# exit 127 because the account shell is fish: `launchCommand` runs `exec "$SHELL" -lc 'exec "$0" "$@"'`,
-# which fish rejects. Confirm it is the only failure by running a scratch copy of the test with
-# `SetEnv HOME=${home} SHELL=/bin/bash` in its sshd_config; all 7 tests pass under bash.
 env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
 # test.sh must not see the provider API keys the Fish shell exports: with keys present, Pi's
 # test harness sees hundreds of available models and the selector tests assert on a short list.
+# Always run the pi-env SSH tests under bash, never under the account shell. The test sshd starts the
+# daemon through the account's login shell, which is fish on both machines, and fish rejects the
+# `exec "$SHELL" -lc 'exec "$0" "$@"'` in `launchCommand`, so "starts the daemon through the login shell
+# only when asked" exits 127 inside test.sh. That one failure in test.sh is expected; the bash run below
+# is authoritative for `packages/env/test/ssh.test.ts`, and every other test.sh failure still stops the sync.
+(cd packages/env \
+    && sed 's|`SetEnv HOME=${home}`|`SetEnv HOME=${home} SHELL=/bin/bash`|' test/ssh.test.ts > test/ssh-bash.scratch.test.ts \
+    && env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- node ../../node_modules/vitest/dist/cli.js --run test/ssh-bash.scratch.test.ts; \
+    status=$?; rm -f test/ssh-bash.scratch.test.ts; exit $status)
 
 # 4. Extension packages, then the binary with the dotfiles extensions compiled in.
 (cd packages/coding-agent/bundle && mise exec node@24 -- npm install --no-audit --no-fund)
