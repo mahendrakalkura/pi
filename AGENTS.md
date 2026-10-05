@@ -185,6 +185,13 @@ mise exec node@24 -- npm run check:browser-smoke
 # "Cannot find package" on a stale `packages/durable/dist`.
 mise exec node@24 -- npm --prefix packages/tui run build
 mise exec node@24 -- npm --prefix packages/durable run build
+# The pi-env tests spawn the Rust daemon and fail with "Build the daemon first" when
+# `packages/env/daemon/target/debug/pi-env` is missing. CI builds it the same way before `npm test`.
+mise exec node@24 -- npm run build:daemon --workspace packages/env
+# `packages/env/test/ssh.test.ts` "starts the daemon through the login shell only when asked" fails with
+# exit 127 because the account shell is fish: `launchCommand` runs `exec "$SHELL" -lc 'exec "$0" "$@"'`,
+# which fish rejects. Confirm it is the only failure by running a scratch copy of the test with
+# `SetEnv HOME=${home} SHELL=/bin/bash` in its sshd_config; all 7 tests pass under bash.
 env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
 # test.sh must not see the provider API keys the Fish shell exports: with keys present, Pi's
 # test harness sees hundreds of available models and the selector tests assert on a short list.
