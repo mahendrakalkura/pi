@@ -1321,6 +1321,8 @@ pi.on("before_agent_start", (event, ctx) => {
 
 Command handlers receive `ExtensionCommandContext`, which extends `ExtensionContext` with session control methods. These are only available in commands because they can deadlock if called from event handlers.
 
+Command handlers can also call tools listed in `ctx.tools` with `await ctx.executeTool(name, args, { signal, onUpdate })`. Command calls use the same argument validation, `tool_call` and `tool_result` hooks, and callable-tool exposure rules as nested tool calls. Their results return to the command without adding transcript entries, even in print mode.
+
 ### ctx.getSystemPromptOptions()
 
 Returns the base inputs Pi currently uses to build the system prompt.
