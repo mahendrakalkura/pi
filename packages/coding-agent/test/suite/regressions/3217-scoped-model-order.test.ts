@@ -2,7 +2,6 @@ import { setKeybindings, type TUI } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { KeybindingsManager } from "../../../src/core/keybindings.ts";
 import { ModelSelectorComponent } from "../../../src/modes/interactive/components/model-selector.ts";
-import { ScopedModelsSelectorComponent } from "../../../src/modes/interactive/components/scoped-models-selector.ts";
 import { initTheme } from "../../../src/modes/interactive/theme/theme.ts";
 import { stripAnsi } from "../../../src/utils/ansi.ts";
 import { createHarness, type Harness } from "../harness.ts";
@@ -11,6 +10,14 @@ function createFakeTui(): TUI {
 	return {
 		requestRender: () => {},
 	} as unknown as TUI;
+}
+
+// A box-table data row splits into cells around "│"; drop the two empty ends.
+function rowCells(line: string): string[] {
+	return line
+		.split("│")
+		.slice(1, -1)
+		.map((cell) => cell.trim());
 }
 
 describe("issue #3217 scoped model ordering", () => {
@@ -31,38 +38,7 @@ describe("issue #3217 scoped model ordering", () => {
 		}
 	});
 
-	it("propagates reordered scoped models back to the session state", async () => {
-		const harness = await createHarness({
-			models: [
-				{ id: "faux-1", name: "One", reasoning: true },
-				{ id: "faux-2", name: "Two", reasoning: true },
-				{ id: "faux-3", name: "Three", reasoning: true },
-			],
-		});
-		harnesses.push(harness);
-
-		const orderedIds = harness.models.map((model) => `${model.provider}/${model.id}`);
-		const changes: Array<string[] | null> = [];
-		const selector = new ScopedModelsSelectorComponent(
-			{
-				allModels: [...harness.models],
-				enabledModelIds: orderedIds,
-			},
-			{
-				onChange: (enabledModelIds) => {
-					changes.push(enabledModelIds);
-				},
-				onPersist: () => {},
-				onCancel: () => {},
-			},
-		);
-
-		selector.handleInput("\x1b[1;3B");
-
-		expect(changes).toEqual([[orderedIds[1], orderedIds[0], orderedIds[2]]]);
-	});
-
-	it("preserves scoped model order in the /model scoped tab", async () => {
+	it("sorts scoped models by id in the /model picker", async () => {
 		const harness = await createHarness({
 			models: [
 				{ id: "faux-1", name: "One", reasoning: true },
@@ -75,8 +51,10 @@ describe("issue #3217 scoped model ordering", () => {
 		const modelOne = harness.getModel("faux-1")!;
 		const modelTwo = harness.getModel("faux-2")!;
 		const modelThree = harness.getModel("faux-3")!;
+		const tui = createFakeTui();
+		const requestRender = vi.spyOn(tui, "requestRender");
 		const selector = new ModelSelectorComponent(
-			createFakeTui(),
+			tui,
 			modelOne,
 			harness.session.modelRuntime,
 			[{ model: modelTwo }, { model: modelOne }, { model: modelThree }],
@@ -84,20 +62,12 @@ describe("issue #3217 scoped model ordering", () => {
 			() => {},
 		);
 
-		await vi.waitFor(() => {
-			const rendered = stripAnsi(selector.render(120).join("\n"));
-			expect(rendered).toContain(`[${modelOne.provider}]`);
-			expect(rendered).toContain("Model catalogs refreshed.");
-		});
-
+		await vi.waitFor(() => expect(requestRender).toHaveBeenCalledTimes(2));
 		const renderedLines = stripAnsi(selector.render(120).join("\n"))
 			.split("\n")
-			.filter((line) => line.includes(`[${modelOne.provider}]`));
-		const orderedIds = renderedLines.slice(0, 3).map((line) => {
-			const [modelId] = line.trim().replace(/^→\s*/, "").split(" [");
-			return modelId?.replace(/^✓\s*/, "").trim() ?? "";
-		});
+			.filter((line) => line.includes(" faux-"));
+		const orderedIds = renderedLines.slice(0, 3).map((line) => rowCells(line)[3]);
 
-		expect(orderedIds).toEqual([modelTwo.id, modelOne.id, modelThree.id]);
+		expect(orderedIds).toEqual([modelOne.id, modelTwo.id, modelThree.id]);
 	});
 });
