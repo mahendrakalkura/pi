@@ -377,6 +377,7 @@ export class ExtensionRunner {
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
 	private executeToolFn: ExtensionContextActions["executeTool"];
+	private executeCommandToolFn: ExtensionContextActions["executeCommandTool"];
 	private getCallableToolsFn: () => readonly AgentTool[] = () => [];
 	/** Registered MCP servers already reported as unhandled. */
 	private readonly reportedMcpServers = new Set<string>();
@@ -451,6 +452,7 @@ export class ExtensionRunner {
 		this.getSystemPromptOptionsFn =
 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
 		this.executeToolFn = contextActions.executeTool;
+		this.executeCommandToolFn = contextActions.executeCommandTool;
 		this.getCallableToolsFn = contextActions.getCallableTools ?? (() => []);
 
 		// Servers registered from now on reach the extension that connects them right away. Servers
@@ -995,6 +997,21 @@ export class ExtensionRunner {
 			{},
 			Object.getOwnPropertyDescriptors(this.createContext()),
 		) as ExtensionCommandContext;
+		Object.defineProperties(context, {
+			tools: {
+				get: () => {
+					this.assertActive();
+					return this.getCallableToolsFn();
+				},
+			},
+			executeTool: {
+				value: (name: string, args: unknown, options: ExecuteToolOptions = {}) => {
+					this.assertActive();
+					if (!this.executeCommandToolFn) throw new Error("Command tool calls are not available in this context");
+					return this.executeCommandToolFn(name, args, options);
+				},
+			},
+		});
 		context.getSystemPromptOptions = () => {
 			this.assertActive();
 			return this.getSystemPromptOptionsFn();

@@ -399,6 +399,11 @@ export interface ExtensionToolContext extends ExtensionContext {
  * Includes session control methods only safe in user-initiated commands.
  */
 export interface ExtensionCommandContext extends ExtensionContext {
+	/** Tools {@link executeTool} can call. */
+	readonly tools: readonly AgentTool[];
+	/** Run a tool through validation and the `tool_call` and `tool_result` hooks without adding transcript entries. */
+	executeTool(name: string, args: unknown, options?: ExecuteToolOptions): Promise<AgentToolCallOutcome>;
+
 	/** Get the current base system-prompt construction options. */
 	getSystemPromptOptions(): BuildSystemPromptOptions;
 
@@ -2197,7 +2202,9 @@ export interface ExtensionContextActions {
 		args: unknown,
 		options: ExecuteToolOptions,
 	) => Promise<AgentToolCallOutcome>;
-	/** Backs `ExtensionToolContext.tools`. */
+	/** Backs `ExtensionCommandContext.executeTool()` using the same guarded tool pipeline. */
+	executeCommandTool?: (name: string, args: unknown, options: ExecuteToolOptions) => Promise<AgentToolCallOutcome>;
+	/** Backs `ExtensionToolContext.tools` and `ExtensionCommandContext.tools`. */
 	getCallableTools?: () => readonly AgentTool[];
 }
 

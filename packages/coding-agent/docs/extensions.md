@@ -212,7 +212,8 @@ The built-in MCP support connects registered servers. When nothing does, because
 Use `ctx.modelRegistry.streamSimple()` for provider-neutral nested model calls.
 
 Command handlers receive `ExtensionCommandContext`, which adds operations for waiting until idle, reloading, tree navigation, and session replacement.
-These operations are command-only because calling them from lifecycle handlers can deadlock the runtime.
+They can also call tools listed in `ctx.tools` with `await ctx.executeTool(name, args, { signal, onUpdate })`. Command calls use the same argument validation, `tool_call` and `tool_result` hooks, and callable-tool exposure rules as nested tool calls. Their results return to the command without adding transcript entries, even in print mode.
+Session controls are command-only because calling them from lifecycle handlers can deadlock the runtime.
 
 Session replacement invalidates the old context. Capture only plain data before switching, then use the fresh context supplied to `withSession` for session-bound work.
 

@@ -472,6 +472,8 @@ export class AgentSession {
 	private _toolRegistry: Map<string, AgentTool> = new Map();
 	/** Created on the first `ctx.executeTool()` call. */
 	private _nestedToolCalls: NestedToolCallRunner | undefined;
+	private _commandToolCallId = 0;
+	private readonly _commandToolMessages = new Map<string, AssistantMessage>();
 	/** Declared tools whose declarations requests leave out, from `prepareLoadout` hooks. */
 	private _hiddenDeclarations: ReadonlySet<string> = new Set();
 	private _toolDefinitions: Map<string, ToolDefinitionEntry> = new Map();
@@ -737,7 +739,8 @@ export class AgentSession {
 			getTools: () => this._getCallableTools(),
 			isSequential: () => this.agent.toolExecution === "sequential",
 			runToolCall: (toolCall, parentId, signal, onUpdate) => {
-				const assistantMessage = this._findLastAssistantMessage();
+				const assistantMessage =
+					this._commandToolMessages.get(parentId.split("/", 1)[0]!) ?? this._findLastAssistantMessage();
 				if (!assistantMessage) {
 					return Promise.resolve({
 						toolCall,
@@ -761,6 +764,39 @@ export class AgentSession {
 			},
 		});
 		return this._nestedToolCalls.execute(parentToolCallId, name, args, options);
+	}
+
+	private async _executeCommandToolCall(
+		name: string,
+		args: unknown,
+		options: ExecuteToolOptions,
+	): Promise<AgentToolCallOutcome> {
+		const callerId = `command:${++this._commandToolCallId}`;
+		// Hooks require an assistant message. Command calls use an unpersisted marker, not a prior model response.
+		const commandMessage: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "command",
+			provider: "command",
+			model: "command",
+			usage: {
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			stopReason: "toolUse",
+			timestamp: Date.now(),
+		};
+		this._commandToolMessages.set(callerId, commandMessage);
+		try {
+			return await this._executeNestedToolCall(callerId, name, args, options);
+		} finally {
+			this._nestedToolCalls?.takeRecord(callerId);
+			this._commandToolMessages.delete(callerId);
+		}
 	}
 
 	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
@@ -3465,6 +3501,7 @@ export class AgentSession {
 				getSystemPrompt: () => this.systemPrompt,
 				getSystemPromptOptions: () => this._baseSystemPromptOptions,
 				executeTool: (callerId, name, args, options) => this._executeNestedToolCall(callerId, name, args, options),
+				executeCommandTool: (name, args, options) => this._executeCommandToolCall(name, args, options),
 				getCallableTools: () => this._getCallableTools(),
 			},
 			{
