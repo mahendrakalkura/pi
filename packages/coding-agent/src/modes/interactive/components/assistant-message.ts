@@ -26,6 +26,7 @@ export class AssistantMessageComponent extends Container {
 	private isStreaming = false;
 	private messageId?: string;
 	private timestamp?: string;
+	private contentIsStale = false;
 	private thinkingVisibilityOverrides = new Map<number, boolean>();
 
 	constructor(
@@ -87,6 +88,7 @@ export class AssistantMessageComponent extends Container {
 	}
 
 	override render(width: number): string[] {
+		if (this.contentIsStale && this.lastMessage) this.buildContent(this.lastMessage);
 		const lines = super.render(width);
 		if (this.hasToolCalls || lines.length === 0) {
 			return lines;
@@ -100,7 +102,18 @@ export class AssistantMessageComponent extends Container {
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
 		this.lastMessage = message;
 		this.isStreaming = isStreaming;
+		// While a reply streams, every delta of it comes here, and the screen is drawn a few dozen times a second at most: the
+		// components are made when it is (render()), from the latest message, not for each delta (and its text trimmed, a
+		// copy of all of it so far, each time).
+		if (isStreaming) {
+			this.contentIsStale = true;
+			return;
+		}
+		this.buildContent(message);
+	}
 
+	private buildContent(message: AssistantMessage): void {
+		this.contentIsStale = false;
 		// Clear content container
 		this.contentContainer.clear();
 
