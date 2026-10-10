@@ -3,6 +3,7 @@ import { createInterface } from "node:readline";
 import { spawn } from "child_process";
 import path from "path";
 import { type Static, Type } from "typebox";
+import { detachString } from "../../utils/text.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -43,6 +44,8 @@ export const grepToolSystemPromptContribution = {
 
 export type GrepToolInput = Static<typeof grepSchema>;
 const DEFAULT_LIMIT = 100;
+/** Characters of rg's error output kept for an error message. */
+const MAX_STDERR_CHARS = 16 * 1024;
 
 export interface GrepToolDetails {
 	truncation?: TruncationResult;
@@ -201,7 +204,8 @@ export function createGrepToolDefinition(
 						};
 						signal?.addEventListener("abort", onAbort, { once: true });
 						child.stderr?.on("data", (chunk) => {
-							stderr += chunk.toString();
+							// rg prints an error per unreadable file and keeps going; the message only needs the first ones.
+							if (stderr.length < MAX_STDERR_CHARS) stderr += chunk.toString();
 						});
 
 						// Size of the full output, including lines past the byte cap that are counted but not stored.
@@ -225,9 +229,11 @@ export function createGrepToolDefinition(
 							// Truncate long lines so grep output stays compact.
 							const { text: truncatedText, wasTruncated } = truncateLine(sanitized);
 							if (wasTruncated) linesTruncated = true;
-							const line = isMatch
+							const formatted = isMatch
 								? `${relativePath}:${lineNumber}: ${truncatedText}`
 								: `${relativePath}-${lineNumber}- ${truncatedText}`;
+							// A cut line still references the whole line, which in a minified file can be megabytes.
+							const line = wasTruncated ? detachString(formatted) : formatted;
 							// Byte truncation below drops everything past the cap, so keep counting but stop storing (#9276).
 							// outputBytes counts a newline after every line; the joined output has one fewer.
 							if (outputBytes - 1 <= DEFAULT_MAX_BYTES) outputLines.push(line);
