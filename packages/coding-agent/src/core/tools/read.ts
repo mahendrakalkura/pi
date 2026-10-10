@@ -5,6 +5,7 @@ import { access as fsAccess, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
+import { detachString } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
@@ -74,6 +75,28 @@ function toReadOutput(content: (TextContent | ImageContent)[]): ReadToolOutput {
 	const text = content.find((block) => block.type === "text")?.text ?? "";
 	const image = content.find((block) => block.type === "image");
 	return image ? { type: "image", data: image.data, mimeType: image.mimeType, note: text } : text;
+}
+
+/**
+ * Lines of `text` split at "\n": how many there are, where line `startLine` starts, and where line `endLine - 1`
+ * ends (the end of the text when `endLine` is past the last line). `start` is the end of the text when `startLine`
+ * is past the last line.
+ */
+function locateLines(
+	text: string,
+	startLine: number,
+	endLine: number,
+): { totalLines: number; start: number; end: number } {
+	let start = startLine === 0 ? 0 : text.length;
+	let end = text.length;
+	let newlines = 0;
+	for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) {
+		// Line `newlines` ends at i, and line `newlines + 1` starts after it.
+		if (newlines === endLine - 1) end = i;
+		newlines++;
+		if (newlines === startLine) start = i + 1;
+	}
+	return { totalLines: newlines + 1, start, end };
 }
 
 function getNonVisionImageNote(model: Model<Api> | undefined): string | undefined {
@@ -154,31 +177,35 @@ export function createReadToolDefinition(
 								// Read text content.
 								const buffer = await ops.readFile(absolutePath);
 								const textContent = buffer.toString("utf-8");
-								const allLines = textContent.split("\n");
-								const totalFileLines = allLines.length;
-								// Apply offset if specified. Convert from 1-indexed input to 0-indexed array access.
-								const startLine = offset ? Math.max(0, offset - 1) : 0;
+								// Apply offset if specified. Convert from 1-indexed input to 0-indexed line numbers.
+								const startLine = offset ? Math.max(0, Math.floor(offset) - 1) : 0;
 								const startLineDisplay = startLine + 1;
+								const requestedEndLine =
+									limit !== undefined ? startLine + Math.max(0, Math.floor(limit)) : Number.POSITIVE_INFINITY;
+								// Find the selected lines by scanning for newlines instead of splitting the file: splitting
+								// allocates a string per line of the whole file to return at most a few thousand of them.
+								const {
+									totalLines: totalFileLines,
+									start,
+									end,
+								} = locateLines(textContent, startLine, requestedEndLine);
 								// Check if offset is out of bounds.
-								if (startLine >= allLines.length) {
-									throw new Error(`Offset ${offset} is beyond end of file (${allLines.length} lines total)`);
+								if (startLine >= totalFileLines) {
+									throw new Error(`Offset ${offset} is beyond end of file (${totalFileLines} lines total)`);
 								}
-								let selectedContent: string;
-								let userLimitedLines: number | undefined;
 								// If limit is specified by the user, honor it first. Otherwise truncateHead decides.
-								if (limit !== undefined) {
-									const endLine = Math.min(startLine + limit, allLines.length);
-									selectedContent = allLines.slice(startLine, endLine).join("\n");
-									userLimitedLines = endLine - startLine;
-								} else {
-									selectedContent = allLines.slice(startLine).join("\n");
-								}
+								const selectedContent = requestedEndLine > startLine ? textContent.slice(start, end) : "";
+								const userLimitedLines =
+									limit !== undefined ? Math.min(requestedEndLine, totalFileLines) - startLine : undefined;
 								// Apply truncation, respecting both line and byte limits.
 								const truncation = truncateHead(selectedContent);
 								let outputText: string;
 								if (truncation.firstLineExceedsLimit) {
 									// First line alone exceeds the byte limit. Point the model at a bash fallback.
-									const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
+									const firstNewline = selectedContent.indexOf("\n");
+									const firstLine =
+										firstNewline === -1 ? selectedContent : selectedContent.slice(0, firstNewline);
+									const firstLineSize = formatSize(Buffer.byteLength(firstLine, "utf-8"));
 									outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
 									details = { truncation };
 								} else if (truncation.truncated) {
@@ -192,16 +219,18 @@ export function createReadToolDefinition(
 										outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
 									}
 									details = { truncation };
-								} else if (userLimitedLines !== undefined && startLine + userLimitedLines < allLines.length) {
+								} else if (userLimitedLines !== undefined && startLine + userLimitedLines < totalFileLines) {
 									// User-specified limit stopped early, but the file still has more content.
-									const remaining = allLines.length - (startLine + userLimitedLines);
+									const remaining = totalFileLines - (startLine + userLimitedLines);
 									const nextOffset = startLine + userLimitedLines + 1;
 									outputText = `${truncation.content}\n\n[${remaining} more lines in file. Use offset=${nextOffset} to continue.]`;
 								} else {
 									// No truncation and no remaining user-limited content.
 									outputText = truncation.content;
 								}
-								content = [{ type: "text", text: outputText }];
+								// The output can be a substring of the whole file's text, which it would keep in memory for as
+								// long as the session holds the result.
+								content = [{ type: "text", text: detachString(outputText) }];
 							}
 
 							if (aborted) return;
