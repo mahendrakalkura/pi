@@ -11,7 +11,9 @@ export interface ServerSentEvent {
  * many chunks costs time linear in its size.
  */
 export class SseDecoder {
-	private readonly decoder = new TextDecoder();
+	private readonly decoder: InstanceType<typeof TextDecoder>;
+	/** Remove a byte order mark from the start of every line, as the OpenAI SDK does by decoding each line on its own. */
+	private readonly stripLineBom: boolean;
 	/** The incomplete last line. */
 	private pendingLine = "";
 	/** The last text ended with CR, so a leading LF of the next text completes that CRLF. */
@@ -19,6 +21,12 @@ export class SseDecoder {
 	private event: string | null = null;
 	private data: string[] = [];
 	private raw: string[] = [];
+
+	constructor(options: { stripLineBom?: boolean } = {}) {
+		this.stripLineBom = options.stripLineBom ?? false;
+		// With stripLineBom every line loses its byte order mark, so the decoder must keep the one at the start.
+		this.decoder = new TextDecoder("utf-8", { ignoreBOM: this.stripLineBom });
+	}
 
 	/** Takes the next bytes and returns the events they complete. */
 	push(bytes: Uint8Array): ServerSentEvent[] {
@@ -56,7 +64,8 @@ export class SseDecoder {
 		return events;
 	}
 
-	private decodeLine(line: string): ServerSentEvent | undefined {
+	private decodeLine(input: string): ServerSentEvent | undefined {
+		const line = this.stripLineBom && input.charCodeAt(0) === 0xfeff ? input.slice(1) : input;
 		if (line === "") return this.flush();
 		this.raw.push(line);
 		if (line.startsWith(":")) return undefined;
