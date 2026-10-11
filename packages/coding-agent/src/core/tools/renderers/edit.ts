@@ -6,9 +6,9 @@
  * definition, so the tool's public shape is unchanged.
  */
 
-import { Box, Container, Spacer, Text } from "@earendil-works/pi-tui";
+import { Box, type Component, Container, Spacer, Text } from "@earendil-works/pi-tui";
 import { renderDiff } from "../../../modes/interactive/components/diff.ts";
-import type { Theme } from "../../../modes/interactive/theme/theme.ts";
+import { getThemeInstance, type Theme } from "../../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition } from "../../extensions/types.ts";
 import type { EditToolDetails } from "../edit.ts";
 import { computeEditsDiff, type Edit, type EditDiffError, type EditDiffResult } from "../edit-diff.ts";
@@ -34,6 +34,23 @@ type EditCallRenderComponent = Box & {
 	previewArgsKey?: string;
 	previewPending?: boolean;
 	settledError?: boolean;
+	/** What the rows were last built from and with (buildEditCallComponent()). */
+	built?: BuiltEditCall;
+};
+/**
+ * The rows of an edit call and what they were made from. A tool row is built again on every display update (each
+ * streamed argument, the start, the result, an invalidation): the diff is rendered again only when it or the theme
+ * changed, and an unchanged row keeps its component, which keeps its wrapped lines.
+ */
+type BuiltEditCall = {
+	theme: Theme | undefined;
+	header: string;
+	headerText: Text;
+	diff?: string;
+	renderedDiff?: string;
+	body?: string;
+	bodyText?: Text;
+	spacer?: Spacer;
 };
 function createEditCallRenderComponent(): EditCallRenderComponent {
 	return Object.assign(new Box(1, 1, (text: string) => text), {
@@ -137,17 +154,41 @@ function buildEditCallComponent(
 ): EditCallRenderComponent {
 	component.setBgFn(getEditHeaderBg(component.preview, component.settledError, theme));
 	component.setPaddingX(outputPad);
-	component.clear();
-	component.addChild(new Text(formatEditCall(args, theme, cwd), 0, 0));
+	const themeInstance = getThemeInstance();
+	const previous = component.built?.theme === themeInstance ? component.built : undefined;
+	const header = formatEditCall(args, theme, cwd);
+	const built: BuiltEditCall = {
+		theme: themeInstance,
+		header,
+		headerText: previous?.header === header ? previous.headerText : new Text(header, 0, 0),
+	};
+	component.built = built;
+	const children: Component[] = [built.headerText];
 
-	if (!component.preview) {
-		return component;
+	const preview = component.preview;
+	if (preview) {
+		let body: string;
+		if ("error" in preview) {
+			body = theme.fg("error", preview.error);
+		} else {
+			built.diff = preview.diff;
+			built.renderedDiff =
+				previous?.diff === preview.diff && previous.renderedDiff !== undefined
+					? previous.renderedDiff
+					: renderDiff(preview.diff);
+			body = built.renderedDiff;
+		}
+		built.body = body;
+		built.bodyText = previous?.body === body && previous.bodyText ? previous.bodyText : new Text(body, 0, 0);
+		built.spacer = previous?.spacer ?? new Spacer(1);
+		children.push(built.spacer, built.bodyText);
 	}
 
-	const body =
-		"error" in component.preview ? theme.fg("error", component.preview.error) : renderDiff(component.preview.diff);
-	component.addChild(new Spacer(1));
-	component.addChild(new Text(body, 0, 0));
+	// The same rows: leave the box as it is, so it keeps its lines.
+	if (children.length !== component.children.length || children.some((child, i) => child !== component.children[i])) {
+		component.clear();
+		for (const child of children) component.addChild(child);
+	}
 	return component;
 }
 function setEditPreview(

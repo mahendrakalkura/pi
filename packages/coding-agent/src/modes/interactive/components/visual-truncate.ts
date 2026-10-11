@@ -3,7 +3,14 @@
  * Used by tool renderers and bash-execution.ts for consistent behavior.
  */
 
-import { type Component, Text, truncateToWidth } from "@earendil-works/pi-tui";
+import {
+	type Component,
+	markStableRender,
+	Text,
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+} from "@earendil-works/pi-tui";
 
 export interface VisualTruncateResult {
 	/** The visual lines to display */
@@ -51,15 +58,67 @@ export function truncateToVisualLines(
 	return { visualLines: truncatedLines, skippedCount };
 }
 
-export interface VisualLinePreviewOptions {
-	/** Styled text; may contain newlines. */
-	text: string;
+/**
+ * truncateToVisualLines(lines.map(styleLine).join("\n"), maxVisualLines, width, 0, "end") for lines without ANSI codes and
+ * a style that closes what it opens on each line: only the last lines are styled and wrapped. The lines before them are
+ * only counted, and a line that fits the width counts as one visual line without being wrapped. A long output shown
+ * collapsed is rendered at the cost of its last lines, not all of it.
+ */
+export function truncateStyledLinesToVisualEnd(
+	lines: readonly string[],
+	styleLine: (line: string) => string,
+	maxVisualLines: number,
+	width: number,
+): VisualTruncateResult {
+	if (lines.length === 0) {
+		return { visualLines: [], skippedCount: 0 };
+	}
+	const contentWidth = Math.max(1, width);
+	// (Text replaces each tab with three spaces before wrapping.)
+	const visualCount = (line: string): number => {
+		const normalized = line.replace(/\t/g, "   ");
+		return normalized === "" || visibleWidth(normalized) <= contentWidth
+			? 1
+			: wrapTextWithAnsi(styleLine(normalized), contentWidth).length;
+	};
+	let start = lines.length;
+	let tailVisualLines = 0;
+	while (start > 0 && tailVisualLines < maxVisualLines) {
+		start--;
+		tailVisualLines += visualCount(lines[start]!);
+	}
+	let headVisualLines = 0;
+	for (let i = 0; i < start; i++) headVisualLines += visualCount(lines[i]!);
+
+	const tail = new Text(lines.slice(start).map(styleLine).join("\n"), 0, 0).render(width);
+	const total = headVisualLines + tail.length;
+	if (total <= maxVisualLines) {
+		return { visualLines: tail, skippedCount: 0 };
+	}
+	return { visualLines: tail.slice(-maxVisualLines), skippedCount: total - maxVisualLines };
+}
+
+interface VisualLinePreviewBaseOptions {
 	maxVisualLines: number;
-	/** Which visual lines to keep. The hint goes before kept end lines and after kept start lines. */
-	keep: "start" | "end";
 	/** Styled hint line for the given number of hidden visual lines. */
 	formatHint: (hidden: number) => string;
 }
+
+export type VisualLinePreviewOptions = VisualLinePreviewBaseOptions &
+	(
+		| {
+				/** Styled text; may contain newlines. */
+				text: string;
+				/** Which visual lines to keep. The hint goes before kept end lines and after kept start lines. */
+				keep: "start" | "end";
+		  }
+		| {
+				/** Lines without ANSI codes, styled by `styleLine` (truncateStyledLinesToVisualEnd()). */
+				lines: readonly string[];
+				styleLine: (line: string) => string;
+				keep: "end";
+		  }
+	);
 
 /**
  * Collapsed tool output limited to a number of visual lines, like bash output. Limiting logical
@@ -77,8 +136,12 @@ export class VisualLinePreview implements Component {
 
 	render(width: number): string[] {
 		if (this.cachedLines === undefined || this.cachedWidth !== width) {
-			const { text, maxVisualLines, keep, formatHint } = this.options;
-			const preview = truncateToVisualLines(text, maxVisualLines, width, 0, keep);
+			const options = this.options;
+			const { maxVisualLines, keep, formatHint } = options;
+			const preview =
+				"lines" in options
+					? truncateStyledLinesToVisualEnd(options.lines, options.styleLine, maxVisualLines, width)
+					: truncateToVisualLines(options.text, maxVisualLines, width, 0, keep);
 			const lines = preview.visualLines;
 			if (preview.skippedCount > 0) {
 				const hint = truncateToWidth(formatHint(preview.skippedCount), width, "...");
@@ -96,3 +159,5 @@ export class VisualLinePreview implements Component {
 		this.cachedLines = undefined;
 	}
 }
+
+markStableRender(VisualLinePreview);

@@ -663,6 +663,11 @@ export const liveTheme: Theme = new Proxy({} as Theme, {
 // (one an extension loaded) never sets it, and keeps the proxy.
 export let theme: Theme = liveTheme;
 
+/** The theme instance in use: another object after a change of theme. */
+export function getThemeInstance(): Theme | undefined {
+	return (globalThis as Record<symbol, Theme>)[THEME_KEY];
+}
+
 function setGlobalTheme(t: Theme): void {
 	(globalThis as Record<symbol, Theme>)[THEME_KEY] = t;
 	(globalThis as Record<symbol, Theme>)[THEME_KEY_OLD] = t;
