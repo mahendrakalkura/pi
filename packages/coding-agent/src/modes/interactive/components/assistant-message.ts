@@ -25,6 +25,16 @@ interface MarkdownSlot {
 	markdown: Markdown;
 }
 
+/** Whether `text` contains one of `names` (lowercase), ignoring case. */
+export function mentionsAny(text: string, names: ReadonlySet<string>): boolean {
+	if (names.size === 0 || text === "") return false;
+	const lower = text.toLowerCase();
+	for (const name of names) {
+		if (lower.includes(name)) return true;
+	}
+	return false;
+}
+
 /** A Markdown component of an assistant message, with what it was made from (AssistantMessageComponent.markdownFor()). */
 interface MarkdownBlock {
 	kind: "text" | "thinking";
@@ -87,6 +97,19 @@ export class AssistantMessageComponent extends Container {
 		if (this.lastMessage) {
 			this.updateContent(this.lastMessage);
 		}
+	}
+
+	/**
+	 * Whether this message may show code highlighted in one of `languages` (lowercase names): whether its text names one
+	 * of them anywhere, which every code block in that language does. Markdown transformers (extensions) may add any.
+	 */
+	mayHighlight(languages: ReadonlySet<string>): boolean {
+		if (this.markdownTransformers.length > 0) return true;
+		const content = this.lastMessage?.content ?? [];
+		return content.some((block) => {
+			const text = block.type === "text" ? block.text : block.type === "thinking" ? block.thinking : "";
+			return mentionsAny(text, languages);
+		});
 	}
 
 	setHideThinkingBlock(hide: boolean): void {
