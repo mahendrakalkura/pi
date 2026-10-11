@@ -178,6 +178,38 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.terminal.write("\r\n");
 	}
 
+	/** The lines of the last frame before and after applyLineResets(): finishLines(). */
+	private rawLines: string[] = [];
+	private finishedLines: string[] = [];
+
+	/**
+	 * applyLineResets() for a frame, taking each line that is the same string as the frame before from the frame before:
+	 * most lines of a long transcript are. Unchanged lines are then the same strings as the lines shown, so the diff
+	 * below compares them by identity. Also counts image lines: applyLineResets() leaves only those as they are.
+	 */
+	private finishLines(raw: string[]): { lines: string[]; imageLines: number } {
+		const previousRaw = this.rawLines;
+		const previousFinished = this.finishedLines;
+		const lines: string[] = new Array(raw.length);
+		const single = [""];
+		let imageLines = 0;
+		for (let i = 0; i < raw.length; i++) {
+			const line = raw[i]!;
+			let finished: string;
+			if (i < previousRaw.length && line === previousRaw[i]) {
+				finished = previousFinished[i]!;
+			} else {
+				single[0] = line;
+				finished = this.applyLineResets(single)[0]!;
+			}
+			if (finished === line) imageLines++;
+			lines[i] = finished;
+		}
+		this.rawLines = raw;
+		this.finishedLines = lines;
+		return { lines, imageLines };
+	}
+
 	private collectKittyImageIds(lines: string[]): Set<number> {
 		const ids = new Set<number>();
 		for (const line of lines) {
@@ -234,7 +266,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	private deleteChangedKittyImages(firstChanged: number, lastChanged: number): string {
-		if (firstChanged < 0 || lastChanged < firstChanged) return "";
+		if (firstChanged < 0 || lastChanged < firstChanged || this.previousKittyImageIds.size === 0) return "";
 
 		const ids = new Set<number>();
 		const maxLine = Math.min(lastChanged, this.previousLines.length - 1);
@@ -276,7 +308,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
 
-		newLines = this.applyLineResets(newLines);
+		const finished = this.finishLines(newLines);
+		newLines = finished.lines;
+		// Kitty image bookkeeping scans every line: only needed while an image is shown or was shown the frame before.
+		const imagesShown = finished.imageLines > 0 || this.previousKittyImageIds.size > 0;
+		const collectKittyImageIds = (lines: string[]): Set<number> =>
+			imagesShown ? this.collectKittyImageIds(lines) : new Set();
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
@@ -318,7 +355,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.previousViewportTop = Math.max(0, bufferLength - height);
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousKittyImageIds = collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
 		};
@@ -386,7 +423,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			lastChanged = newLines.length - 1;
 		}
-		if (firstChanged !== -1) {
+		if (firstChanged !== -1 && imagesShown) {
 			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
@@ -444,7 +481,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousKittyImageIds = collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
@@ -615,7 +652,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = newLines;
-		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+		this.previousKittyImageIds = collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;
 	}
