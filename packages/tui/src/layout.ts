@@ -2,7 +2,7 @@ import type { ScrollView } from "./components/scroll-view.ts";
 import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
 import { cropKittyImageLine, getKittyImageMetadata, getMaxKittyImageRows, isImageLine } from "./terminal-image.ts";
-import { type Component, CURSOR_MARKER, compositeTuiLine } from "./tui.ts";
+import { type Component, CURSOR_MARKER, compositeTuiLine, renderSharedLines } from "./tui.ts";
 import {
 	extractAnsiCode,
 	getActiveBackgroundAnsi,
@@ -74,7 +74,8 @@ function renderCached(context: LayoutContext, component: Component, width: numbe
 	}
 	let lines = widths.get(safeWidth);
 	if (!lines) {
-		lines = component.render(safeWidth);
+		// (Shared lines: layout only reads them.)
+		lines = renderSharedLines(component, safeWidth);
 		widths.set(safeWidth, lines);
 	}
 	return lines;
