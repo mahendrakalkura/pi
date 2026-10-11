@@ -229,6 +229,31 @@ describe("Markdown lexing of a growing source", () => {
 		}
 	});
 
+	// Lexed in pieces while it streams, these split a block that a full lex keeps whole. A message that has finished
+	// streaming is rendered as a full lex gives it.
+	it("a complete source is lexed in full, not from the tokens it streamed as", () => {
+		const documents = [
+			"Intro.\n\nStep one is done.\n2. Install deps\n- run npm i\n\nDone.",
+			"Intro.\n\nTotal:\n\n$$\nsum\n\nof all\n\nparts = 3\n$$\n",
+		];
+		for (const text of documents) {
+			const document = `<!-- complete ${Math.random()} -->\n\n${text}`;
+			for (let length = 1; length < document.length; length++) {
+				lexMarkdownForTest(document.slice(0, length));
+			}
+			lexMarkdownForTest(document);
+			setMarkdownCachingForTest(false);
+			const fresh = JSON.stringify(lexMarkdownForTest(document));
+			const renderedFresh = new Markdown(document, 1, 0, defaultMarkdownTheme).render(72);
+			setMarkdownCachingForTest(true);
+			assert.strictEqual(JSON.stringify(lexMarkdownForTest(document, true)), fresh);
+			assert.deepStrictEqual(
+				new Markdown(document, 1, 0, defaultMarkdownTheme, undefined, { complete: true }).render(72),
+				renderedFresh,
+			);
+		}
+	});
+
 	it("the blocks before the last two are not lexed again", () => {
 		const paragraphs = Array.from({ length: 30 }, (_, i) => `Paragraph ${i} of a long answer.`);
 		let source = `<!-- reuse ${Math.random()} -->`;

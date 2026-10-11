@@ -141,6 +141,7 @@ export class AssistantMessageComponent extends Container {
 							this.messageId,
 							this.timestamp,
 						),
+						complete: !this.isStreaming,
 					}),
 				);
 			} else if (content.type === "thinking") {
@@ -188,6 +189,7 @@ export class AssistantMessageComponent extends Container {
 									this.messageId,
 									this.timestamp,
 								),
+								complete: !this.isStreaming,
 							},
 						);
 				this.contentContainer.addChild(
