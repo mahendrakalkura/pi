@@ -25,6 +25,15 @@ interface MarkdownSlot {
 	markdown: Markdown;
 }
 
+/** A Markdown component of an assistant message, with what it was made from (AssistantMessageComponent.markdownFor()). */
+interface MarkdownBlock {
+	kind: "text" | "thinking";
+	text: string;
+	isStreaming: boolean;
+	outputPad: number;
+	component: Markdown;
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -43,7 +52,6 @@ export class AssistantMessageComponent extends Container {
 	private contentIsStale = false;
 	private thinkingVisibilityOverrides = new Map<number, boolean>();
 	private markdownSlots: MarkdownSlot[] = [];
-	private zoneLines?: { source: readonly string[]; lines: string[] };
 
 	constructor(
 		message?: AssistantMessage,
@@ -105,21 +113,21 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
-	override render(width: number): readonly string[] {
+	override renderShared(width: number): readonly string[] {
 		if (this.contentIsStale && this.lastMessage) this.buildContent(this.lastMessage);
-		const lines = super.render(width);
+		const lines = super.renderShared(width);
 		if (this.hasToolCalls || lines.length === 0) {
 			return lines;
 		}
-
-		// Container output is shared across frames; copy it once per change instead of mutating it.
-		if (this.zoneLines?.source !== lines) {
-			const zoned = [...lines];
-			zoned[0] = OSC133_ZONE_START + zoned[0];
-			zoned[zoned.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + zoned[zoned.length - 1];
-			this.zoneLines = { source: lines, lines: zoned };
+		// The marked lines are kept with the lines they were made from: same lines, same array (renderShared()).
+		if (lines !== this.markedFrom) {
+			const marked = lines.slice();
+			marked[0] = OSC133_ZONE_START + marked[0];
+			marked[marked.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + marked[marked.length - 1];
+			this.markedFrom = lines;
+			this.markedLines = marked;
 		}
-		return this.zoneLines.lines;
+		return this.markedLines;
 	}
 
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
@@ -135,8 +143,29 @@ export class AssistantMessageComponent extends Container {
 		this.buildContent(message);
 	}
 
+	/** A Markdown component for `text`: the one built for it before when nothing it was made with has changed. */
+	private markdownFor(
+		kind: MarkdownBlock["kind"],
+		text: string,
+		previous: MarkdownBlock[],
+		create: () => Markdown,
+	): Markdown {
+		const index = previous.findIndex(
+			(block) =>
+				block.kind === kind &&
+				block.text === text &&
+				block.isStreaming === this.isStreaming &&
+				block.outputPad === this.outputPad,
+		);
+		const component = index === -1 ? create() : previous.splice(index, 1)[0]!.component;
+		this.markdownBlocks.push({ kind, text, isStreaming: this.isStreaming, outputPad: this.outputPad, component });
+		return component;
+	}
+
 	private buildContent(message: AssistantMessage): void {
 		this.contentIsStale = false;
+		const previousBlocks = this.markdownBlocks;
+		this.markdownBlocks = [];
 		// Clear content container
 		this.contentContainer.clear();
 		const previousSlots = this.markdownSlots;
