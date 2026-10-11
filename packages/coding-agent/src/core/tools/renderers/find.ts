@@ -13,6 +13,7 @@ import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/t
 import type { FindToolDetails } from "../find.ts";
 import { getTextOutput, invalidArgText, shortenPath, str } from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
+import { declarePlainRenderers } from "./highlighting.ts";
 
 function formatFindCall(args: { pattern: string; path?: string; limit?: number } | undefined, theme: Theme): string {
 	const pattern = str(args?.pattern);
@@ -75,3 +76,5 @@ export const findRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 		return text;
 	},
 };
+
+declarePlainRenderers(findRenderers);

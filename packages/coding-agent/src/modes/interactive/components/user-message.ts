@@ -1,6 +1,7 @@
 import { Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
+import { mentionsAny } from "./assistant-message.ts";
 import { createMarkdownTransform } from "./markdown-transform.ts";
 
 const OSC133_ZONE_START = "\x1b]133;A\x07";
@@ -37,6 +38,11 @@ export class UserMessageComponent extends Container {
 		this.messageId = messageId;
 		this.timestamp = timestamp;
 		this.rebuild();
+	}
+
+	/** Whether this message may show code highlighted in one of `languages` (lowercase names): AssistantMessageComponent.mayHighlight(). */
+	mayHighlight(languages: ReadonlySet<string>): boolean {
+		return this.markdownTransformers.length > 0 || mentionsAny(this.text, languages);
 	}
 
 	setOutputPad(padding: number): void {
