@@ -1,4 +1,4 @@
-import { Text } from "@earendil-works/pi-tui";
+import { markStableRender, Text } from "@earendil-works/pi-tui";
 
 /**
  * Text whose content applies theme colors. Plain `Text` keeps the colors its string was built with, so
@@ -30,3 +30,5 @@ export class ThemedText extends Text {
 		return super.render(width);
 	}
 }
+
+markStableRender(ThemedText);
