@@ -188,6 +188,7 @@ import {
 import { ThemedText } from "./components/themed-text.ts";
 import { ThinkingSelectorComponent } from "./components/thinking-selector.ts";
 import { ToolExecutionComponent } from "./components/tool-execution.ts";
+import { TranscriptContainer } from "./components/transcript-container.ts";
 import { TreeSelectorComponent } from "./components/tree-selector.ts";
 import { TrustSelectorComponent } from "./components/trust-selector.ts";
 import { UserMessageComponent } from "./components/user-message.ts";
@@ -524,7 +525,7 @@ export class InteractiveMode {
 	private ui: TUI;
 	private mainScreenRenderState: TuiMainScreenRenderState | undefined;
 	private loadedResourcesContainer: Container;
-	private chatContainer: Container;
+	private chatContainer: TranscriptContainer;
 	private documentContainer: Container;
 	private transcriptScrollView: TuiLayouts.ScrollView | undefined;
 	private fullscreenLayoutRoot: Component | undefined;
@@ -713,7 +714,7 @@ export class InteractiveMode {
 		this.ui.setClearOnShrink(this.settingsManager.getClearOnShrink());
 		this.headerContainer = new Container();
 		this.loadedResourcesContainer = new Container();
-		this.chatContainer = new Container();
+		this.chatContainer = new TranscriptContainer();
 		this.documentContainer = new Container();
 		this.documentContainer.addChild(this.headerContainer);
 		this.documentContainer.addChild(this.loadedResourcesContainer);
@@ -1221,9 +1222,18 @@ export class InteractiveMode {
 
 		// Flush the completed startup state before loading the remaining syntax grammars.
 		this.ui.renderNow();
-		loadAllHighlightLanguagesOnDemand(() => {
+		loadAllHighlightLanguagesOnDemand((languages) => {
 			if (!this.isInitialized) return;
-			this.ui.invalidate();
+			// Transcript entries that cannot show code in those languages stay as they are drawn.
+			this.chatContainer.invalidateOnly(
+				(child) =>
+					child instanceof AssistantMessageComponent ||
+					child instanceof UserMessageComponent ||
+					child instanceof ToolExecutionComponent
+						? child.mayHighlight(languages)
+						: true,
+				() => this.ui.invalidate(),
+			);
 			this.ui.requestRender();
 		});
 	}
