@@ -31,6 +31,7 @@ import {
 	getResponsesToolSupport,
 	processResponsesStream,
 } from "./openai-responses-shared.ts";
+import { iterateOpenAIStream } from "./openai-sse.ts";
 import { buildBaseOptions, resolveSamplingParams } from "./simple-options.ts";
 
 const OPENAI_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
@@ -228,7 +229,7 @@ export const stream: StreamFunction<"openai-responses", OpenAIResponsesOptions> 
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			await processResponsesStream(openaiStream, output, stream, model, {
+			await processResponsesStream(iterateOpenAIStream(openaiStream, response, client), output, stream, model, {
 				onProviderStreamEvent: options?.onProviderStreamEvent,
 				serviceTier: options?.serviceTier,
 				grammarToolInputProperties,

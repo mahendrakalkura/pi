@@ -68,6 +68,7 @@ import {
 } from "./constrained-sampling.ts";
 import { buildCopilotDynamicHeaders, hasCopilotVisionInput } from "./github-copilot-headers.ts";
 import { clampOpenAIPromptCacheKey } from "./openai-prompt-cache.ts";
+import { iterateOpenAIStream } from "./openai-sse.ts";
 import {
 	buildBaseOptions,
 	clampThinkingBudgetToAnswerRoom,
@@ -539,7 +540,7 @@ export const stream: StreamFunction<"openai-completions", OpenAICompletionsOptio
 				return { block, state };
 			};
 
-			for await (const chunk of openaiStream) {
+			for await (const chunk of iterateOpenAIStream(openaiStream, response, client)) {
 				await options?.onProviderStreamEvent?.(chunk, model);
 				if (!chunk || typeof chunk !== "object") continue;
 
