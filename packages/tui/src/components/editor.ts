@@ -398,6 +398,42 @@ export class Editor implements Component, Focusable {
 		this.autocompleteMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
 	}
 
+	/**
+	 * The wrapped chunks of each logical line, by line index, for one width and one set of paste IDs (a paste marker
+	 * wraps as one unit): every frame lays out the whole text again, and all lines but the edited one are what they were.
+	 */
+	private wrapCache: {
+		width: number;
+		pasteIds: string;
+		lines: Array<{ text: string; chunks: TextChunk[] } | undefined>;
+	} = { width: -1, pasteIds: "", lines: [] };
+
+	/** The wrap cache for `width`, emptied when the width or the paste IDs changed. */
+	private wrapCacheFor(width: number): Array<{ text: string; chunks: TextChunk[] } | undefined> {
+		const pasteIds = [...this.pastes.keys()].join(",");
+		const cache = this.wrapCache;
+		if (cache.width !== width || cache.pasteIds !== pasteIds) {
+			this.wrapCache = { width, pasteIds, lines: [] };
+		} else if (cache.lines.length > this.state.lines.length) {
+			cache.lines.length = this.state.lines.length;
+		}
+		return this.wrapCache.lines;
+	}
+
+	/** wordWrapLine() for logical line `index`, from the wrap cache when the line is unchanged. */
+	private wrapLine(
+		cache: Array<{ text: string; chunks: TextChunk[] } | undefined>,
+		index: number,
+		line: string,
+		width: number,
+	): TextChunk[] {
+		const known = cache[index];
+		if (known !== undefined && known.text === line) return known.chunks;
+		const chunks = wordWrapLine(line, width, [...this.segment(line, "grapheme")]);
+		cache[index] = { text: line, chunks };
+		return chunks;
+	}
+
 	/** Set of currently valid paste IDs, for marker-aware segmentation. */
 	private validPasteIds(): Set<number> {
 		return new Set(this.pastes.keys());
@@ -1026,6 +1062,7 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Process each logical line
+		const wrapCache = this.wrapCacheFor(contentWidth);
 		for (let i = 0; i < this.state.lines.length; i++) {
 			const line = this.state.lines[i] || "";
 			const isCurrentLine = i === this.state.cursorLine;
@@ -1047,7 +1084,7 @@ export class Editor implements Component, Focusable {
 				}
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, contentWidth, [...this.segment(line, "grapheme")]);
+				const chunks = this.wrapLine(wrapCache, i, line, contentWidth);
 
 				for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
 					const chunk = chunks[chunkIndex];
@@ -1852,6 +1889,7 @@ export class Editor implements Component, Focusable {
 	 */
 	private buildVisualLineMap(width: number): Array<{ logicalLine: number; startCol: number; length: number }> {
 		const visualLines: Array<{ logicalLine: number; startCol: number; length: number }> = [];
+		const wrapCache = this.wrapCacheFor(width);
 
 		for (let i = 0; i < this.state.lines.length; i++) {
 			const line = this.state.lines[i] || "";
@@ -1863,7 +1901,7 @@ export class Editor implements Component, Focusable {
 				visualLines.push({ logicalLine: i, startCol: 0, length: line.length });
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, width, [...this.segment(line, "grapheme")]);
+				const chunks = this.wrapLine(wrapCache, i, line, width);
 				for (const chunk of chunks) {
 					visualLines.push({
 						logicalLine: i,
