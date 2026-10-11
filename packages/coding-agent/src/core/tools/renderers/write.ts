@@ -11,6 +11,7 @@ import { keyHint } from "../../../modes/interactive/components/keybinding-hints.
 import { getLanguageFromPath, highlightCode, type Theme } from "../../../modes/interactive/theme/theme.ts";
 import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/types.ts";
 import { normalizeDisplayText, renderToolPath, replaceTabs, str } from "../render-utils.ts";
+import { declarePathHighlightingRenderers } from "./highlighting.ts";
 
 type WriteHighlightCache = {
 	rawPath: string | null;
@@ -290,3 +291,5 @@ export const writeRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rend
 		return text;
 	},
 };
+
+declarePathHighlightingRenderers(writeRenderers);

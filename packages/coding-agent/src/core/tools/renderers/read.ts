@@ -18,6 +18,7 @@ import { resolveToCwd } from "../path-utils.ts";
 import type { ReadToolDetails } from "../read.ts";
 import { formatReadLineRange, getTextOutput, renderToolPath, replaceTabs, str } from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "../truncate.ts";
+import { declarePathHighlightingRenderers } from "./highlighting.ts";
 
 interface CompactReadClassification {
 	kind: "docs" | "resource" | "skill";
@@ -171,3 +172,5 @@ export const readRenderers: Pick<ToolDefinition<any, ReadToolDetails | undefined
 		return text;
 	},
 };
+
+declarePathHighlightingRenderers(readRenderers);
