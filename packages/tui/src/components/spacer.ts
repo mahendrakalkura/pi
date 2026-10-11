@@ -1,10 +1,13 @@
-import type { Component } from "../tui.ts";
+import { type Component, markStableRender } from "../tui.ts";
 
 /**
  * Spacer component that renders empty lines
  */
 export class Spacer implements Component {
 	private lines: number;
+	/** The lines rendered, kept while their number is the same: every frame renders every spacer of the transcript. */
+	private renderedLines: string[] = [];
+	private renderedCount = 0;
 
 	constructor(lines: number = 1) {
 		this.lines = lines;
@@ -19,10 +22,16 @@ export class Spacer implements Component {
 	}
 
 	render(_width: number): string[] {
-		const result: string[] = [];
-		for (let i = 0; i < this.lines; i++) {
-			result.push("");
+		if (this.renderedCount !== this.lines) {
+			const result: string[] = [];
+			for (let i = 0; i < this.lines; i++) {
+				result.push("");
+			}
+			this.renderedLines = result;
+			this.renderedCount = this.lines;
 		}
-		return result;
+		return this.renderedLines;
 	}
 }
+
+markStableRender(Spacer);

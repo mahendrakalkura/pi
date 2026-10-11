@@ -353,12 +353,125 @@ type ActiveOverlayFocusRestoreState = EligibleOverlayFocusRestoreState | Blocked
 type OverlayFocusRestoreState = { status: "inactive" } | ActiveOverlayFocusRestoreState;
 type OverlayFocusRestorePolicy = "clear" | "preserve";
 
+/** render() functions whose component keeps its lines: see markStableRender(). */
+const stableRenders = new WeakSet<Component["render"]>();
+
+/**
+ * Declares that the components of a class keep their lines: their render() returns the same array again only while
+ * their lines are unchanged, and never modifies an array it returned. Containers then take an unchanged array as
+ * unchanged lines instead of comparing them line by line, which keeps a frame from costing time in proportion to the
+ * whole transcript. A subclass that overrides render() is not covered: it declares this itself if it keeps its lines.
+ * Components that do not declare it render exactly as before; their lines are compared.
+ */
+export function markStableRender(componentClass: { prototype: Component }): void {
+	stableRenders.add(componentClass.prototype.render);
+}
+
+/**
+ * Whether `component` keeps its lines (markStableRender()). A Container that does not override render() does:
+ * renderSharedLines() takes its lines from renderShared().
+ */
+export function isStableRender(component: Component): boolean {
+	return (
+		(component instanceof Container && component.render === Container.prototype.render) ||
+		stableRenders.has(component.render)
+	);
+}
+
+/**
+ * A component's lines, without the copy Container.render() makes: Container.renderShared() for a Container that does
+ * not override render(). The caller must not modify them.
+ */
+export function renderSharedLines(component: Component, width: number): string[] {
+	return component instanceof Container && component.render === Container.prototype.render
+		? component.renderShared(width)
+		: component.render(width);
+}
+
+/** What a list of children rendered to, joined (renderChildren()). */
+export interface RenderedChildren {
+	readonly width: number;
+	readonly children: readonly Component[];
+	/** The array each child returned. */
+	readonly arrays: readonly string[][];
+	readonly heights: readonly number[];
+	/** All the children's lines. Shared: not to be modified. */
+	readonly lines: string[];
+}
+
+/**
+ * Renders `children` at `width` and joins their lines, starting from what they rendered to the frame before:
+ * `previous` itself when no child's lines changed, otherwise new lines that keep the unchanged leading children's
+ * lines. A child's lines are unchanged when it is the same child and either keeps its lines (isStableRender()) and
+ * returned the same array, or returned the lines joined the frame before. The second check covers any component,
+ * including one that modifies its array in place.
+ */
+export function renderChildren(
+	children: readonly Component[],
+	width: number,
+	previous: RenderedChildren | undefined,
+): RenderedChildren {
+	const count = children.length;
+	const before = previous?.width === width ? previous : undefined;
+	let index = 0;
+	let offset = 0;
+	let changedLines: string[] | undefined;
+	if (before !== undefined) {
+		for (; index < count; index++) {
+			const child = children[index]!;
+			const lines = renderSharedLines(child, width);
+			if (
+				index >= before.children.length ||
+				before.children[index] !== child ||
+				!sameLines(child, lines, before, index, offset)
+			) {
+				changedLines = lines;
+				break;
+			}
+			offset += lines.length;
+		}
+		if (index === count && count === before.children.length) return before;
+	}
+	const arrays: string[][] = new Array(count);
+	const heights: number[] = new Array(count);
+	for (let i = 0; i < index; i++) {
+		arrays[i] = before!.arrays[i]!;
+		heights[i] = before!.heights[i]!;
+	}
+	const joined = before !== undefined && offset > 0 ? before.lines.slice(0, offset) : [];
+	for (; index < count; index++) {
+		const lines = changedLines ?? renderSharedLines(children[index]!, width);
+		changedLines = undefined;
+		arrays[index] = lines;
+		heights[index] = lines.length;
+		for (let i = 0; i < lines.length; i++) joined.push(lines[i]!);
+	}
+	return { width, children: children.slice(), arrays, heights, lines: joined };
+}
+
+function sameLines(
+	child: Component,
+	lines: string[],
+	previous: RenderedChildren,
+	index: number,
+	offset: number,
+): boolean {
+	if (lines === previous.arrays[index] && isStableRender(child)) return true;
+	const height = previous.heights[index]!;
+	if (lines.length !== height) return false;
+	const joined = previous.lines;
+	for (let i = 0; i < height; i++) {
+		if (lines[i] !== joined[offset + i]) return false;
+	}
+	return true;
+}
+
 /**
  * Container - a component that contains other components
  */
 export class Container implements Component {
 	children: Component[] = [];
-	private mouseLayout?: { width: number; children: Array<{ component: Component; height: number }> };
+	private rendered?: RenderedChildren;
 
 	addChild(component: Component): void {
 		this.children.push(component);
@@ -376,6 +489,7 @@ export class Container implements Component {
 	}
 
 	invalidate(): void {
+		this.rendered = undefined;
 		for (const child of this.children) {
 			child.invalidate?.();
 		}
@@ -383,12 +497,13 @@ export class Container implements Component {
 
 	handleMouse(event: TuiMouseEvent): TuiMouseDispatchResult | undefined {
 		if (event.y < 0 || event.y >= event.height) return undefined;
-		const mouseChildren =
-			this.mouseLayout?.width === event.width
-				? this.mouseLayout.children
-				: this.children.map((component) => ({ component, height: component.render(event.width).length }));
+		// The children as last drawn, at their drawn heights.
+		const rendered = this.rendered?.width === event.width ? this.rendered : undefined;
+		const children = rendered?.children ?? this.children;
 		let childY = 0;
-		for (const { component: child, height: childHeight } of mouseChildren) {
+		for (let i = 0; i < children.length; i++) {
+			const child = children[i]!;
+			const childHeight = rendered ? rendered.heights[i]! : child.render(event.width).length;
 			if (event.y >= childY && event.y < childY + childHeight) {
 				const result = dispatchMouseEvent(child, {
 					...event,
@@ -403,18 +518,18 @@ export class Container implements Component {
 		return undefined;
 	}
 
+	/**
+	 * The children's lines, kept from one call to the next: the same array while no child's lines changed. The caller
+	 * must not modify it; render() returns a copy. A subclass that adds to the children's lines overrides this, not
+	 * render(), and keeps the same contract: it returns the same array again only when its lines are unchanged.
+	 */
+	renderShared(width: number): string[] {
+		this.rendered = renderChildren(this.children, width, this.rendered);
+		return this.rendered.lines;
+	}
+
 	render(width: number): string[] {
-		const lines: string[] = [];
-		const mouseChildren: Array<{ component: Component; height: number }> = [];
-		for (const child of this.children) {
-			const childLines = child.render(width);
-			mouseChildren.push({ component: child, height: childLines.length });
-			for (const line of childLines) {
-				lines.push(line);
-			}
-		}
-		this.mouseLayout = { width, children: mouseChildren };
-		return lines;
+		return this.renderShared(width).slice();
 	}
 }
 

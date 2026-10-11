@@ -3,7 +3,7 @@ import markedCjkFriendly from "marked-cjk-friendly";
 import { renderLatex } from "../latex.ts";
 import { invalidateRenderedMarkdown, renderedMarkdownGeneration } from "../rendered-markdown.ts";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
-import type { Component } from "../tui.ts";
+import { type Component, markStableRender } from "../tui.ts";
 import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
@@ -1312,3 +1312,5 @@ export class Markdown implements Component {
 		return lines;
 	}
 }
+
+markStableRender(Markdown);

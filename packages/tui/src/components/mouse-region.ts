@@ -1,6 +1,9 @@
 import {
 	type Component,
 	dispatchMouseEvent,
+	isStableRender,
+	markStableRender,
+	renderSharedLines,
 	type TuiMouseDispatchResult,
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
@@ -12,6 +15,8 @@ export type MouseRegionHandler = (event: TuiMouseEvent) => TuiMouseEventResult |
 export class MouseRegion implements Component {
 	private readonly child: Component;
 	private readonly onMouse: MouseRegionHandler;
+	/** A copy of the lines of a child that does not keep its lines (isStableRender()), kept while they are the same. */
+	private copiedLines?: string[];
 
 	constructor(child: Component, onMouse: MouseRegionHandler) {
 		this.child = child;
@@ -19,7 +24,14 @@ export class MouseRegion implements Component {
 	}
 
 	render(width: number): string[] {
-		return this.child.render(width);
+		const lines = renderSharedLines(this.child, width);
+		if (isStableRender(this.child)) return lines;
+		const copied = this.copiedLines;
+		if (copied !== undefined && copied.length === lines.length && copied.every((line, i) => line === lines[i])) {
+			return copied;
+		}
+		this.copiedLines = lines.slice();
+		return this.copiedLines;
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseDispatchResult | TuiMouseEventResult | undefined {
@@ -28,6 +40,9 @@ export class MouseRegion implements Component {
 	}
 
 	invalidate(): void {
+		this.copiedLines = undefined;
 		this.child.invalidate();
 	}
 }
+
+markStableRender(MouseRegion);
