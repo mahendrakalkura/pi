@@ -13,6 +13,7 @@ import type { ToolDefinition } from "../../extensions/types.ts";
 import type { EditToolDetails } from "../edit.ts";
 import { computeEditsDiff, type Edit, type EditDiffError, type EditDiffResult } from "../edit-diff.ts";
 import { renderToolPath, str } from "../render-utils.ts";
+import { declarePlainRenderers } from "./highlighting.ts";
 
 type EditPreview = EditDiffResult | EditDiffError;
 export type EditRenderState = {
@@ -291,3 +292,5 @@ export const editRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rende
 		return component;
 	},
 };
+
+declarePlainRenderers(editRenderers);
