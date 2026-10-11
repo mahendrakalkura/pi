@@ -261,7 +261,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	) {
 		super(terminal, showHardwareCursor, logDirectory);
 		this.implicitDocument = {
-			render: (width) => super.render(width),
+			// (Shared lines: only the layout reads them.)
+			render: (width) => super.renderShared(width),
 			handleMouse: (event) => super.handleMouse(event),
 			invalidate: () => {
 				for (const child of this.children) child.invalidate();
