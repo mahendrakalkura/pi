@@ -39,6 +39,7 @@ import {
 	hyperlink,
 	Markdown,
 	matchesKey,
+	onCapabilitiesChange,
 	Spacer,
 	setCapabilityOverrides,
 	setKeybindings,
@@ -536,6 +537,7 @@ export class InteractiveMode {
 
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
+	private unsubscribeCapabilityChanges?: () => void;
 	private signalCleanupHandlers: Array<() => void> = [];
 
 	// Track if editor is in bash mode (text starts with !)
@@ -1025,6 +1027,11 @@ export class InteractiveMode {
 		this.defaultEditor.onSubmit = (text) => this.handleStartupSubmit(text);
 		this.ui.setFocus(this.editor);
 
+		// The tmux hyperlink probe answers in the background: draw again with what it found.
+		this.unsubscribeCapabilityChanges ??= onCapabilitiesChange(() => {
+			this.ui.invalidate();
+			this.ui.requestRender();
+		});
 		// Start the UI before initializing extensions so session_start handlers can use interactive dialogs
 		this.ui.start();
 		this.isInitialized = true;
@@ -7135,6 +7142,8 @@ export class InteractiveMode {
 		this.clearExtensionTerminalInputListeners();
 		this.footer.dispose();
 		this.footerDataProvider.dispose();
+		this.unsubscribeCapabilityChanges?.();
+		this.unsubscribeCapabilityChanges = undefined;
 		if (this.unsubscribe) {
 			this.unsubscribe();
 		}
