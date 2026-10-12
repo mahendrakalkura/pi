@@ -416,20 +416,22 @@ function buildSessionPath(
 }
 
 function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
-	let thinkingLevel = "off";
-	let model: { provider: string; modelId: string } | null = null;
+	const settings: Pick<SessionContext, "thinkingLevel" | "model"> = { thinkingLevel: "off", model: null };
+	for (const entry of path) applySessionContextSetting(settings, entry);
+	return settings;
+}
 
-	for (const entry of path) {
-		if (entry.type === "thinking_level_change") {
-			thinkingLevel = entry.thinkingLevel;
-		} else if (entry.type === "model_change") {
-			model = { provider: entry.provider, modelId: entry.modelId };
-		} else if (entry.type === "message" && entry.message.role === "assistant") {
-			model = { provider: entry.message.provider, modelId: entry.message.model };
-		}
+function applySessionContextSetting(
+	settings: Pick<SessionContext, "thinkingLevel" | "model">,
+	entry: SessionEntry,
+): void {
+	if (entry.type === "thinking_level_change") {
+		settings.thinkingLevel = entry.thinkingLevel;
+	} else if (entry.type === "model_change") {
+		settings.model = { provider: entry.provider, modelId: entry.modelId };
+	} else if (entry.type === "message" && entry.message.role === "assistant") {
+		settings.model = { provider: entry.message.provider, modelId: entry.message.model };
 	}
-
-	return { thinkingLevel, model };
 }
 
 /**
@@ -1001,6 +1003,16 @@ export class SessionManager {
 	 * the per-request projection does not walk the whole history. Never handed out; callers get copies.
 	 */
 	private leafPath: { leafId: string; path: SessionEntry[] } | undefined;
+	/**
+	 * The projection of `leafId`'s path, kept between calls like `leafPath`: the agent, the compaction check and the
+	 * footer each ask for it several times per turn, and an append only adds one entry's messages. Rebuilt when the
+	 * leaf moves elsewhere, the session is replaced, or an appended entry changes earlier projected entries (compaction,
+	 * context edit). Never handed out: callers get copies of its arrays.
+	 */
+	private projection: { leafId: string | null; projection: SessionProjection; revision: number } | undefined;
+	private projectionRevision = 0;
+	/** The latest session_info entry in file order (what getSessionName() reports). */
+	private latestSessionInfo: SessionInfoEntry | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1075,6 +1087,8 @@ export class SessionManager {
 		};
 		this.fileEntries = [header];
 		this.leafPath = undefined;
+		this.projection = undefined;
+		this.latestSessionInfo = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1108,6 +1122,8 @@ export class SessionManager {
 
 	private _buildIndex(): void {
 		this.leafPath = undefined;
+		this.projection = undefined;
+		this.latestSessionInfo = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -1116,6 +1132,7 @@ export class SessionManager {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
+			if (entry.type === "session_info") this.latestSessionInfo = entry;
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1199,6 +1216,7 @@ export class SessionManager {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
+		if (entry.type === "session_info") this.latestSessionInfo = entry;
 		this._persist(entry);
 	}
 
@@ -1323,16 +1341,9 @@ export class SessionManager {
 
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
-		// Walk entries in reverse to find the latest session_info entry.
-		// Empty names explicitly clear the session title. Reads fileEntries directly: the footer
-		// calls this on every frame, and getEntries() copies the whole session.
-		for (let i = this.fileEntries.length - 1; i >= 0; i--) {
-			const entry = this.fileEntries[i];
-			if (entry.type === "session_info") {
-				return entry.name?.trim() || undefined;
-			}
-		}
-		return undefined;
+		// The latest session_info entry, kept up to date as entries are added: the footer calls this on every frame.
+		// Empty names explicitly clear the session title.
+		return this.latestSessionInfo?.name?.trim() || undefined;
 	}
 
 	/**
@@ -1495,17 +1506,57 @@ export class SessionManager {
 		if (leafId === null) return [];
 		const cached = this.leafPath;
 		if (cached?.leafId === leafId) return cached.path;
-		const leaf = this.byId.get(leafId);
+		const appended = cached && this._appendedSince(cached.leafId, leafId);
 		let path: SessionEntry[];
-		if (cached && leaf && leaf.parentId === cached.leafId) {
+		if (cached && appended) {
 			// Appended under the cached leaf: extend the cached path in place.
 			path = cached.path;
-			path.push(leaf);
+			for (const entry of appended) path.push(entry);
 		} else {
 			path = this._walkBranch(leafId);
 		}
 		this.leafPath = { leafId, path };
 		return path;
+	}
+
+	/**
+	 * The entries from `fromId` (exclusive) down to `leafId`, root first, when `leafId` descends from `fromId` by at
+	 * most a few appends; otherwise undefined.
+	 */
+	private _appendedSince(fromId: string, leafId: string): SessionEntry[] | undefined {
+		const appended: SessionEntry[] = [];
+		let current = this.byId.get(leafId);
+		while (current && appended.length < 64) {
+			appended.push(current);
+			if (current.parentId === fromId) return appended.reverse();
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
+		return undefined;
+	}
+
+	/** The cached projection of the current leaf path. Must not be modified or returned to callers. */
+	private _projection(): { projection: SessionProjection; revision: number } {
+		const leafId = this.leafId;
+		const cached = this.projection;
+		if (cached && cached.leafId === leafId) return cached;
+		const appended =
+			leafId !== null && cached?.leafId != null ? this._appendedSince(cached.leafId, leafId) : undefined;
+		let projection: SessionProjection;
+		if (cached && appended?.every((entry) => entry.type !== "compaction" && entry.type !== "context_edit")) {
+			// Entries after the path's latest compaction are all in context, and no earlier projected entry changes:
+			// a context edit or a compaction would change what came before, so those rebuild.
+			projection = cached.projection;
+			for (const entry of appended) {
+				applySessionContextSetting(projection, entry);
+				const messages = sessionEntryToContextMessages(entry);
+				projection.entries.push({ sourceEntry: entry, messages });
+				for (const message of messages) projection.messages.push(message);
+			}
+		} else {
+			projection = projectSessionPath(this._leafPath());
+		}
+		this.projection = { leafId, projection, revision: ++this.projectionRevision };
+		return this.projection;
 	}
 
 	/**
@@ -1523,7 +1574,25 @@ export class SessionManager {
 	 * Uses tree traversal from current leaf.
 	 */
 	buildSessionProjection(): SessionProjection {
-		return projectSessionPath(this._leafPath());
+		const { entries, messages, thinkingLevel, model } = this._projection().projection;
+		return { entries: entries.slice(), messages: messages.slice(), thinkingLevel, model: model && { ...model } };
+	}
+
+	/**
+	 * A number that changes whenever buildSessionProjection() (and the leaf path, getBranch()) may return something
+	 * else: what is derived from them can be kept until it changes.
+	 */
+	getProjectionRevision(): number {
+		return this._projection().revision;
+	}
+
+	/**
+	 * buildSessionProjection() without the copies, for reading only: callers must not modify it or keep it past the next
+	 * change to the session (it is the cached projection itself).
+	 * @internal
+	 */
+	peekSessionProjection(): SessionProjection {
+		return this._projection().projection;
 	}
 
 	buildSessionContext(): SessionContext {
