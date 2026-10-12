@@ -778,8 +778,11 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			const scopedQuery = this.resolveScopedFuzzyQuery(query);
 			const fdBaseDir = scopedQuery?.baseDir ?? this.basePath;
 			const fdQuery = scopedQuery?.query ?? query;
-			const baseDirEntries = await this.getBaseDirSuggestions(fdBaseDir, fdQuery, options.signal);
-			const recursiveEntries = await walkDirectoryWithFd(fdBaseDir, this.fdPath, fdQuery, 100, options.signal);
+			// (The two fd runs at once: each is a process start, ~20 ms on Windows, and they do not depend on each other.)
+			const [baseDirEntries, recursiveEntries] = await Promise.all([
+				this.getBaseDirSuggestions(fdBaseDir, fdQuery, options.signal),
+				walkDirectoryWithFd(fdBaseDir, this.fdPath, fdQuery, 100, options.signal),
+			]);
 			const seenPaths = new Set(baseDirEntries.map((entry) => entry.path));
 			const entries = [
 				...baseDirEntries,
