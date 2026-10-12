@@ -1,5 +1,7 @@
 import { writeFile } from "node:fs/promises";
-import { crc32, deflateRawSync } from "node:zlib";
+
+// zlib loads on first use: archives are written rarely, and loading it costs every start.
+const zlib = () => process.getBuiltinModule("node:zlib");
 
 interface ZipEntry {
 	name: string;
@@ -23,6 +25,7 @@ function createZipArchive(entries: readonly ZipEntry[]): Buffer {
 	for (const entry of entries) {
 		const name = Buffer.from(entry.name);
 		const data = typeof entry.data === "string" ? Buffer.from(entry.data) : Buffer.from(entry.data);
+		const { crc32, deflateRawSync } = zlib();
 		const compressed = deflateRawSync(data);
 		const checksum = crc32(data);
 
