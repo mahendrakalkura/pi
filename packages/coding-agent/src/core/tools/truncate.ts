@@ -60,6 +60,24 @@ function countLines(content: string): number {
 	return content.endsWith("\n") ? lines - 1 : lines;
 }
 
+const NON_ASCII = /[\u0080-\uffff]/g;
+const SURROGATE = /[\ud800-\udfff]/;
+const SURROGATE_PAIRS = /[\ud800-\udbff][\udc00-\udfff]/g;
+
+/** Index of the first non-ASCII character of `content` at or after `from`, or its length if there is none. */
+function findNonAscii(content: string, from: number): number {
+	NON_ASCII.lastIndex = from;
+	return NON_ASCII.exec(content)?.index ?? content.length;
+}
+
+/**
+ * A copy of `text` that shares no memory with the string it was cut from, so a short result does not keep a large
+ * input alive. UTF-16 code units round-trip unchanged, lone surrogates included.
+ */
+function copyString(text: string): string {
+	return Buffer.from(text, "utf16le").toString("utf16le");
+}
+
 /**
  * Format bytes as human-readable size.
  */
@@ -105,8 +123,12 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 	}
 
 	// Check if first line alone exceeds byte limit
+	// Every non-ASCII character takes more UTF-8 bytes than UTF-16 units, so equal lengths mean the content is ASCII and
+	// a line's byte length is its length.
+	const ascii = totalBytes === content.length;
 	const firstNewline = content.indexOf("\n");
-	const firstLineBytes = Buffer.byteLength(firstNewline === -1 ? content : content.slice(0, firstNewline), "utf-8");
+	const firstLineEnd = firstNewline === -1 ? content.length : firstNewline;
+	const firstLineBytes = ascii ? firstLineEnd : Buffer.byteLength(content.slice(0, firstLineEnd), "utf-8");
 	if (firstLineBytes > maxBytes) {
 		return {
 			content: "",
@@ -123,42 +145,51 @@ export function truncateHead(content: string, options: TruncationOptions = {}): 
 		};
 	}
 
-	// Collect complete lines that fit
-	const outputLinesArr: string[] = [];
+	// Count the complete lines that fit. They are a prefix of `content`, which is cut once instead of slicing every
+	// line and joining them again. Only lines that contain a non-ASCII character are measured with Buffer.byteLength.
+	let outputLines = 0;
 	let outputBytesCount = 0;
+	let outputEnd = 0;
 	let truncatedBy: "lines" | "bytes" = "lines";
+	let nextNonAscii = ascii ? content.length : findNonAscii(content, 0);
 
-	for (let i = 0, start = 0; i < totalLines && i < maxLines; i++) {
-		const end = content.indexOf("\n", start);
-		const line = end === -1 ? content.slice(start) : content.slice(start, end);
-		start = end + 1;
-		const lineBytes = Buffer.byteLength(line, "utf-8") + (i > 0 ? 1 : 0); // +1 for newline
+	for (let start = 0; outputLines < totalLines && outputLines < maxLines; ) {
+		const newline = content.indexOf("\n", start);
+		const end = newline === -1 ? content.length : newline;
+		let lineBytes: number;
+		if (end <= nextNonAscii) {
+			lineBytes = end - start;
+		} else {
+			lineBytes = Buffer.byteLength(content.slice(start, end), "utf-8");
+			nextNonAscii = findNonAscii(content, end);
+		}
+		if (outputLines > 0) lineBytes++; // +1 for newline
 
 		if (outputBytesCount + lineBytes > maxBytes) {
 			truncatedBy = "bytes";
 			break;
 		}
 
-		outputLinesArr.push(line);
+		outputLines++;
 		outputBytesCount += lineBytes;
+		outputEnd = end;
+		start = end + 1;
 	}
 
 	// If we exited due to line limit
-	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
+	if (outputLines >= maxLines && outputBytesCount <= maxBytes) {
 		truncatedBy = "lines";
 	}
 
-	const outputContent = outputLinesArr.join("\n");
-	const finalOutputBytes = Buffer.byteLength(outputContent, "utf-8");
-
 	return {
-		content: outputContent,
+		content: copyString(content.slice(0, outputEnd)),
 		truncated: true,
 		truncatedBy,
 		totalLines,
 		totalBytes,
-		outputLines: outputLinesArr.length,
-		outputBytes: finalOutputBytes,
+		outputLines,
+		// A "\n" never splits a surrogate pair, so the lines' byte lengths add up to the output's.
+		outputBytes: outputBytesCount,
 		lastLinePartial: false,
 		firstLineExceedsLimit: false,
 		maxLines,
@@ -196,54 +227,55 @@ export function truncateTail(content: string, options: TruncationOptions = {}): 
 		};
 	}
 
-	// Work backwards from the end, collecting the kept lines last first. A trailing "\n" ends the last line.
-	const outputLinesArr: string[] = [];
+	// Work backwards from the end. A trailing "\n" ends the last line. The kept lines are a suffix of the content up to
+	// that "\n", which is cut once instead of slicing every line and joining them again.
+	const ascii = totalBytes === content.length;
+	const contentEnd = content.endsWith("\n") ? content.length - 1 : content.length;
+	let outputLines = 0;
 	let outputBytesCount = 0;
+	let outputStart = contentEnd;
+	let partialLine: string | undefined;
 	let truncatedBy: "lines" | "bytes" = "lines";
-	let lastLinePartial = false;
 
-	let end = content.endsWith("\n") ? content.length - 1 : content.length;
-	for (let i = totalLines - 1; i >= 0 && outputLinesArr.length < maxLines; i--) {
+	let end = contentEnd;
+	for (let i = totalLines - 1; i >= 0 && outputLines < maxLines; i--) {
 		const start = i === 0 ? 0 : content.lastIndexOf("\n", end - 1) + 1;
-		const line = content.slice(start, end);
-		end = start - 1;
-		const lineBytes = Buffer.byteLength(line, "utf-8") + (outputLinesArr.length > 0 ? 1 : 0); // +1 for newline
+		const lineBytes =
+			(ascii ? end - start : Buffer.byteLength(content.slice(start, end), "utf-8")) + (outputLines > 0 ? 1 : 0); // +1 for newline
 
 		if (outputBytesCount + lineBytes > maxBytes) {
 			truncatedBy = "bytes";
 			// Edge case: if we haven't added ANY lines yet and this line exceeds maxBytes,
 			// take the end of the line (partial)
-			if (outputLinesArr.length === 0) {
-				const truncatedLine = truncateStringToBytesFromEnd(line, maxBytes);
-				outputLinesArr.push(truncatedLine);
-				outputBytesCount = Buffer.byteLength(truncatedLine, "utf-8");
-				lastLinePartial = true;
+			if (outputLines === 0) {
+				partialLine = truncateStringToBytesFromEnd(content.slice(start, end), maxBytes);
+				outputLines = 1;
+				outputBytesCount = Buffer.byteLength(partialLine, "utf-8");
 			}
 			break;
 		}
 
-		outputLinesArr.push(line);
+		outputLines++;
 		outputBytesCount += lineBytes;
+		outputStart = start;
+		end = start - 1;
 	}
-	outputLinesArr.reverse();
 
 	// If we exited due to line limit
-	if (outputLinesArr.length >= maxLines && outputBytesCount <= maxBytes) {
+	if (outputLines >= maxLines && outputBytesCount <= maxBytes) {
 		truncatedBy = "lines";
 	}
 
-	const outputContent = outputLinesArr.join("\n");
-	const finalOutputBytes = Buffer.byteLength(outputContent, "utf-8");
-
 	return {
-		content: outputContent,
+		content: partialLine ?? copyString(content.slice(outputStart, contentEnd)),
 		truncated: true,
 		truncatedBy,
 		totalLines,
 		totalBytes,
-		outputLines: outputLinesArr.length,
-		outputBytes: finalOutputBytes,
-		lastLinePartial,
+		outputLines,
+		// A "\n" never splits a surrogate pair, so the lines' byte lengths add up to the output's.
+		outputBytes: outputBytesCount,
+		lastLinePartial: partialLine !== undefined,
 		firstLineExceedsLimit: false,
 		maxLines,
 		maxBytes,
@@ -313,7 +345,11 @@ export function truncateMiddle(content: string, maxBytes: number): MiddleTruncat
 	while (tailStart < buf.length && !isBoundary(tailStart)) tailStart++;
 	const head = buf.subarray(0, headEnd).toString("utf-8");
 	const tail = buf.subarray(tailStart).toString("utf-8");
-	const removedChars = Array.from(buf.subarray(headEnd, tailStart).toString("utf-8")).length;
+	// Characters are code points: UTF-16 units less one per surrogate pair. Counted with native string searches
+	// instead of building an array of every removed character, which can be megabytes of them.
+	const removed = buf.subarray(headEnd, tailStart).toString("utf-8");
+	let removedChars = removed.length;
+	if (SURROGATE.test(removed)) removedChars -= removed.match(SURROGATE_PAIRS)?.length ?? 0;
 	return {
 		content: `${head}…${removedChars} chars truncated…${tail}`,
 		truncated: true,
