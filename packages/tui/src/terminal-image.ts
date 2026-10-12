@@ -1,4 +1,5 @@
-import { execSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import type { Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -33,7 +34,10 @@ export interface ImageRenderOptions {
 }
 
 let cachedCapabilities: TerminalCapabilities | null = null;
+/** Whether `cachedCapabilities` took `hyperlinks: false` from a tmux probe that has not answered yet. */
+let cachedBeforeTmuxAnswer = false;
 let capabilityOverrides: Partial<TerminalCapabilities> = {};
+const capabilityChangeListeners = new Set<() => void>();
 
 // Default cell dimensions - updated by TUI when terminal responds to query
 let cellDimensions: CellDimensions = { widthPx: 9, heightPx: 18 };
@@ -46,25 +50,71 @@ export function setCellDimensions(dims: CellDimensions): void {
 	cellDimensions = dims;
 }
 
+/** The tmux probe's answer; undefined until it has answered. */
+let tmuxHyperlinks: boolean | undefined;
+let tmuxProbeStarted = false;
+
 /**
  * Checks whether the attached tmux client forwards OSC 8 hyperlinks to the
  * outer terminal. tmux only re-emits them when its `client_termfeatures` lists
  * `hyperlinks`, and strips them otherwise. On any error fallbacks `false`.
+ *
+ * The check runs `tmux` in the background, so starting Pi does not wait for it (10-40 ms): until it answers this
+ * returns `false`. An answer of `true` drops the cached capabilities and notifies onCapabilitiesChange() listeners once.
  */
 function probeTmuxHyperlinks(): boolean {
-	try {
-		const termfeatures = execSync("tmux display-message -p '#{client_termfeatures}'", {
-			encoding: "utf8",
-			timeout: 250,
-			stdio: ["ignore", "pipe", "ignore"],
-		});
-		return termfeatures
-			.split(",")
-			.map((feature) => feature.trim())
-			.includes("hyperlinks");
-	} catch {
-		return false;
+	if (tmuxHyperlinks !== undefined) return tmuxHyperlinks;
+	if (!tmuxProbeStarted) {
+		tmuxProbeStarted = true;
+		startTmuxProbe();
 	}
+	return false;
+}
+
+function startTmuxProbe(): void {
+	const answer = (forwards: boolean) => {
+		tmuxHyperlinks = forwards;
+		if (!forwards || !cachedBeforeTmuxAnswer) return;
+		cachedCapabilities = null;
+		cachedBeforeTmuxAnswer = false;
+		for (const listener of capabilityChangeListeners) listener();
+	};
+	try {
+		const child = execFile(
+			"tmux",
+			["display-message", "-p", "#{client_termfeatures}"],
+			{ encoding: "utf8" },
+			(error, stdout) => {
+				clearTimeout(timeout);
+				answer(
+					!error &&
+						stdout
+							.split(",")
+							.map((feature) => feature.trim())
+							.includes("hyperlinks"),
+				);
+			},
+		);
+		// Neither the probe nor its time limit may keep a short-lived Pi (e.g. `pi -p`) running.
+		const timeout = setTimeout(() => child.kill(), 250);
+		timeout.unref();
+		child.unref();
+		child.stdin?.end();
+		// The pipes are sockets, which can be unreferenced too.
+		(child.stdout as Socket | null)?.unref();
+		(child.stderr as Socket | null)?.unref();
+	} catch {
+		answer(false);
+	}
+}
+
+/**
+ * Calls `listener` when the detected capabilities change after they were first read (the tmux hyperlink probe
+ * answered): what was drawn with the old ones should be drawn again. Returns a function that removes the listener.
+ */
+export function onCapabilitiesChange(listener: () => void): () => void {
+	capabilityChangeListeners.add(listener);
+	return () => capabilityChangeListeners.delete(listener);
 }
 
 function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean): TerminalCapabilities {
@@ -171,10 +221,20 @@ export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeT
 export function getCapabilities(): TerminalCapabilities {
 	if (!cachedCapabilities) {
 		const hyperlinks = capabilityOverrides.hyperlinks;
+		let probePending = false;
 		cachedCapabilities = {
-			...detectCapabilities(hyperlinks === undefined ? undefined : () => hyperlinks),
+			...detectCapabilities(
+				hyperlinks === undefined
+					? () => {
+							const forwards = probeTmuxHyperlinks();
+							probePending = tmuxHyperlinks === undefined;
+							return forwards;
+						}
+					: () => hyperlinks,
+			),
 			...capabilityOverrides,
 		};
+		cachedBeforeTmuxAnswer = probePending;
 	}
 	return cachedCapabilities;
 }
@@ -185,6 +245,9 @@ export function getTerminalColorMode(capabilities: TerminalCapabilities = getCap
 
 export function resetCapabilitiesCache(): void {
 	cachedCapabilities = null;
+	cachedBeforeTmuxAnswer = false;
+	tmuxHyperlinks = undefined;
+	tmuxProbeStarted = false;
 }
 
 /** Override selected auto-detected capabilities. */
@@ -198,11 +261,13 @@ export function setCapabilityOverrides(overrides: Partial<TerminalCapabilities>)
 	}
 	capabilityOverrides = { ...overrides };
 	cachedCapabilities = null;
+	cachedBeforeTmuxAnswer = false;
 }
 
 /** Override the cached capabilities. Useful in tests to exercise both code paths. */
 export function setCapabilities(caps: TerminalCapabilities): void {
 	cachedCapabilities = caps;
+	cachedBeforeTmuxAnswer = false;
 }
 
 const KITTY_PREFIX = "\x1b_G";
