@@ -156,6 +156,7 @@ export {
 	type ImageProtocol,
 	type ImageRenderOptions,
 	imageFallback,
+	onCapabilitiesChange,
 	renderImage,
 	resetCapabilitiesCache,
 	setCapabilities,
