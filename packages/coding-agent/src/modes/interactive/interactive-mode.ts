@@ -95,6 +95,7 @@ import type {
 } from "../../core/extensions/index.ts";
 import { FooterDataProvider, type ReadonlyFooterDataProvider } from "../../core/footer-data-provider.ts";
 import { configureHttpDispatcher, formatHttpIdleTimeoutMs } from "../../core/http-dispatcher.ts";
+import { IdleCollector, processHeapBytes, runtimeFullCollection } from "../../core/idle-gc.ts";
 import { type AppKeybinding, KeybindingsManager } from "../../core/keybindings.ts";
 import type { McpHttpServerConfig } from "../../core/mcp-servers.ts";
 import { createCompactionSummaryMessage, createCustomMessage } from "../../core/messages.ts";
@@ -531,6 +532,8 @@ export class InteractiveMode {
 	// Agent subscription unsubscribe function
 	private unsubscribe?: () => void;
 	private unsubscribeCapabilityChanges?: () => void;
+	/** Bun only: a full collection when idle after a run (see idle-gc.ts). */
+	private idleCollector: IdleCollector | undefined;
 	private signalCleanupHandlers: Array<() => void> = [];
 
 	// Track if editor is in bash mode (text starts with !)
@@ -661,6 +664,19 @@ export class InteractiveMode {
 		this.editorContainer = new Container();
 		this.editorContainer.addChild(this.editor as Component);
 		this.footerDataProvider = new FooterDataProvider(this.sessionManager.getCwd());
+		const collect = runtimeFullCollection();
+		this.idleCollector = collect
+			? new IdleCollector({
+					collect,
+					heapBytes: processHeapBytes,
+					isBusy: () => this.session.isStreaming || this.session.isCompacting,
+					watchActivity: (onActivity) =>
+						this.ui.addInputListener(() => {
+							onActivity();
+							return undefined;
+						}),
+				})
+			: undefined;
 		this.footer = new FooterComponent(this.session, this.footerDataProvider);
 		this.footer.setAutoCompactEnabled(this.session.autoCompactionEnabled);
 		this.footerContainer = new Container();
@@ -3410,6 +3426,7 @@ export class InteractiveMode {
 
 		switch (event.type) {
 			case "agent_start":
+				this.idleCollector?.cancel();
 				this.pendingTools.clear();
 				// Restore main escape handler if retry handler is still active
 				// (retry success event fires later, but we need main handler now)
@@ -3660,6 +3677,7 @@ export class InteractiveMode {
 				this.pendingTools.clear();
 
 				this.ui.requestRender();
+				this.idleCollector?.schedule();
 				break;
 
 			case "agent_settled":
@@ -7041,6 +7059,7 @@ export class InteractiveMode {
 		this.footerDataProvider.dispose();
 		this.unsubscribeCapabilityChanges?.();
 		this.unsubscribeCapabilityChanges = undefined;
+		this.idleCollector?.dispose();
 		if (this.unsubscribe) {
 			this.unsubscribe();
 		}
