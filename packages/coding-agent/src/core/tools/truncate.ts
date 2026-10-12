@@ -37,6 +37,14 @@ export interface TruncationResult {
 	maxBytes: number;
 }
 
+/**
+ * `truncation` for a tool result's details: the same, without `content`, which is the tool result's text already (with a
+ * notice after it). Details are kept with the session in memory and in its file, so the text would be kept twice.
+ */
+export function truncationDetails(truncation: TruncationResult): TruncationResult {
+	return { ...truncation, content: "" };
+}
+
 export interface TruncationOptions {
 	/** Maximum number of lines (default: 2000) */
 	maxLines?: number;
