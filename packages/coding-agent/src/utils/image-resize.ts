@@ -1,4 +1,4 @@
-import { Worker } from "node:worker_threads";
+import type { Worker } from "node:worker_threads";
 import {
 	IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
 	type ImageResizeOptions,
@@ -22,7 +22,8 @@ function isResizeImageWorkerResponse(value: unknown): value is ResizeImageWorker
 }
 
 function createResizeWorker(workerSpecifier: string | URL): Worker {
-	return new Worker(workerSpecifier);
+	// worker_threads loads on first use, not at every start.
+	return new (process.getBuiltinModule("node:worker_threads").Worker)(workerSpecifier);
 }
 
 async function resizeImageInWorker(
