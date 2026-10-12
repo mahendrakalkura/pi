@@ -1111,6 +1111,8 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		// Streaming emits an event per delta, and most have no handler: skip building the context and the snapshot.
+		if (!this.hasHandlers(event.type)) return undefined as RunnerEmitResult<TEvent>;
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
 
