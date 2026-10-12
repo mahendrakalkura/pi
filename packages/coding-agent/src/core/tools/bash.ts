@@ -17,6 +17,13 @@ import { OutputAccumulator, type OutputSnapshot } from "./output-accumulator.ts"
 import { BASH_UPDATE_THROTTLE_MS, createShellRenderers } from "./renderers/bash.ts";
 import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult } from "./truncate.ts";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	type TruncationResult,
+	truncationDetails,
+} from "./truncate.ts";
 
 const MAX_TIMEOUT_MS = 2_147_483_647;
 /** Output limit of `structuredContent.output`, which programmatic callers such as codemode scripts receive. */
@@ -320,7 +327,7 @@ export function createShellToolDefinition(
 				onUpdate({
 					content: [{ type: "text", text: snapshot.content || "" }],
 					details: {
-						truncation: snapshot.truncation.truncated ? snapshot.truncation : undefined,
+						truncation: snapshot.truncation.truncated ? truncationDetails(snapshot.truncation) : undefined,
 						...outputFileDetails(snapshot),
 					},
 				});
@@ -373,7 +380,7 @@ export function createShellToolDefinition(
 				let text = snapshot.content || emptyText;
 				let details: BashToolDetails | undefined;
 				if (truncation.truncated) {
-					details = { truncation, ...outputFileDetails(snapshot) };
+					details = { truncation: truncationDetails(truncation), ...outputFileDetails(snapshot) };
 					const file = snapshot.fullOutputFile;
 					const fullOutput =
 						file?.kind === "failed"

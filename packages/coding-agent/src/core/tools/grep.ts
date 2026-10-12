@@ -16,6 +16,7 @@ import {
 	type TruncationResult,
 	truncateHead,
 	truncateLine,
+	truncationDetails,
 } from "./truncate.ts";
 
 const grepSchema = Type.Object({
@@ -312,7 +313,7 @@ export function createGrepToolDefinition(
 							}
 							if (truncation.truncated) {
 								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-								details.truncation = truncation;
+								details.truncation = truncationDetails(truncation);
 							}
 							if (linesTruncated) {
 								notices.push(
