@@ -129,7 +129,7 @@ import {
 import { copyToClipboard, readClipboardFilePaths, readClipboardText } from "../../utils/clipboard.ts";
 import { extensionForImageMimeType, readClipboardImage } from "../../utils/clipboard-image.ts";
 import { parseGitUrl } from "../../utils/git.ts";
-import { ensurePngTranscoder } from "../../utils/image-convert.ts";
+import { ensurePngTranscoderOnFirstUse } from "../../utils/image-convert.ts";
 import { getCwdRelativePath } from "../../utils/paths.ts";
 import { getPiUserAgent } from "../../utils/pi-user-agent.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
@@ -2096,9 +2096,9 @@ export class InteractiveMode {
 		this.transcriptScrollView?.setScrollbar(this.settingsManager.getFullscreenScrollbar());
 	}
 
-	/** Lets extension images use the PNG transcoder; tool results register it themselves. */
+	/** Lets extension images use the PNG transcoder, loaded when first needed; tool results register it themselves. */
 	private ensurePngTranscoder(): void {
-		ensurePngTranscoder(() => {
+		ensurePngTranscoderOnFirstUse(() => {
 			this.ui.invalidate();
 			this.ui.requestRender();
 		});

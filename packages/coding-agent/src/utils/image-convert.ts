@@ -77,13 +77,44 @@ let pngTranscoderRegistered = false;
  */
 export function ensurePngTranscoder(onRegistered: () => void): void {
 	if (pngTranscoderRegistered || getCapabilities().images !== "kitty") return;
+	void loadAndRegisterPngTranscoder().then((registered) => {
+		if (registered) onRegistered();
+	});
+}
+
+function loadAndRegisterPngTranscoder(): Promise<boolean> {
 	pngTranscoderLoad ??= loadPngTranscoder().then((transcoder) => {
 		if (!transcoder) return false;
 		setImageTranscoder(transcoder);
 		pngTranscoderRegistered = true;
 		return true;
 	});
-	void pngTranscoderLoad.then((registered) => {
-		if (registered) onRegistered();
+	return pngTranscoderLoad;
+}
+
+let firstUseTranscoderInstalled = false;
+let firstUseTranscoderCalled = false;
+let onFirstUseRegistered: (() => void) | undefined;
+
+/**
+ * ensurePngTranscoder() for images nothing has asked for yet: on Kitty-protocol terminals, photon loads the first time a
+ * non-PNG image is drawn instead of at startup (it costs startup time and memory). Until it has loaded, such an image is
+ * drawn as its text fallback, as it is while ensurePngTranscoder() loads photon. `onRegistered` then runs once to draw the
+ * fallbacks again; it is the one pending callback (a later call replaces it) and does not run when no image needed photon.
+ */
+export function ensurePngTranscoderOnFirstUse(onRegistered: () => void): void {
+	onFirstUseRegistered = onRegistered;
+	if (pngTranscoderRegistered || firstUseTranscoderInstalled || getCapabilities().images !== "kitty") return;
+	firstUseTranscoderInstalled = true;
+	setImageTranscoder(() => {
+		if (!firstUseTranscoderCalled) {
+			firstUseTranscoderCalled = true;
+			void loadAndRegisterPngTranscoder().then((registered) => {
+				if (registered) onFirstUseRegistered?.();
+				// Without photon there is no transcoder, as before.
+				else setImageTranscoder(undefined);
+			});
+		}
+		return null;
 	});
 }
