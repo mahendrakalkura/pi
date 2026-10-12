@@ -6,7 +6,7 @@ import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { lsRenderers } from "./renderers/ls.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead, truncationDetails } from "./truncate.ts";
 
 const lsSchema = Type.Object({
 	path: Type.Optional(Type.String({ description: "Directory to list (default: current directory)" })),
@@ -149,7 +149,7 @@ export function createLsToolDefinition(
 						}
 						if (truncation.truncated) {
 							notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-							details.truncation = truncation;
+							details.truncation = truncationDetails(truncation);
 						}
 						if (notices.length > 0) {
 							output += `\n\n[${notices.join(". ")}]`;

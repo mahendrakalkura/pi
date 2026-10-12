@@ -196,6 +196,9 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.truncation?.truncatedBy).toBe("lines");
 			expect(result.details?.truncation?.totalLines).toBe(2500);
 			expect(result.details?.truncation?.outputLines).toBe(2000);
+			// The kept text is the result's content; details do not hold it a second time.
+			expect(result.details?.truncation?.content).toBe("");
+			expect(getTextOutput(result)).toContain("Line 2000\n\n[Showing lines 1-2000 of 2500.");
 		});
 
 		it("should detect image MIME type from file magic (not extension)", async () => {
@@ -839,6 +842,7 @@ describe("Coding Agent Tools", () => {
 
 			expect(result.details?.truncation?.truncated).toBe(true);
 			expect(result.details?.truncation?.truncatedBy).toBe("lines");
+			expect(result.details?.truncation?.content).toBe("");
 			expect(fullOutputPath).toBeDefined();
 			expect(output).toMatch(/\[Showing lines \d+-\d+ of \d+\. Full output: /);
 			expect(output).not.toContain("Full output: undefined");

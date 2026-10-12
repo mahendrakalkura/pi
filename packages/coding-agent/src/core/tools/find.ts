@@ -8,7 +8,7 @@ import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { findRenderers } from "./renderers/find.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead, truncationDetails } from "./truncate.ts";
 
 /** Relativize a find result against the search root and normalize it to posix separators. */
 export function relativizeFindResultPath(
@@ -154,7 +154,7 @@ export function createFindToolDefinition(
 							}
 							if (truncation.truncated) {
 								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-								details.truncation = truncation;
+								details.truncation = truncationDetails(truncation);
 							}
 							if (notices.length > 0) {
 								resultOutput += `\n\n[${notices.join(". ")}]`;
@@ -286,7 +286,7 @@ export function createFindToolDefinition(
 							}
 							if (truncation.truncated) {
 								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-								details.truncation = truncation;
+								details.truncation = truncationDetails(truncation);
 							}
 							if (notices.length > 0) {
 								resultOutput += `\n\n[${notices.join(". ")}]`;
