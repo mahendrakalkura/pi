@@ -129,7 +129,6 @@ import {
 	getLatestCompactionEntry,
 	type SessionEntry,
 	SessionManager,
-	type SessionProjection,
 } from "./session-manager.ts";
 import {
 	applyToolModifiers,
@@ -439,6 +438,9 @@ export class AgentSession {
 	 * retry is routed with it as `failed`, since the context no longer contains it.
 	 */
 	private _failedResponse: AssistantMessage | undefined;
+	private _contextEstimate:
+		| { sessionManager: SessionManager; revision: number; tokens: number; knownAfterCompaction: boolean }
+		| undefined;
 
 	// Bash execution state
 	private readonly _bashAbortControllers = new Set<AbortController>();
@@ -825,21 +827,59 @@ export class AgentSession {
 		}
 	}
 
-	/** Whether `projection`, the current session projection, exceeds the compaction threshold of `model`. */
-	private _exceedsCompactionThreshold(model: Model<any>, projection: SessionProjection): boolean {
+	/** Whether the current session projection exceeds the compaction threshold of `model`. */
+	private _exceedsCompactionThreshold(model: Model<any>): boolean {
 		if (model.contextWindow <= 0) return false;
 		return shouldCompact(
-			estimateProjectedContextTokens(projection, this.sessionManager.getBranch()).tokens,
+			this._contextTokenEstimate().tokens,
 			model.contextWindow,
 			this.settingsManager.getCompactionSettings(this.model),
 		);
+	}
+
+	/**
+	 * The context size estimate of the current projection, kept until the projection changes: the compaction check
+	 * runs before every request and the footer asks after every entry, and each estimate walks the whole context.
+	 * `knownAfterCompaction` is false when the latest compaction has no projected assistant response with usage after it
+	 * (the size is unknown until the next response).
+	 */
+	private _contextTokenEstimate(): { tokens: number; knownAfterCompaction: boolean } {
+		const sessionManager = this.sessionManager;
+		const revision = sessionManager.getProjectionRevision();
+		const cached = this._contextEstimate;
+		if (cached && cached.sessionManager === sessionManager && cached.revision === revision) return cached;
+
+		const projection = sessionManager.peekSessionProjection();
+		const branch = sessionManager.getBranch();
+		let knownAfterCompaction = true;
+		const latestCompaction = getLatestCompactionEntry(branch);
+		if (latestCompaction) {
+			const projectedAssistants = new Set(
+				projection.entries.flatMap((entry) =>
+					entry.messages.some(
+						(message) =>
+							message.role === "assistant" &&
+							message.stopReason !== "aborted" &&
+							message.stopReason !== "error" &&
+							calculateContextTokens(message.usage) > 0,
+					)
+						? [entry.sourceEntry.id]
+						: [],
+				),
+			);
+			const compactionIndex = branch.findIndex((entry) => entry.id === latestCompaction.id);
+			knownAfterCompaction = branch.slice(compactionIndex + 1).some((entry) => projectedAssistants.has(entry.id));
+		}
+		const tokens = estimateProjectedContextTokens(projection, branch).tokens;
+		this._contextEstimate = { sessionManager, revision, tokens, knownAfterCompaction };
+		return this._contextEstimate;
 	}
 
 	private async _compactBeforeNextAssistantResponse(context: AgentContext): Promise<AgentContext> {
 		const projection = this.sessionManager.buildSessionProjection();
 		// A virtual selection is checked in prepareRequest, against the model the request is routed to.
 		const model = this.model;
-		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model, projection)) {
+		if (!model || isVirtualModel(model) || !this._exceedsCompactionThreshold(model)) {
 			return { ...context, messages: projection.messages };
 		}
 		await this._runAutoCompaction("threshold", false);
@@ -868,9 +908,9 @@ export class AgentSession {
 					},
 					signal,
 				);
-				return { previous, context: previous?.context ?? canonicalContext, projection };
+				return { previous, context: previous?.context ?? canonicalContext };
 			};
-			let { previous, context, projection } = await prepare();
+			let { previous, context } = await prepare();
 			const model = previous?.model ?? this.agent.state.model;
 			const thinkingLevel = previous?.thinkingLevel ?? this.agent.state.thinkingLevel;
 			if (!isVirtualModel(model)) return { ...previous, context, model, thinkingLevel };
@@ -897,7 +937,7 @@ export class AgentSession {
 			}
 			// The route stands: the router already decided this request. The state entry does not change
 			// the projection.
-			if (this._exceedsCompactionThreshold(route.model, projection)) {
+			if (this._exceedsCompactionThreshold(route.model)) {
 				await this._runAutoCompaction("threshold", false);
 				({ previous, context } = await prepare());
 			}
@@ -4372,32 +4412,9 @@ export class AgentSession {
 		// After compaction, the last assistant usage reflects pre-compaction context size.
 		// We can only trust usage from an assistant that responded after the latest compaction.
 		// If no such assistant exists, context token count is unknown until the next LLM response.
-		const projection = this.sessionManager.buildSessionProjection();
-		const branch = this.sessionManager.getBranch();
-		const latestCompaction = getLatestCompactionEntry(branch);
+		const estimate = this._contextTokenEstimate();
+		if (!estimate.knownAfterCompaction) return { tokens: null, contextWindow, percent: null };
 
-		if (latestCompaction) {
-			const projectedAssistants = new Set(
-				projection.entries.flatMap((entry) =>
-					entry.messages.some(
-						(message) =>
-							message.role === "assistant" &&
-							message.stopReason !== "aborted" &&
-							message.stopReason !== "error" &&
-							calculateContextTokens(message.usage) > 0,
-					)
-						? [entry.sourceEntry.id]
-						: [],
-				),
-			);
-			const compactionIndex = branch.findIndex((entry) => entry.id === latestCompaction.id);
-			const hasPostCompactionUsage = branch
-				.slice(compactionIndex + 1)
-				.some((entry) => projectedAssistants.has(entry.id));
-			if (!hasPostCompactionUsage) return { tokens: null, contextWindow, percent: null };
-		}
-
-		const estimate = estimateProjectedContextTokens(projection, branch);
 		const percent = (estimate.tokens / contextWindow) * 100;
 
 		return {
