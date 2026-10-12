@@ -202,6 +202,9 @@ describe("Coding Agent Tools", () => {
 			expect(result.details?.truncation?.truncatedBy).toBe("lines");
 			expect(result.details?.truncation?.totalLines).toBe(2500);
 			expect(result.details?.truncation?.outputLines).toBe(2000);
+			// The kept text is the result's content; details do not hold it a second time.
+			expect(result.details?.truncation?.content).toBe("");
+			expect(getTextOutput(result)).toContain("Line 2000\n\n[Showing lines 1-2000 of 2500.");
 		});
 
 		it("should detect image MIME type from file magic (not extension)", async () => {
@@ -845,6 +848,7 @@ describe("Coding Agent Tools", () => {
 
 			expect(result.details?.truncation?.truncated).toBe(true);
 			expect(result.details?.truncation?.truncatedBy).toBe("lines");
+			expect(result.details?.truncation?.content).toBe("");
 			expect(fullOutputPath).toBeDefined();
 			expect(output).toMatch(/\[Showing lines \d+-\d+ of \d+\. Full output: /);
 			expect(output).not.toContain("Full output: undefined");
@@ -1264,7 +1268,9 @@ describe("Coding Agent Tools", () => {
 			const result = await findTool.execute("test-call-find-byte-cap", { pattern: "*.txt", path: testDir });
 			const expected = truncateHead(names.join("\n"), { maxLines: Number.MAX_SAFE_INTEGER });
 			expect(result.details?.truncation).toEqual({ ...expected, content: result.details?.truncation?.content });
-			expect(result.details?.truncation?.content.split("\n")).toHaveLength(expected.outputLines);
+			// Details carry the truncation without its content, which is the result's text already.
+			expect(result.details?.truncation?.content).toBe("");
+			expect(getTextOutput(result).split("\n\n")[0].split("\n")).toHaveLength(expected.outputLines);
 			expect(result.details?.resultLimitReached).toBeUndefined();
 			expect(getTextOutput(result)).toMatch(/\n\n\[50\.0KB limit reached\]$/);
 		});

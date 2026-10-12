@@ -6,7 +6,13 @@ import { pathToFileURL } from "url";
 import type * as util from "util";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { createReadToolDefinition, type ReadOperations } from "../src/core/tools/read.ts";
-import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "../src/core/tools/truncate.ts";
+import {
+	DEFAULT_MAX_BYTES,
+	formatSize,
+	type TruncationResult,
+	truncateHead,
+	truncationDetails,
+} from "../src/core/tools/truncate.ts";
 
 // Runs when the read tool decodes a chunk: the file is open and partly read, so a test can change it mid-read.
 const decodeHook = vi.hoisted(() => ({ run: undefined as (() => void) | undefined }));
@@ -21,7 +27,8 @@ vi.mock("util", async (importOriginal) => {
 	return { ...actual, TextDecoder: HookedTextDecoder };
 });
 
-// The read tool's text path before it streamed (#9654), kept as the reference the new path must match.
+// The read tool's text path before it streamed (#9654), kept as the reference the new path must match. Details carry
+// the truncation without its content, which is the result's text already.
 function referenceRead(
 	textContent: string,
 	path: string,
@@ -50,7 +57,7 @@ function referenceRead(
 	if (truncation.firstLineExceedsLimit) {
 		const firstLineSize = formatSize(Buffer.byteLength(allLines[startLine], "utf-8"));
 		outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
-		details = { truncation };
+		details = { truncation: truncationDetails(truncation) };
 	} else if (truncation.truncated) {
 		const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
 		const nextOffset = endLineDisplay + 1;
@@ -60,7 +67,7 @@ function referenceRead(
 		} else {
 			outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
 		}
-		details = { truncation };
+		details = { truncation: truncationDetails(truncation) };
 	} else if (userLimitedLines !== undefined && startLine + userLimitedLines < allLines.length) {
 		const remaining = allLines.length - (startLine + userLimitedLines);
 		const nextOffset = startLine + userLimitedLines + 1;

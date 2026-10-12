@@ -11,6 +11,14 @@ import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
 import { type TypeBoxAgentTool, wrapToolDefinition } from "./tool-definition-wrapper.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import {
+	DEFAULT_MAX_BYTES,
+	DEFAULT_MAX_LINES,
+	formatSize,
+	type TruncationResult,
+	truncateHead,
+	truncationDetails,
+} from "./truncate.ts";
 
 const readSchema = Type.Object({
 	path: Type.String({ description: "Path to the file to read (relative or absolute)" }),
@@ -319,7 +327,7 @@ export function createReadToolDefinition(
 									// First line alone exceeds the byte limit. Point the model at a bash fallback.
 									const firstLineSize = formatSize(firstLineBytes);
 									outputText = `[Line ${startLineDisplay} is ${firstLineSize}, exceeds ${formatSize(DEFAULT_MAX_BYTES)} limit. Use bash: sed -n '${startLineDisplay}p' ${path} | head -c ${DEFAULT_MAX_BYTES}]`;
-									details = { truncation };
+									details = { truncation: truncationDetails(truncation) };
 								} else if (truncation.truncated) {
 									// Truncation occurred. Build an actionable continuation notice.
 									const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
@@ -330,7 +338,7 @@ export function createReadToolDefinition(
 									} else {
 										outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines} (${formatSize(DEFAULT_MAX_BYTES)} limit). Use offset=${nextOffset} to continue.]`;
 									}
-									details = { truncation };
+									details = { truncation: truncationDetails(truncation) };
 								} else if (userLimitedLines !== undefined && startLine + userLimitedLines < totalFileLines) {
 									// User-specified limit stopped early, but the file still has more content.
 									const remaining = totalFileLines - (startLine + userLimitedLines);
