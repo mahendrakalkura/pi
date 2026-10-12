@@ -46,8 +46,15 @@ const eagerLanguages = {
 	lua,
 };
 
-for (const [name, language] of Object.entries(eagerLanguages)) {
-	hljs.registerLanguage(name, language);
+let eagerLanguagesRegistered = false;
+
+/** The eager set registers on first use, not at every start: running its grammar definitions costs about 1 ms. */
+function registerEagerLanguages(): void {
+	if (eagerLanguagesRegistered) return;
+	eagerLanguagesRegistered = true;
+	for (const [name, language] of Object.entries(eagerLanguages)) {
+		hljs.registerLanguage(name, language);
+	}
 }
 
 let allLanguagesPromise: Promise<void> | undefined;
@@ -55,6 +62,7 @@ let allLanguagesPromise: Promise<void> | undefined;
 let allLanguagesLoaded = false;
 
 export function loadAllHighlightLanguages(): Promise<void> {
+	registerEagerLanguages();
 	if (!allLanguagesPromise) {
 		allLanguagesPromise = new Promise((resolve) => {
 			setImmediate(() => {
@@ -211,6 +219,7 @@ export function renderHighlightedHtml(html: string, theme: HighlightTheme = {}):
 }
 
 export function highlight(code: string, options: HighlightOptions = {}): string {
+	registerEagerLanguages();
 	const html = options.language
 		? hljs.highlight(code, {
 				language: options.language,
@@ -250,6 +259,7 @@ export function loadAllHighlightLanguagesOnDemand(onLoaded: (languages: Readonly
 }
 
 export function supportsLanguage(name: string): boolean {
+	registerEagerLanguages();
 	if (hljs.getLanguage(name) !== undefined) {
 		return true;
 	}
