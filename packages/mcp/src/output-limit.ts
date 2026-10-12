@@ -8,6 +8,9 @@ import type { LlmContent } from "./protocol/content.ts";
 /** Model-facing text of an MCP result beyond this is cut in the middle. */
 export const MCP_OUTPUT_MAX_BYTES = 20 * 1024;
 
+const SURROGATE = /[\ud800-\udfff]/;
+const SURROGATE_PAIRS = /[\ud800-\udbff][\udc00-\udfff]/g;
+
 /**
  * Saves data the model cannot get in full, such as the full text of a truncated result, and returns
  * where it was saved (a path the model can read). `extension` includes the dot, for example `.txt`.
@@ -70,8 +73,15 @@ function truncateMiddle(text: string, maxBytes: number): MiddleTruncation | unde
 	while (tailStart < buf.length && !isBoundary(tailStart)) tailStart++;
 	const head = buf.subarray(0, headEnd).toString("utf-8");
 	const tail = buf.subarray(tailStart).toString("utf-8");
-	const removedChars = Array.from(buf.subarray(headEnd, tailStart).toString("utf-8")).length;
-	// A final newline ends the last line instead of starting another.
-	const lines = text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+	// Characters are code points: UTF-16 units less one per surrogate pair. Counted with native string searches
+	// instead of building an array of every removed character, which can be megabytes of them.
+	const removed = buf.subarray(headEnd, tailStart).toString("utf-8");
+	let removedChars = removed.length;
+	if (SURROGATE.test(removed)) removedChars -= removed.match(SURROGATE_PAIRS)?.length ?? 0;
+	// A final newline ends the last line instead of starting another. Counted without splitting, which would allocate
+	// a string per line of all of the text.
+	let lines = 1;
+	for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) lines++;
+	if (text.endsWith("\n")) lines--;
 	return { content: `${head}…${removedChars} chars truncated…${tail}`, totalBytes: buf.length, totalLines: lines };
 }

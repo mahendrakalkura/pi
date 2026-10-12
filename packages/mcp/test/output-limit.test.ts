@@ -76,4 +76,36 @@ describe("limitMcpContent", () => {
 		expect(Buffer.byteLength(tail)).toBeLessThanOrEqual(MCP_OUTPUT_MAX_BYTES / 2);
 		expect(Array.from(head).length + Array.from(tail).length + Number(marker[1])).toBe(Array.from(text).length);
 	});
+
+	it("counts removed characters and lines as splitting the text would", async () => {
+		// Surrogate pairs, lone surrogates (U+FFFD in UTF-8), multi-byte characters, CR/LF variants and a final newline.
+		const pieces = ["a", "xyz", "\n", "\n\n", "\r\n", "\r", "é", "€", "😀", "\ud800", "\udc00", "中文"];
+		let state = 0x5eed;
+		const random = () => {
+			state = (state * 1103515245 + 12345) >>> 0;
+			return state / 4294967296;
+		};
+		for (let i = 0; i < 200; i++) {
+			const parts: string[] = [];
+			// Twice the limit: adjacent lone surrogates join into a pair of fewer bytes than the two counted apart.
+			for (let bytes = 0; bytes <= 2 * MCP_OUTPUT_MAX_BYTES; ) {
+				const piece = pieces[Math.floor(random() * pieces.length)];
+				parts.push(piece);
+				bytes += Buffer.byteLength(piece);
+			}
+			let text = parts.join("");
+			if (random() < 0.5) text += "\n";
+			const limited = textOf((await limitMcpContent([{ type: "text", text }])).content);
+			const lines = text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+			expect(limited).toContain(`\nTotal output lines: ${lines}\n`);
+			const marker = /…(\d+) chars truncated…/.exec(limited);
+			if (!marker) throw new Error("expected the truncation marker");
+			const [head, tail] = limited.slice(limited.indexOf("\n\n") + 2).split(marker[0]);
+			const removed = Buffer.from(text, "utf-8").subarray(
+				Buffer.byteLength(head),
+				Buffer.byteLength(text) - Buffer.byteLength(tail),
+			);
+			expect(Number(marker[1])).toBe(Array.from(removed.toString("utf-8")).length);
+		}
+	});
 });
