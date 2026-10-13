@@ -1,0 +1,58 @@
+diff -ruN a/build/src/McpPage.js b/build/src/McpPage.js
+--- a/build/src/McpPage.js
++++ b/build/src/McpPage.js
+@@ -130,6 +130,7 @@
+     // Metadata
+     isolatedContextName;
+     #devtoolsUniverse;
++    #focusEmulation;
+     // Dialog
+     #dialog;
+     #dialogHandler;
+@@ -166,16 +167,17 @@
+         });
+     }
+     async init() {
+-        await Promise.allSettled([
+-            this.#initDevToolsUniverseNoThrow(),
+-            this.#initFocusEmulationNoThrow(),
+-        ]);
++        await this.#initDevToolsUniverseNoThrow();
+     }
+-    async #initFocusEmulationNoThrow() {
+-        // We emulate a focused page for all pages to support multi-agent workflows.
+-        void this.pptrPage.emulateFocusedPage(true).catch(error => {
++    // Pi patch: emulate focus only on pages a tool works with. Emulating it on every
++    // discovered page marks the user's background tabs visible, which defeats
++    // Chromium's background media deferral and background throttling.
++    async enableFocusEmulation() {
++        this.#focusEmulation ??= this.pptrPage.emulateFocusedPage(true).catch(error => {
++            this.#focusEmulation = undefined;
+             logger?.('Error turning on focused page emulation', error);
+         });
++        await this.#focusEmulation;
+     }
+     async #initDevToolsUniverseNoThrow() {
+         if (this.#devtoolsUniverse) {
+diff -ruN a/build/src/ToolHandler.js b/build/src/ToolHandler.js
+--- a/build/src/ToolHandler.js
++++ b/build/src/ToolHandler.js
+@@ -225,6 +225,7 @@
+                             ? context.getPageById(pageId)
+                             : context.getSelectedMcpPage();
+                     response.setPage(page);
++                    await page.enableFocusEmulation();
+                     if (this.tool.blockedByDialog) {
+                         page.throwIfDialogOpen();
+                     }
+diff -ruN a/build/src/tools/pages.js b/build/src/tools/pages.js
+--- a/build/src/tools/pages.js
++++ b/build/src/tools/pages.js
+@@ -46,6 +46,7 @@
+     handler: async (request, response, context) => {
+         const page = context.getPageById(request.params.pageId);
+         context.selectPage(page);
++        await page.enableFocusEmulation();
+         response.setIncludePages(true);
+         response.setListThirdPartyDeveloperTools();
+         response.setListWebMcpTools();
