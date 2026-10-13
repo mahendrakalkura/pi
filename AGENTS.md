@@ -183,6 +183,10 @@ mise exec node@24 -- npm run check:browser-smoke
 # The experimental durable tests import `@earendil-works/pi-durable/tools` the same way and fail with
 # "Cannot find package" on a stale `packages/durable/dist`.
 mise exec node@24 -- npm --prefix packages/tui run build
+# pi-durable imports `@earendil-works/pi-codemode/portable` through its `dist/`, so its build fails with
+# TS2307 "Cannot find module" on a stale `packages/codemode/dist`. Build chord and codemode first.
+mise exec node@24 -- npm --prefix packages/chord run build
+mise exec node@24 -- npm --prefix packages/codemode run build
 mise exec node@24 -- npm --prefix packages/durable run build
 # The pi-env tests spawn the Rust daemon and fail with "Build the daemon first" when
 # `packages/env/daemon/target/debug/pi-env` is missing. CI builds it the same way before `npm test`.
