@@ -940,3 +940,12 @@ describe("hyperlink", () => {
 		assert.ok(result.includes("README.md"));
 	});
 });
+
+describe("Kitty image controls", () => {
+	it("crops nothing, quickly, in a line of many image commands with no controls end", () => {
+		const line = "\x1b_G".repeat(100_000);
+		const started = performance.now();
+		assert.strictEqual(cropKittyImageLine(line, 1, 1), line);
+		assert.ok(performance.now() - started < 1000);
+	});
+});
