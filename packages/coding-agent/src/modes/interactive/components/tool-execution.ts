@@ -177,16 +177,18 @@ export class ToolExecutionComponent extends Container {
 
 	/**
 	 * Show new partial arguments. Applied at the next render, so a call streaming many argument deltas between two
-	 * frames runs its renderer once per frame, not once per delta (#9265).
+	 * frames runs its renderer once per frame, not once per delta (#9265). Returns whether `args` are new arguments,
+	 * which may change what this draws.
 	 */
-	updateArgs(args: any): void {
+	updateArgs(args: any): boolean {
 		// Every message_update hands every tool call of the message its arguments again, and ToolCallArgumentsStream
 		// returns the same object until they change: the same object is the same arguments, and drawing them again is
 		// wasted work that grows with their size (the write and edit renderers go over the whole file content).
-		if (args === this.args) return;
+		if (args === this.args) return false;
 		this.args = args;
 		this.argsPending = true;
 		this.ui.requestRender();
+		return true;
 	}
 
 	markExecutionStarted(): void {
