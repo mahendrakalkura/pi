@@ -210,6 +210,12 @@ interface LexedMarkdown {
 const lexedMarkdown: LexedMarkdown[] = [];
 const LEXED_MARKDOWN_KEPT = 8;
 
+/**
+ * For tokens lexed from those of a shorter source (lexAddedMarkdown()): those tokens, and how many leading tokens the two
+ * have in common (the same objects). Held weakly: the shorter source's tokens are not needed once these are rendered.
+ */
+const lexedFrom = new WeakMap<Token[], { tokens: WeakRef<Token[]>; shared: number }>();
+
 function hasLinkDefinitions(tokens: Token[]): boolean {
 	const links = (tokens as Partial<{ links: Record<string, unknown> }>).links;
 	return links !== undefined && Object.keys(links).length > 0;
@@ -242,9 +248,10 @@ function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | un
 	if (last <= 0) {
 		return undefined;
 	}
-	let offset = 0;
-	for (let i = 0; i < last; i++) {
-		offset += previous.tokens[i].raw.length;
+	// (The tokens of a resumable source add up to it: where the kept ones end is counted from the end, over the last few.)
+	let offset = previous.source.length;
+	for (let i = last; i < previous.tokens.length; i++) {
+		offset -= previous.tokens[i].raw.length;
 	}
 	// The text of a token is a part of the string that was lexed, and keeps all of that string in memory. Lexing the end
 	// of `source` as a part of it would leave every block of a long message holding the whole message as it was when
@@ -260,7 +267,11 @@ function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | un
 		length += token.raw.length;
 	}
 	// (As in lexMarkdown(): the next time, each token has to begin where the ones before it add up to.)
-	return length === source.length ? tokens : undefined;
+	if (length !== source.length) {
+		return undefined;
+	}
+	lexedFrom.set(tokens, { tokens: new WeakRef(previous.tokens), shared: last });
+	return tokens;
 }
 
 /**
@@ -357,12 +368,11 @@ function replaceTabs(text: string): string {
 	return replaced;
 }
 
-/** What a top-level block was rendered to, and everything that went into it besides the token. */
-interface RenderedBlock {
+/** Everything a block's lines depend on besides its token and the type of the token after it. */
+interface RenderSettings {
 	generation: number;
 	width: number;
 	paddingX: number;
-	nextTokenType: string | undefined;
 	theme: MarkdownTheme;
 	color: DefaultTextStyle["color"];
 	bgColor: DefaultTextStyle["bgColor"];
@@ -374,10 +384,46 @@ interface RenderedBlock {
 	preserveBackslashEscapes: boolean | undefined;
 	renderLatex: boolean | undefined;
 	capabilities: ReturnType<typeof getCapabilities>;
+}
+
+function sameSettings(a: RenderSettings, b: RenderSettings): boolean {
+	return (
+		a === b ||
+		(a.generation === b.generation &&
+			a.width === b.width &&
+			a.paddingX === b.paddingX &&
+			a.theme === b.theme &&
+			a.color === b.color &&
+			a.bgColor === b.bgColor &&
+			a.bold === b.bold &&
+			a.italic === b.italic &&
+			a.strikethrough === b.strikethrough &&
+			a.underline === b.underline &&
+			a.preserveOrderedListMarkers === b.preserveOrderedListMarkers &&
+			a.preserveBackslashEscapes === b.preserveBackslashEscapes &&
+			a.renderLatex === b.renderLatex &&
+			a.capabilities === b.capabilities)
+	);
+}
+
+/** What a top-level block was rendered to, and everything that went into it besides the token. */
+interface RenderedBlock {
+	settings: RenderSettings;
+	nextTokenType: string | undefined;
 	lines: string[];
 }
 
 const renderedBlocks = new WeakMap<Token, RenderedBlock>();
+
+/** What the top-level tokens of a source were rendered to: the lines of all the blocks, and where each block ends. */
+interface RenderedTokens {
+	settings: RenderSettings;
+	lines: string[];
+	/** `ends[i]`: the number of lines of the blocks up to and including block `i`. */
+	ends: number[];
+}
+
+const renderedTokens = new WeakMap<Token[], RenderedTokens>();
 
 let markdownCaching = true;
 
@@ -504,38 +550,46 @@ export class Markdown implements Component {
 		invalidateRenderedMarkdown();
 	}
 
+	/** Everything the lines of a block rendered at `width` depend on besides its token and the next token's type. */
+	private renderSettings(width: number): RenderSettings {
+		const style = this.defaultTextStyle;
+		return {
+			generation: renderedMarkdownGeneration(),
+			width,
+			paddingX: this.paddingX,
+			theme: this.theme,
+			color: style?.color,
+			bgColor: style?.bgColor,
+			bold: style?.bold,
+			italic: style?.italic,
+			strikethrough: style?.strikethrough,
+			underline: style?.underline,
+			preserveOrderedListMarkers: this.options.preserveOrderedListMarkers,
+			preserveBackslashEscapes: this.options.preserveBackslashEscapes,
+			renderLatex: this.options.renderLatex,
+			capabilities: getCapabilities(),
+		};
+	}
+
 	/**
 	 * The lines of one top-level block: rendered, wrapped, with margins and background. Kept with the token, which stays the
 	 * same object while the text before the last blocks of a message stays the same (lexMarkdown()).
 	 */
-	private renderBlock(token: Token, nextTokenType: string | undefined, width: number, contentWidth: number): string[] {
-		const style = this.defaultTextStyle;
-		const capabilities = getCapabilities();
+	private renderBlock(
+		token: Token,
+		nextTokenType: string | undefined,
+		settings: RenderSettings,
+		contentWidth: number,
+	): string[] {
 		const known = markdownCaching ? renderedBlocks.get(token) : undefined;
-		if (
-			known &&
-			known.generation === renderedMarkdownGeneration() &&
-			known.width === width &&
-			known.paddingX === this.paddingX &&
-			known.nextTokenType === nextTokenType &&
-			known.theme === this.theme &&
-			known.color === style?.color &&
-			known.bgColor === style?.bgColor &&
-			known.bold === style?.bold &&
-			known.italic === style?.italic &&
-			known.strikethrough === style?.strikethrough &&
-			known.underline === style?.underline &&
-			known.preserveOrderedListMarkers === this.options.preserveOrderedListMarkers &&
-			known.preserveBackslashEscapes === this.options.preserveBackslashEscapes &&
-			known.renderLatex === this.options.renderLatex &&
-			known.capabilities === capabilities
-		) {
+		if (known && known.nextTokenType === nextTokenType && sameSettings(known.settings, settings)) {
 			return known.lines;
 		}
 
+		const width = settings.width;
 		const leftMargin = " ".repeat(this.paddingX);
 		const rightMargin = " ".repeat(this.paddingX);
-		const bgFn = style?.bgColor;
+		const bgFn = this.defaultTextStyle?.bgColor;
 		const lines: string[] = [];
 		const add = (line: string) => {
 			if (isImageLine(line)) {
@@ -563,27 +617,47 @@ export class Markdown implements Component {
 			}
 		}
 		flattenLines(lines);
-		if (!markdownCaching) {
-			return lines;
+		if (markdownCaching) {
+			renderedBlocks.set(token, { settings, nextTokenType, lines });
 		}
-		renderedBlocks.set(token, {
-			generation: renderedMarkdownGeneration(),
-			width,
-			paddingX: this.paddingX,
-			nextTokenType,
-			theme: this.theme,
-			color: style?.color,
-			bgColor: style?.bgColor,
-			bold: style?.bold,
-			italic: style?.italic,
-			strikethrough: style?.strikethrough,
-			underline: style?.underline,
-			preserveOrderedListMarkers: this.options.preserveOrderedListMarkers,
-			preserveBackslashEscapes: this.options.preserveBackslashEscapes,
-			renderLatex: this.options.renderLatex,
-			capabilities,
-			lines,
-		});
+		return lines;
+	}
+
+	/**
+	 * The lines of all the top-level blocks of `tokens`, joined. Tokens lexed from those of a shorter source (a message
+	 * streaming in) take the lines of the blocks they have in common with it from what that source rendered to, so that the
+	 * cost of a new chunk does not grow with the length of the message: only the blocks lexed again are gone through.
+	 * The result is shared: not to be modified.
+	 */
+	private renderTokens(tokens: Token[], settings: RenderSettings, contentWidth: number): string[] {
+		const known = renderedTokens.get(tokens);
+		if (known && sameSettings(known.settings, settings)) {
+			return known.lines;
+		}
+		let lines: string[] = [];
+		let ends: number[] = [];
+		let reused = 0;
+		const from = lexedFrom.get(tokens);
+		const fromTokens = from?.tokens.deref();
+		const fromRendered = fromTokens ? renderedTokens.get(fromTokens) : undefined;
+		if (from && fromTokens && fromRendered && sameSettings(fromRendered.settings, settings)) {
+			reused = from.shared;
+			// (The lines of a block depend on the type of the block after it.)
+			if (reused > 0 && tokens[reused]?.type !== fromTokens[reused]?.type) {
+				reused--;
+			}
+			if (reused > 0) {
+				lines = fromRendered.lines.slice(0, fromRendered.ends[reused - 1]);
+				ends = fromRendered.ends.slice(0, reused);
+			}
+		}
+		for (let i = reused; i < tokens.length; i++) {
+			for (const line of this.renderBlock(tokens[i], tokens[i + 1]?.type, settings, contentWidth)) {
+				lines.push(line);
+			}
+			ends.push(lines.length);
+		}
+		renderedTokens.set(tokens, { settings, lines, ends });
 		return lines;
 	}
 
@@ -621,10 +695,16 @@ export class Markdown implements Component {
 		// Convert tokens to styled terminal output, wrapped, with margins and background: block by block, each from what it
 		// was rendered to the last time when nothing it depends on has changed.
 		const bgFn = this.defaultTextStyle?.bgColor;
-		const contentLines: string[] = [];
-		for (let i = 0; i < tokens.length; i++) {
-			for (const line of this.renderBlock(tokens[i], tokens[i + 1]?.type, width, contentWidth)) {
-				contentLines.push(line);
+		const settings = this.renderSettings(width);
+		let contentLines: string[];
+		if (markdownCaching) {
+			contentLines = this.renderTokens(tokens, settings, contentWidth);
+		} else {
+			contentLines = [];
+			for (let i = 0; i < tokens.length; i++) {
+				for (const line of this.renderBlock(tokens[i], tokens[i + 1]?.type, settings, contentWidth)) {
+					contentLines.push(line);
+				}
 			}
 		}
 

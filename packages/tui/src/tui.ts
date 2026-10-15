@@ -359,9 +359,11 @@ const stableRenders = new WeakSet<Component["render"]>();
 /**
  * Declares that the components of a class keep their lines: their render() returns the same array again only while
  * their lines are unchanged, and never modifies an array it returned. Containers then take an unchanged array as
- * unchanged lines instead of comparing them line by line, which keeps a frame from costing time in proportion to the
- * whole transcript. A subclass that overrides render() is not covered: it declares this itself if it keeps its lines.
- * Components that do not declare it render exactly as before; their lines are compared.
+ * unchanged lines and a new array as changed lines instead of comparing them line by line, which keeps a frame from
+ * costing time in proportion to the whole transcript. (A new array with the same lines is taken as changed: the lines
+ * after it are joined again, and what is drawn is the same.) A subclass that overrides render() is not covered: it
+ * declares this itself if it keeps its lines. Components that do not declare it render exactly as before; their lines
+ * are compared.
  */
 export function markStableRender(componentClass: { prototype: Component }): void {
 	stableRenders.add(componentClass.prototype.render);
@@ -403,8 +405,11 @@ export interface RenderedChildren {
  * Renders `children` at `width` and joins their lines, starting from what they rendered to the frame before:
  * `previous` itself when no child's lines changed, otherwise new lines that keep the unchanged leading children's
  * lines. A child's lines are unchanged when it is the same child and either keeps its lines (isStableRender()) and
- * returned the same array, or returned the lines joined the frame before. The second check covers any component,
- * including one that modifies its array in place.
+ * returned the same array, or does not keep its lines and returned the lines joined the frame before. The second check
+ * covers any component, including one that modifies its array in place. A child that keeps its lines and returned a new
+ * array is taken as changed without comparing its lines: while a reply streams in, that is the message growing, and
+ * comparing it line by line (at each level of containers it is in) would take time in proportion to its length every
+ * frame.
  */
 export function renderChildren(
 	children: readonly Component[],
@@ -438,13 +443,18 @@ export function renderChildren(
 		arrays[i] = before!.arrays[i]!;
 		heights[i] = before!.heights[i]!;
 	}
-	const joined = before !== undefined && offset > 0 ? before.lines.slice(0, offset) : [];
+	const first = index;
 	for (; index < count; index++) {
 		const lines = changedLines ?? renderSharedLines(children[index]!, width);
 		changedLines = undefined;
 		arrays[index] = lines;
 		heights[index] = lines.length;
-		for (let i = 0; i < lines.length; i++) joined.push(lines[i]!);
+	}
+	// (concat() copies the lines in bulk, which a loop that pushes them one by one takes several times as long to do; in
+	// groups of arrays, as a call takes a bounded number of arguments.)
+	let joined = before !== undefined && offset > 0 ? before.lines.slice(0, offset) : [];
+	for (let i = first; i < count; i += 1024) {
+		joined = joined.concat(...arrays.slice(i, Math.min(count, i + 1024)));
 	}
 	return { width, children: children.slice(), arrays, heights, lines: joined };
 }
@@ -456,7 +466,7 @@ function sameLines(
 	index: number,
 	offset: number,
 ): boolean {
-	if (lines === previous.arrays[index] && isStableRender(child)) return true;
+	if (isStableRender(child)) return lines === previous.arrays[index];
 	const height = previous.heights[index]!;
 	if (lines.length !== height) return false;
 	const joined = previous.lines;
