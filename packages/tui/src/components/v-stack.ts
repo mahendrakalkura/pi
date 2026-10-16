@@ -1,3 +1,5 @@
+import type { LayoutViewport } from "../layout-node.ts";
+import type { Component } from "../tui.ts";
 import { allocateStackSizes, Stack, type StackChild, type StackOptions, visibleStackEntries } from "./stack.ts";
 
 export class VStack extends Stack {
@@ -27,6 +29,25 @@ export class VStack extends Stack {
 			for (let padding = childLines.length; padding < sizes[index]!; padding++) lines.push("");
 		}
 		return lines;
+	}
+
+	/**
+	 * How many lines render(width) returns, from the height `heightOf` gives each child at a width instead of from its
+	 * lines. The layout measures a stack with this: it renders the children once a frame and keeps their lines, which
+	 * render() would render a second time. (A child with a fixed basis is not measured: its basis is its height.)
+	 */
+	measureHeight(width: number, heightOf: (component: Component, width: number) => number): number {
+		const viewport: LayoutViewport = { width: Math.max(1, width), height: Number.MAX_SAFE_INTEGER };
+		const entries = visibleStackEntries(this.entries, viewport);
+		const sizes = allocateStackSizes(
+			entries,
+			entries.map((entry) => (typeof entry.basis === "number" ? 0 : heightOf(entry.component, viewport.width))),
+			undefined,
+			this.gap,
+		);
+		let height = Math.max(0, entries.length - 1) * this.gap;
+		for (const size of sizes) height += size;
+		return height;
 	}
 }
 

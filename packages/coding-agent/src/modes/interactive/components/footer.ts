@@ -64,6 +64,7 @@ export class FooterComponent implements Component {
 	private session: AgentSession;
 	private footerData: ReadonlyFooterDataProvider;
 	private sessionStats?: SessionStats;
+	private formattedCwd?: { cwd: string; home: string | undefined; text: string };
 
 	constructor(session: AgentSession, footerData: ReadonlyFooterDataProvider) {
 		this.session = session;
@@ -154,6 +155,18 @@ export class FooterComponent implements Component {
 		return this.sessionStats;
 	}
 
+	/**
+	 * formatCwdForFooter(), kept while the directories are the same: it resolves both paths, on every frame. (Not kept for
+	 * a relative path, which resolves against the process's working directory.)
+	 */
+	private formatCwd(cwd: string, home: string | undefined): string {
+		const cached = this.formattedCwd;
+		if (cached && cached.cwd === cwd && cached.home === home) return cached.text;
+		const text = formatCwdForFooter(cwd, home);
+		this.formattedCwd = isAbsolute(cwd) && (home === undefined || isAbsolute(home)) ? { cwd, home, text } : undefined;
+		return text;
+	}
+
 	render(width: number): string[] {
 		const state = this.session.state;
 		const { usageTotals, latestCacheHitRate, contextUsage } = this.getSessionStats();
@@ -162,7 +175,7 @@ export class FooterComponent implements Component {
 		const contextPercent = contextUsage?.percent !== null ? contextPercentValue.toFixed(1) : "?";
 
 		// Replace home directory with ~
-		let pwd = formatCwdForFooter(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
+		let pwd = this.formatCwd(this.session.sessionManager.getCwd(), process.env.HOME || process.env.USERPROFILE);
 
 		// Add git branch if available
 		const branch = this.footerData.getGitBranch();
