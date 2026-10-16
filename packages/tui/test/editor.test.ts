@@ -978,6 +978,18 @@ describe("Editor component", () => {
 			assert.strictEqual(chunks[1]!.text, "world test");
 		});
 
+		it("keeps a wide character wider than the width as a chunk of its own", () => {
+			// (It used to re-wrap the character by itself, without end.)
+			assert.deepStrictEqual(
+				wordWrapLine("a中b", 1).map((chunk) => chunk.text),
+				["a", "中", "b"],
+			);
+			assert.deepStrictEqual(
+				wordWrapLine("中", 1, [...new Intl.Segmenter().segment("中")]).map((chunk) => chunk.text),
+				["中"],
+			);
+		});
+
 		it("keeps whitespace at terminal width boundary on same line", () => {
 			// "hello world " is exactly 12 chars (including trailing space)
 			// The space at position 12 should stay on the first line
