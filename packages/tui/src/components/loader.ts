@@ -24,6 +24,8 @@ export class Loader extends Text {
 	private spinnerColorFn: (str: string) => string;
 	private messageColorFn: (str: string) => string;
 	private message: string = "Loading...";
+	/** The text last set: the indicator and the message, as drawn. */
+	private displayText = "";
 
 	constructor(
 		ui: TUI,
@@ -54,6 +56,16 @@ export class Loader extends Text {
 			clearInterval(this.intervalId);
 			this.intervalId = null;
 		}
+	}
+
+	override setText(text: string): void {
+		this.displayText = text;
+		super.setText(text);
+	}
+
+	/** The text the loader draws (the indicator and the message): what its lines are made of, apart from the width. */
+	protected getDisplayText(): string {
+		return this.displayText;
 	}
 
 	setMessage(message: string): void {

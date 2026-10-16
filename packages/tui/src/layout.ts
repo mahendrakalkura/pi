@@ -1,5 +1,6 @@
 import type { ScrollView } from "./components/scroll-view.ts";
 import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
+import { VStack } from "./components/v-stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
 import { cropKittyImageLine, getKittyImageMetadata, getMaxKittyImageRows, isImageLine } from "./terminal-image.ts";
 import { type Component, CURSOR_MARKER, compositeTuiLine, renderSharedLines } from "./tui.ts";
@@ -81,7 +82,17 @@ function renderCached(context: LayoutContext, component: Component, width: numbe
 	return lines;
 }
 
+/**
+ * The height of `component`'s lines at `width`. A VStack that renders as VStack does is measured from its children's
+ * heights: its own render() would render the children again, after which laying them out renders them a second time
+ * (in Pi, the whole input dock: editor, status and footer, twice a frame).
+ */
 function measureHeight(context: LayoutContext, component: Component, width: number): number {
+	if (component instanceof VStack && component.render === VStack.prototype.render) {
+		return component.measureHeight(Math.max(1, Math.floor(width)), (child, childWidth) =>
+			measureHeight(context, child, childWidth),
+		);
+	}
 	return renderCached(context, component, width).length;
 }
 

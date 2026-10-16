@@ -8,7 +8,12 @@ export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSu
 
 export class StatusIndicator extends Loader {
 	readonly kind: StatusIndicatorKind;
-	private lastBorderLine: { line: string; width: number; text: string } | undefined;
+	/**
+	 * renderInBorder() at `borderWidth`, by the loader's text. The editor draws its border on every frame, and the text
+	 * cycles through the spinner's frames: each frame's line is wrapped and truncated once, not on every tick.
+	 */
+	private borderTexts = new Map<string, string>();
+	private borderWidth = -1;
 
 	constructor(
 		kind: StatusIndicatorKind,
@@ -23,13 +28,31 @@ export class StatusIndicator extends Loader {
 	}
 
 	renderInBorder(width: number): string {
-		const line = super.render(width + 2)[1] ?? "";
-		// The editor draws its border on every frame; the line changes with the spinner, a few times a second.
-		const last = this.lastBorderLine;
-		if (last && last.line === line && last.width === width) return last.text;
-		const text = truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
-		this.lastBorderLine = { line, width, text };
+		if (width !== this.borderWidth) {
+			this.borderTexts.clear();
+			this.borderWidth = width;
+		}
+		const key = this.getDisplayText();
+		let text = this.borderTexts.get(key);
+		if (text === undefined) {
+			const line = super.render(width + 2)[1] ?? "";
+			text = truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
+			// (A message that changes, such as a retry's countdown, adds a text a second.)
+			if (this.borderTexts.size >= 64) this.borderTexts.clear();
+			this.borderTexts.set(key, text);
+		}
 		return text;
+	}
+
+	override invalidate(): void {
+		this.borderTexts.clear();
+		super.invalidate();
+	}
+
+	// (setPaddingX() invalidates.)
+	override setCustomBgFn(customBgFn?: (text: string) => string): void {
+		this.borderTexts.clear();
+		super.setCustomBgFn(customBgFn);
 	}
 
 	renderSpinnerInBorder(width: number): string {
