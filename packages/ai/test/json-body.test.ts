@@ -8,6 +8,8 @@ import { normalizeContext } from "../src/utils/transcript.ts";
 
 const long = (seed: string, length = 5000) => seed.repeat(Math.ceil(length / seed.length)).slice(0, length);
 
+const { rawJSON } = JSON as unknown as { rawJSON: (text: string) => unknown };
+
 class Point {
 	x = 1;
 	y = 2;
@@ -71,6 +73,51 @@ describe("cacheJsonSerialization", () => {
 		expected.push({ role: "user", content: long("added later ") });
 		(expected[1] as { content: string }).content = long("replaced ");
 		expect(JSON.stringify(messages)).toBe(JSON.stringify(expected));
+	});
+
+	it("leaves raw JSON values already in the messages as they are", () => {
+		const items = () => [
+			rawJSON('"raw item"'),
+			{ role: "user", content: rawJSON(JSON.stringify(long("raw content "))) },
+			{ role: "tool", content: [{ type: "text", text: long("text ") }, rawJSON("12345678901234567890")] },
+		];
+		const messages = items();
+		cacheJsonSerialization(messages);
+		const expected = JSON.stringify(items());
+		for (let request = 0; request < 2; request++) {
+			expect(JSON.stringify(messages)).toBe(expected);
+		}
+	});
+
+	it("does nothing to arrays it cannot extend", () => {
+		for (const lock of [Object.freeze, Object.seal, Object.preventExtensions]) {
+			const messages = lock(sample());
+			expect(() => cacheJsonSerialization(messages)).not.toThrow();
+			expect(Object.hasOwn(messages, "toJSON")).toBe(false);
+			expect(JSON.stringify(messages)).toBe(JSON.stringify(sample()));
+		}
+	});
+
+	it("serializes the array as it is when building the copy fails", () => {
+		let reads = 0;
+		const messages: unknown[] = [
+			{ role: "user", content: long("before ") },
+			{
+				role: "user",
+				get content() {
+					reads++;
+					if (reads === 1) throw new Error("first read fails");
+					return long("after ");
+				},
+			},
+		];
+		cacheJsonSerialization(messages);
+		expect(JSON.stringify(messages)).toBe(
+			JSON.stringify([
+				{ role: "user", content: long("before ") },
+				{ role: "user", content: long("after ") },
+			]),
+		);
 	});
 
 	it("leaves the array's enumerable shape alone and does not replace an existing toJSON", () => {
@@ -144,39 +191,38 @@ afterEach(() => {
 });
 
 describe("request bodies with the serialization cache", () => {
-	const adapters: [string, (fetch: FetchFunction, onPayload: (payload: unknown) => undefined) => Promise<unknown>][] =
+	const adapters: [string, (fetch: FetchFunction, onPayload: (payload: unknown) => unknown) => Promise<unknown>][] = [
 		[
-			[
-				"openai-completions",
-				(fetch, onPayload) =>
-					streamOpenAICompletions(createModel("openai-completions"), history, {
-						apiKey: "k",
-						fetch,
-						onPayload,
-						maxRetries: 0,
-					}).result(),
-			],
-			[
-				"openai-responses",
-				(fetch, onPayload) =>
-					streamOpenAIResponses(createModel("openai-responses"), history, {
-						apiKey: "k",
-						fetch,
-						onPayload,
-						maxRetries: 0,
-					}).result(),
-			],
-			[
-				"anthropic-messages",
-				(fetch, onPayload) =>
-					streamAnthropic(createModel("anthropic-messages"), history, {
-						apiKey: "k",
-						fetch,
-						onPayload,
-						maxRetries: 0,
-					}).result(),
-			],
-		];
+			"openai-completions",
+			(fetch, onPayload) =>
+				streamOpenAICompletions(createModel("openai-completions"), history, {
+					apiKey: "k",
+					fetch,
+					onPayload,
+					maxRetries: 0,
+				}).result(),
+		],
+		[
+			"openai-responses",
+			(fetch, onPayload) =>
+				streamOpenAIResponses(createModel("openai-responses"), history, {
+					apiKey: "k",
+					fetch,
+					onPayload,
+					maxRetries: 0,
+				}).result(),
+		],
+		[
+			"anthropic-messages",
+			(fetch, onPayload) =>
+				streamAnthropic(createModel("anthropic-messages"), history, {
+					apiKey: "k",
+					fetch,
+					onPayload,
+					maxRetries: 0,
+				}).result(),
+		],
+	];
 
 	for (const [name, run] of adapters) {
 		it(`sends what JSON.stringify makes of the payload (${name})`, async () => {
@@ -202,6 +248,28 @@ describe("request bodies with the serialization cache", () => {
 				expect(sent).toBe(expected);
 				expect(Object.hasOwn(items as object, "toJSON")).toBe(true);
 			}
+		});
+
+		it(`sends a payload whose messages onPayload froze (${name})`, async () => {
+			let expected: string | undefined;
+			let sent: unknown;
+			const fetch = vi.fn<FetchFunction>(async (_url, init) => {
+				sent = init?.body;
+				return new Response(JSON.stringify({ error: { message: "rejected" } }), {
+					status: 400,
+					headers: { "content-type": "application/json" },
+				});
+			});
+			await run(fetch, (payload) => {
+				const replaced = { ...(payload as Record<string, unknown>) };
+				const key = "messages" in replaced ? "messages" : "input";
+				replaced[key] = Object.freeze([...(replaced[key] as unknown[])]);
+				const { betas: _betas, ...body } = replaced;
+				expected = JSON.stringify(body);
+				return replaced;
+			});
+			expect(fetch).toHaveBeenCalledOnce();
+			expect(sent).toBe(expected);
 		});
 	}
 });
