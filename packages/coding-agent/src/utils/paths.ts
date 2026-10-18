@@ -1,4 +1,4 @@
-import { realpathSync, statSync } from "node:fs";
+import { readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve as nodeResolvePath, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,6 +43,29 @@ export function getFileRevision(path: string): string | undefined {
 	}
 	if (revisionsThisTurn.has(path)) revisionsThisTurn.set(path, revision);
 	return revision;
+}
+
+/**
+ * A JSON file read without its lock, when the read can stand for one under the lock. A writer holds the lock while it
+ * truncates the file and writes it again, so a read in between gets nothing or the start of a document, which does not
+ * parse. A document that parses, from a file whose revision is the same before and after the read, is what the locked read
+ * would have returned. `parse` gives the value or throws; anything else (no file, a failed read or parse, an empty file, a
+ * change during the read) gives undefined, and the caller reads under the lock.
+ */
+export function readJsonFileUnlocked<T>(
+	path: string,
+	parse: (content: string) => T,
+): { content: string; value: T; revision: string } | undefined {
+	const revision = getFileRevision(path);
+	if (revision === undefined) return undefined;
+	try {
+		const content = readFileSync(path, "utf-8");
+		if (content.trim() === "") return undefined;
+		const value = parse(content);
+		return getFileRevision(path) === revision ? { content, value, revision } : undefined;
+	} catch {
+		return undefined;
+	}
 }
 
 // Revisions looked up in this turn of the event loop (until its microtasks run), by path.
