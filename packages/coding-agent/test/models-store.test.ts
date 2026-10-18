@@ -53,6 +53,23 @@ describe("FileModelsStore", () => {
 		expect((await reloaded.read("two"))?.models.map((entry) => entry.id)).toEqual(["m2"]);
 	});
 
+	it("leaves the file untouched when a write or delete changes nothing", async () => {
+		const path = join(sharedTempDir, "unchanged-models-store.json");
+		const store = new FileModelsStore(path);
+		await store.write("one", { models: [model("one", "m1")], checkedAt: 100 });
+		const written = statSync(path, { bigint: true });
+		const content = readFileSync(path, "utf-8");
+
+		await store.write("one", { models: [model("one", "m1")], checkedAt: 100 });
+		await store.delete("missing");
+		expect(readFileSync(path, "utf-8")).toBe(content);
+		expect(statSync(path, { bigint: true }).mtimeNs).toBe(written.mtimeNs);
+
+		await store.write("one", { models: [model("one", "m1")], checkedAt: 200 });
+		expect((await new FileModelsStore(path).read("one"))?.checkedAt).toBe(200);
+		expect(readFileSync(path, "utf-8")).not.toBe(content);
+	});
+
 	it.skipIf(process.platform === "win32")("preserves the mode of an existing models file", async () => {
 		const managedModelsPath = join(sharedTempDir, "managed-mode.json");
 		writeFileSync(managedModelsPath, "{}");
