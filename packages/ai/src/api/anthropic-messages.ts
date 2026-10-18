@@ -42,6 +42,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
+import { cacheJsonSerialization } from "../utils/json-body.ts";
 import { parseJsonWithRepair } from "../utils/json-parse.ts";
 import {
 	applyOpenRouterReportedCost,
@@ -765,6 +766,7 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				if (nextParams !== undefined) {
 					params = { ...(nextParams as MessageCreateParamsStreaming), stream: true };
 				}
+				cacheJsonSerialization(params.messages);
 				const prepared =
 					threadSessionId !== undefined && options?.disableContinuation !== true
 						? prepareThreadRequest(model, threadSessionId, params)
