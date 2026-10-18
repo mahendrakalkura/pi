@@ -8,7 +8,8 @@
  * cacheJsonSerialization(messages) gives the messages array a toJSON that returns a copy of it with each long string
  * replaced by a JSON.rawJSON() value holding the string's serialized form, kept from the previous request.
  * JSON.stringify copies those as they are. The output is byte-identical to JSON.stringify of the original array.
- * Without JSON.rawJSON (older engines) nothing changes.
+ * Without JSON.rawJSON and JSON.isRawJSON (older engines) nothing changes, and nothing it does can make a request fail:
+ * on any error it serializes the array as JSON.stringify would.
  *
  * The array, not the request body, carries the toJSON: SDKs copy the body (`{ ...params }`, `const { betas, ...body } =
  * params`) before they serialize it, and those copies keep the array but not a property that is not enumerable.
@@ -18,7 +19,10 @@
  * about one request's long strings, and two conversations that take turns still reuse theirs.
  */
 
-const rawJSON = (JSON as unknown as { rawJSON?: (text: string) => unknown }).rawJSON;
+const { rawJSON, isRawJSON } = JSON as unknown as {
+	rawJSON?: (text: string) => unknown;
+	isRawJSON?: (value: unknown) => boolean;
+};
 
 /** Shorter strings are cheap to escape again; caching them would cost more in entries than it saves. */
 const MIN_CACHED_LENGTH = 1024;
@@ -55,7 +59,8 @@ function substitute(value: unknown, toRaw: (text: string) => unknown, ancestors:
 	if (typeof value === "string") {
 		return value.length >= MIN_CACHED_LENGTH ? cachedString(value, toRaw) : value;
 	}
-	if (value === null || typeof value !== "object" || ancestors.has(value)) {
+	// A raw JSON value already in the messages is a frozen null-prototype object: copied, it would become an ordinary one.
+	if (value === null || typeof value !== "object" || ancestors.has(value) || isRawJSON?.(value)) {
 		return value;
 	}
 	if (Array.isArray(value)) {
@@ -96,25 +101,37 @@ function substituteItems(
 
 /**
  * Makes JSON.stringify of `items` (a request's messages) reuse the serialized form of long strings serialized before,
- * by defining a non-enumerable toJSON on the array. Does nothing to anything but a plain array without a toJSON.
+ * by defining a non-enumerable toJSON on the array. Does nothing to anything but an extensible plain array without a
+ * toJSON (an onPayload hook may return a frozen one). Never throws.
  */
 export function cacheJsonSerialization(items: unknown): void {
 	const toRaw = rawJSON;
 	if (
 		!toRaw ||
+		!isRawJSON ||
 		!Array.isArray(items) ||
 		Object.getPrototypeOf(items) !== Array.prototype ||
+		!Object.isExtensible(items) ||
 		Object.hasOwn(items, "toJSON")
 	) {
 		return;
 	}
-	Object.defineProperty(items, "toJSON", {
-		value(this: unknown[]): unknown {
-			startGeneration();
-			return substituteItems(this, toRaw, new Set());
-		},
-		configurable: true,
-		writable: true,
-		enumerable: false,
-	});
+	try {
+		Object.defineProperty(items, "toJSON", {
+			value(this: unknown[]): unknown {
+				try {
+					startGeneration();
+					return substituteItems(this, toRaw, new Set());
+				} catch {
+					// JSON.stringify serializes what toJSON returns without calling it again: the array as it is.
+					return this;
+				}
+			},
+			configurable: true,
+			writable: true,
+			enumerable: false,
+		});
+	} catch {
+		// Not cached; serialized as before.
+	}
 }
