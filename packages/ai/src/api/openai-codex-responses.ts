@@ -29,6 +29,7 @@ import { formatProviderError, normalizeProviderError } from "../utils/error-body
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { getIdentityHeaders } from "../utils/identity.ts";
+import { cacheJsonSerialization } from "../utils/json-body.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getSystemMessageText } from "../utils/text.ts";
 import {
@@ -284,6 +285,7 @@ export const stream: StreamFunction<"openai-codex-responses", OpenAICodexRespons
 			if (nextBody !== undefined) {
 				body = nextBody as RequestBody;
 			}
+			cacheJsonSerialization(body.input);
 			const websocketRequestId = codexSessionId || uuidv7();
 			// Codex expects an originator on every request; it is not attribution.
 			const identityHeaders = { originator: "pi", ...getIdentityHeaders(model, options?.identity) };
