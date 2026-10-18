@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
-import { getFileRevision, normalizePath, readJsonFileUnlocked, resolvePath } from "../utils/paths.ts";
+import { getFileRevision, normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
@@ -238,11 +238,6 @@ export class FileSettingsStorage implements SettingsStorage {
 		const cached = settingsFileReads.get(path);
 		if (cached?.revision === revision) {
 			return cached.content;
-		}
-		const unlocked = readJsonFileUnlocked(path, (content) => JSON.parse(stripBom(content)) as unknown);
-		if (unlocked) {
-			settingsFileReads.set(path, { revision: unlocked.revision, content: unlocked.content });
-			return unlocked.content;
 		}
 		let content: string | undefined;
 		this.withLock(scope, (current) => {
