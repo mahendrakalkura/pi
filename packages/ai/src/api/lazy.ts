@@ -1,5 +1,5 @@
 import type { Api, AssistantMessage, AssistantMessageEvent, Model, ProviderStreams } from "../types.ts";
-import { AssistantMessageEventStream } from "../utils/event-stream.ts";
+import { AssistantMessageEventStream, EventStream } from "../utils/event-stream.ts";
 
 function createSetupErrorMessage(model: Model<Api>, error: unknown, timestamp: number): AssistantMessage {
 	return {
@@ -40,6 +40,17 @@ async function forwardStream(
 	observer: LazyStreamObserver | undefined,
 	observeResult: (result: AssistantMessage | undefined) => void,
 ): Promise<void> {
+	if (source instanceof EventStream) {
+		// Pushed through as they come. The result is there once the source is done, as when its iteration ends.
+		source.forwardTo((event) => {
+			target.push(event);
+			observer?.onEvent?.(event);
+		});
+		const forwardedResult = await source.result();
+		target.end(forwardedResult);
+		observeResult(forwardedResult);
+		return;
+	}
 	let result: AssistantMessage | undefined;
 	for await (const event of source) {
 		target.push(event);
