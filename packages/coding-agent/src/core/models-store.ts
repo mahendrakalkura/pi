@@ -20,6 +20,12 @@ type ModelsFileReadState = {
 	reload?: ModelsFileReload;
 };
 
+/** The file's new content, or undefined when it would be what the file holds: a refresh that changes nothing writes nothing. */
+function changedContent(content: string | undefined, data: StoredModels): string | undefined {
+	const next = JSON.stringify(data, null, 2);
+	return next === content ? undefined : next;
+}
+
 // Optimize the common path without retaining an unbounded set of custom paths.
 let sharedModelsFileReadState: { path: string; readState: ModelsFileReadState } | undefined;
 
@@ -129,7 +135,7 @@ export class FileModelsStore implements ModelsStore {
 			const current = this.parse(content);
 			current[providerId] = structuredClone(entry);
 			latest = current;
-			return { result: undefined, next: JSON.stringify(current, null, 2) };
+			return { result: undefined, next: changedContent(content, current) };
 		}, options);
 		if (latest) this.updateReadState(this.readState, latest);
 	}
@@ -140,7 +146,7 @@ export class FileModelsStore implements ModelsStore {
 			const current = this.parse(content);
 			delete current[providerId];
 			latest = current;
-			return { result: undefined, next: JSON.stringify(current, null, 2) };
+			return { result: undefined, next: changedContent(content, current) };
 		}, options);
 		if (latest) this.updateReadState(this.readState, latest);
 	}
