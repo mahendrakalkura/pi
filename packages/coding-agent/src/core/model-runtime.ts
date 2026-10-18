@@ -191,6 +191,8 @@ export class ModelRuntime implements Models {
 		storedProviders: new Set(),
 		auth: new Map(),
 	};
+	/** Set while registerWithoutRefresh() runs its registrations. */
+	private registeringWithoutRefresh = false;
 	private availabilityRefreshSeq = 0;
 	private availabilityErrorSeq = 0;
 	private readonly providerAvailabilitySeq = new Map<string, number>();
@@ -899,6 +901,25 @@ export class ModelRuntime implements Models {
 		return { aborted: result.aborted || (options.signal?.aborted ?? false), errors };
 	}
 
+	/**
+	 * Runs `register`, whose provider and model registrations start no refresh of their own, for a caller that refreshes
+	 * once they are all made (createAgentSessionServices()): each would otherwise start a full refresh, which the caller's
+	 * then repeats.
+	 */
+	registerWithoutRefresh(register: () => void): void {
+		this.registeringWithoutRefresh = true;
+		try {
+			register();
+		} finally {
+			this.registeringWithoutRefresh = false;
+		}
+	}
+
+	/** After a registration: a refresh in the background, unless registerWithoutRefresh() leaves it to its caller. */
+	private refreshAfterChange(): void {
+		if (!this.registeringWithoutRefresh) void this.refresh({ allowNetwork: false });
+	}
+
 	registerNativeProvider(provider: Provider): void {
 		if (!provider.id.trim()) throw new Error("Provider id must not be empty.");
 		this.extensionProviders.delete(provider.id);
@@ -910,7 +931,7 @@ export class ModelRuntime implements Models {
 			configuredRequestAuthStatus(this.config.getProvider(provider.id), undefined),
 			provider.auth.oauth && !provider.auth.apiKey ? "oauth" : "api_key",
 		);
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	/**
@@ -956,7 +977,7 @@ export class ModelRuntime implements Models {
 			configuredRequestAuthStatus(this.config.getProvider(providerId), effective),
 			effective.oauth && !effective.apiKey ? "oauth" : "api_key",
 		);
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	unregisterProvider(providerId: string): void {
@@ -964,7 +985,7 @@ export class ModelRuntime implements Models {
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	/**
@@ -990,7 +1011,7 @@ export class ModelRuntime implements Models {
 			this.snapshot = { ...this.snapshot, auth, configuredProviders };
 		}
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	unregisterVirtualModel(providerId: string, id: string): void {
@@ -999,7 +1020,7 @@ export class ModelRuntime implements Models {
 		if (models.size === 0) this.virtualModels.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	/**
