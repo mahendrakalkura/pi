@@ -26,6 +26,7 @@ class FifoQueue<T> {
 export class EventStream<T, R = T> implements AsyncIterable<T> {
 	private queue = new FifoQueue<T>();
 	private waiting = new FifoQueue<(value: IteratorResult<T>) => void>();
+	private sink: ((event: T) => void) | undefined;
 	protected done = false;
 	private finalResultPromise: Promise<R>;
 	private resolveFinalResult!: (result: R) => void;
@@ -46,6 +47,11 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		if (this.isComplete(event)) {
 			this.done = true;
 			this.resolveFinalResult(this.extractResult(event));
+		}
+
+		if (this.sink) {
+			this.sink(event);
+			return;
 		}
 
 		// Deliver to waiting consumer or queue it
@@ -85,6 +91,16 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 
 	result(): Promise<R> {
 		return this.finalResultPromise;
+	}
+
+	/**
+	 * Hands every event to `sink` instead of to an iterator: the queued ones at once, in order, then each one as it is
+	 * pushed. For a stream that has no consumer but the one forwarding it (lazyStream()): an iterator's `for await` takes
+	 * several promise reactions per event, which a chain of forwarding streams paid for every event of a response.
+	 */
+	forwardTo(sink: (event: T) => void): void {
+		while (this.queue.length > 0) sink(this.queue.dequeue()!);
+		this.sink = sink;
 	}
 }
 
