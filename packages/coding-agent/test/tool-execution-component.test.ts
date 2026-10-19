@@ -221,6 +221,37 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).not.toContain("[Showing lines 2001-4000 of 4000. Full output:");
 	});
 
+	test("bash results draw the same without structuredContent, which the TUI does not keep", async () => {
+		const operations: BashOperations = {
+			exec: async (_command, _cwd, { onData }) => {
+				for (let i = 1; i <= 4000; i++) onData(Buffer.from(`line-${i} ${"x".repeat(200)}\n`));
+				return { exitCode: 3 };
+			},
+		};
+		const tool = createBashToolDefinition(process.cwd(), { operations, exposeSessionEnvironment: false });
+		const result = await tool.execute("tool-bash-sc", { command: "big" }, undefined, undefined, {} as never);
+		expect(JSON.stringify(result.structuredContent).length).toBeGreaterThan(500_000);
+		const render = (shown: Parameters<ToolExecutionComponent["updateResult"]>[0]) => {
+			const component = new ToolExecutionComponent(
+				"bash",
+				"tool-bash-sc",
+				{ command: "big" },
+				{},
+				tool,
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(shown, false);
+			const collapsed = component.render(120).join("\n");
+			component.setExpanded(true);
+			return [collapsed, component.render(120).join("\n")];
+		};
+		const full = render({ ...result, isError: true, durationMs: 1234 });
+		const kept = render({ content: result.content, details: result.details, isError: true, durationMs: 1234 });
+		expect(kept).toEqual(full);
+		expect(stripAnsi(full[1]!)).toContain("line-4000");
+	});
+
 	// Issue #9628: keep short durations precise and make long shell durations readable.
 	test.each([
 		{ ms: 0, formatted: "0.0s" },
