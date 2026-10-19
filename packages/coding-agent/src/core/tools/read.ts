@@ -3,7 +3,7 @@ import { constants } from "fs";
 import { access as fsAccess, open as fsOpen, readFile as fsReadFile } from "fs/promises";
 import { type Static, Type } from "typebox";
 import { TextDecoder } from "util";
-import { processImage } from "../../utils/image-process.ts";
+import { markProcessedImageBlock, processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
 import { detachSharedString } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
@@ -284,20 +284,24 @@ export function createReadToolDefinition(
 							if (mimeType) {
 								// Read image as binary.
 								const buffer = await ops.readFile(absolutePath);
-								const processed = await processImage(buffer, mimeType, {
+								const processOptions = {
 									autoResizeImages,
 									resizeOptions: ctx?.model?.inputLimits?.images?.resize ?? fallbackResizeOptions,
-								});
+								};
+								const processed = await processImage(buffer, mimeType, processOptions);
 								if (!processed.ok) {
 									const textNote = `Read image file [${mimeType}]\n${processed.message}`;
 									content = [{ type: "text", text: textNote }];
 								} else {
 									let textNote = `Read image file [${processed.mimeType}]`;
 									if (processed.hints.length > 0) textNote += `\n${processed.hints.join("\n")}`;
-									content = [
-										{ type: "text", text: textNote },
-										{ type: "image", data: processed.data, mimeType: processed.mimeType },
-									];
+									const image: ImageContent = {
+										type: "image",
+										data: processed.data,
+										mimeType: processed.mimeType,
+									};
+									markProcessedImageBlock(image, processOptions);
+									content = [{ type: "text", text: textNote }, image];
 									if (ctx?.model && !ctx.model.input.includes("image")) {
 										details = { imageUnsupportedByModel: ctx.model.id };
 									}
