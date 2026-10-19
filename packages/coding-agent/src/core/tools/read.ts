@@ -5,7 +5,7 @@ import { type Static, Type } from "typebox";
 import { TextDecoder } from "util";
 import { processImage } from "../../utils/image-process.ts";
 import { detectSupportedImageMimeTypeFromFile } from "../../utils/mime.ts";
-import { detachString } from "../../utils/text.ts";
+import { detachSharedString } from "../../utils/text.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveReadPathAsync } from "./path-utils.ts";
 import { readRenderers } from "./renderers/read.ts";
@@ -349,8 +349,8 @@ export function createReadToolDefinition(
 									outputText = truncation.content;
 								}
 								// The output can be a substring of the whole file's text, which it would keep in memory for as
-								// long as the session holds the result.
-								content = [{ type: "text", text: detachString(outputText) }];
+								// long as the session holds the result. A file read again unchanged gives the same string.
+								content = [{ type: "text", text: detachSharedString(outputText) }];
 							}
 
 							if (aborted) return;
