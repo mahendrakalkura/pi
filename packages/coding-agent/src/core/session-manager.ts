@@ -15,7 +15,6 @@ import { randomUUID } from "crypto";
 import {
 	appendFileSync,
 	closeSync,
-	createReadStream,
 	existsSync,
 	mkdirSync,
 	openSync,
@@ -25,9 +24,8 @@ import {
 	statSync,
 	writeFileSync,
 } from "fs";
-import { readdir, stat } from "fs/promises";
+import { open, readdir, readFile, rename, rm, stat, writeFile } from "fs/promises";
 import { basename, join, resolve } from "path";
-import { createInterface } from "readline";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
@@ -798,88 +796,359 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 	return Number.isNaN(t) ? undefined : t;
 }
 
-async function buildSessionInfo(
+/** Length of the start of a line that is enough to tell what a listing needs from it. */
+const LINE_HEAD_BYTES = 256;
+/** A message line as `JSON.stringify` writes it, up to its message's role (group 1). */
+const MESSAGE_LINE_HEAD =
+	/^\{"type":"message","id":"[^"\\]*","parentId":(?:null|"[^"\\]*"),"timestamp":"[^"\\]*","message":\{"role":"([^"\\]*)"/;
+
+/**
+ * What a line after the header gives a session listing, told from its first bytes where they are enough:
+ * - "skip": an entry of a type the listing does not use. Such a line adds nothing whether it parses or not (a line has
+ *   one "type": JSON.stringify writes no key twice).
+ * - "count": a message the listing only counts: not a user or assistant message (tool results, system prompts). These
+ *   are most of a session's bytes. The line must end like a whole entry ("}}", the end of its message and its own).
+ * - "parse": anything else, including every line whose start is not written the way `JSON.stringify` writes entries.
+ */
+function classifySessionLine(buffer: Buffer, start: number, end: number): "skip" | "count" | "parse" {
+	const head = buffer.toString("latin1", start, Math.min(end, start + LINE_HEAD_BYTES));
+	if (!head.startsWith('{"type":"')) return "parse";
+	const typeEnd = head.indexOf('"', 9);
+	if (typeEnd === -1) return "parse";
+	const type = head.slice(9, typeEnd);
+	if (type === "session_info" || type.includes("\\")) return "parse";
+	if (type !== "message") return "skip";
+	const role = MESSAGE_LINE_HEAD.exec(head)?.[1];
+	if (role === undefined || role === "user" || role === "assistant") return "parse";
+	return end - start >= 2 && buffer[end - 1] === 0x7d && buffer[end - 2] === 0x7d ? "count" : "parse";
+}
+
+/**
+ * Calls `onLine` with each line of a file as a byte range of `buffer`, split like readline splits them (at "\n", "\r\n"
+ * and a lone "\r"), until it returns false. Lines are not decoded: a listing decodes only the lines it parses. A "\n" or
+ * "\r" byte is never part of a multi-byte UTF-8 sequence, so decoding each line on its own gives the text that decoding
+ * the whole file and splitting it gives. Returns the number of bytes read.
+ */
+async function forEachLineOfFile(
 	filePath: string,
-	signal?: AbortSignal,
-	fileStats?: Stats,
-): Promise<SessionInfo | null> {
+	signal: AbortSignal | undefined,
+	onLine: (buffer: Buffer, start: number, end: number) => boolean,
+): Promise<number> {
+	const file = await open(filePath, "r");
 	try {
-		const stats = fileStats ?? (await stat(filePath));
-		let header: SessionHeader | null = null;
-		let messageCount = 0;
-		let firstMessage = "";
-		const allMessages: string[] = [];
-		let name: string | undefined;
-		let lastActivityTime: number | undefined;
-
-		const rl = createInterface({
-			input: createReadStream(filePath, { encoding: "utf8", signal }),
-			crlfDelay: Infinity,
-		});
-
-		for await (const line of rl) {
-			const entry = parseSessionEntryLine(line);
-			if (!entry) continue;
-
-			if (!header) {
-				if (entry.type !== "session") return null;
-				header = entry;
-				continue;
+		const chunk = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
+		// The start of a line that continues in the next chunk, copied out of the reused chunk buffer.
+		let carry: Buffer[] = [];
+		// The previous chunk ended with "\r": a "\n" that starts this chunk belongs to the same line break.
+		let skipLineFeed = false;
+		let bytesReadTotal = 0;
+		const emit = (buffer: Buffer, start: number, end: number): boolean => {
+			if (carry.length === 0) return onLine(buffer, start, end);
+			const line = Buffer.concat([...carry, buffer.subarray(start, end)]);
+			carry = [];
+			return onLine(line, 0, line.length);
+		};
+		while (true) {
+			signal?.throwIfAborted();
+			const { bytesRead } = await file.read(chunk, 0, chunk.length, null);
+			if (bytesRead === 0) break;
+			bytesReadTotal += bytesRead;
+			const buffer = chunk.subarray(0, bytesRead);
+			let pos = 0;
+			if (skipLineFeed) {
+				skipLineFeed = false;
+				if (buffer[0] === 0x0a) pos = 1;
 			}
-
-			// Extract session name (use latest, including explicit clears)
-			if (entry.type === "session_info") {
-				name = entry.name?.trim() || undefined;
+			let nextLineFeed = buffer.indexOf(0x0a, pos);
+			let nextCarriageReturn = buffer.indexOf(0x0d, pos);
+			while (true) {
+				if (nextLineFeed !== -1 && nextLineFeed < pos) nextLineFeed = buffer.indexOf(0x0a, pos);
+				if (nextCarriageReturn !== -1 && nextCarriageReturn < pos) {
+					nextCarriageReturn = buffer.indexOf(0x0d, pos);
+				}
+				const lineEnd =
+					nextCarriageReturn === -1
+						? nextLineFeed
+						: nextLineFeed === -1
+							? nextCarriageReturn
+							: Math.min(nextLineFeed, nextCarriageReturn);
+				if (lineEnd === -1) break;
+				if (!emit(buffer, pos, lineEnd)) return bytesReadTotal;
+				pos = lineEnd + 1;
+				if (lineEnd === nextCarriageReturn) {
+					if (pos === bytesRead) skipLineFeed = true;
+					else if (buffer[pos] === 0x0a) pos++;
+				}
 			}
+			if (pos < bytesRead) carry.push(Buffer.from(buffer.subarray(pos)));
+		}
+		if (carry.length > 0) {
+			const line = Buffer.concat(carry);
+			carry = [];
+			onLine(line, 0, line.length);
+		}
+		return bytesReadTotal;
+	} finally {
+		await file.close();
+	}
+}
 
-			if (entry.type !== "message") continue;
-			messageCount++;
+/**
+ * Reads a session file for a listing. `cacheable` is false when the file changed while it was read: its result may then
+ * not match its stats.
+ */
+async function scanSessionInfo(
+	filePath: string,
+	stats: Stats,
+	signal?: AbortSignal,
+): Promise<{ info: SessionInfo | null; cacheable: boolean }> {
+	let header: SessionHeader | null = null;
+	let notASession = false;
+	let messageCount = 0;
+	let firstMessage = "";
+	const allMessages: string[] = [];
+	let name: string | undefined;
+	let lastActivityTime: number | undefined;
 
-			const activityTime = getMessageActivityTime(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
-
-			const message = entry.message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessages.push(textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
+	const bytesRead = await forEachLineOfFile(filePath, signal, (buffer, start, end) => {
+		if (header) {
+			const kind = classifySessionLine(buffer, start, end);
+			if (kind === "skip") return true;
+			if (kind === "count") {
+				messageCount++;
+				return true;
 			}
 		}
+		const entry = parseSessionEntryLine(buffer.toString("utf8", start, end));
+		if (!entry) return true;
 
-		if (!header) return null;
+		if (!header) {
+			if (entry.type !== "session") {
+				notASession = true;
+				return false;
+			}
+			header = entry;
+			return true;
+		}
 
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const headerTime = typeof header.timestamp === "string" ? new Date(header.timestamp).getTime() : NaN;
-		const modified =
-			typeof lastActivityTime === "number" && lastActivityTime > 0
-				? new Date(lastActivityTime)
-				: !Number.isNaN(headerTime)
-					? new Date(headerTime)
-					: stats.mtime;
+		// Extract session name (use latest, including explicit clears)
+		if (entry.type === "session_info") {
+			name = entry.name?.trim() || undefined;
+		}
 
-		return {
+		if (entry.type !== "message") return true;
+		messageCount++;
+
+		const activityTime = getMessageActivityTime(entry);
+		if (typeof activityTime === "number") {
+			lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
+		}
+
+		const message = entry.message;
+		if (!isMessageWithContent(message)) return true;
+		if (message.role !== "user" && message.role !== "assistant") return true;
+
+		const textContent = extractTextContent(message);
+		if (!textContent) return true;
+
+		allMessages.push(textContent);
+		if (!firstMessage && message.role === "user") {
+			firstMessage = textContent;
+		}
+		return true;
+	});
+	const cacheable = notASession || bytesRead === stats.size;
+
+	// TypeScript does not see the assignment in the callback.
+	const sessionHeader = header as SessionHeader | null;
+	if (!sessionHeader) return { info: null, cacheable };
+
+	const cwd = typeof sessionHeader.cwd === "string" ? sessionHeader.cwd : "";
+	const parentSessionPath = sessionHeader.parentSession;
+	const headerTime = typeof sessionHeader.timestamp === "string" ? new Date(sessionHeader.timestamp).getTime() : NaN;
+	const modified =
+		typeof lastActivityTime === "number" && lastActivityTime > 0
+			? new Date(lastActivityTime)
+			: !Number.isNaN(headerTime)
+				? new Date(headerTime)
+				: stats.mtime;
+
+	return {
+		info: {
 			path: filePath,
-			id: header.id,
+			id: sessionHeader.id,
 			cwd,
 			name,
 			parentSessionPath,
-			created: new Date(header.timestamp),
+			created: new Date(sessionHeader.timestamp),
 			modified,
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.join(" "),
-		};
+		},
+		cacheable,
+	};
+}
+
+async function buildSessionInfo(
+	filePath: string,
+	signal?: AbortSignal,
+	fileStats?: Stats,
+	index?: SessionInfoIndex,
+): Promise<SessionInfo | null> {
+	try {
+		const stats = fileStats ?? (await stat(filePath));
+		const cached = index?.get(filePath, stats);
+		if (cached !== undefined) return cached;
+		const { info, cacheable } = await scanSessionInfo(filePath, stats, signal);
+		if (cacheable) index?.set(filePath, stats, info);
+		return info;
 	} catch {
 		signal?.throwIfAborted();
 		return null;
+	}
+}
+
+/** Name of the file, in a listed session folder, that keeps the listing's results for the next listing. */
+const SESSION_INDEX_FILE = ".session-index.json";
+const SESSION_INDEX_VERSION = 1;
+
+/** A SessionInfo without its path (the key), with dates as times (null for an invalid date), as the index keeps it. */
+interface IndexedSessionInfo {
+	id: string;
+	cwd: string;
+	name?: string;
+	parentSessionPath?: string;
+	created: number | null;
+	modified: number | null;
+	messageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+}
+
+/** A session file's revision when it was read, and what it gave (null: not a session). */
+interface SessionIndexEntry {
+	revision: string;
+	info: IndexedSessionInfo | null;
+}
+
+/** What changes when a file is appended to, rewritten or replaced: its device, inode, size and times. */
+function sessionFileRevision(stats: Stats): string {
+	return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`;
+}
+
+function isIndexedSessionInfo(value: unknown): value is IndexedSessionInfo {
+	if (typeof value !== "object" || value === null) return false;
+	const info = value as Record<string, unknown>;
+	return (
+		typeof info.cwd === "string" &&
+		(info.name === undefined || typeof info.name === "string") &&
+		(info.created === null || typeof info.created === "number") &&
+		(info.modified === null || typeof info.modified === "number") &&
+		typeof info.messageCount === "number" &&
+		typeof info.firstMessage === "string" &&
+		typeof info.allMessagesText === "string"
+	);
+}
+
+function isSessionIndexEntry(value: unknown): value is SessionIndexEntry {
+	if (typeof value !== "object" || value === null) return false;
+	const entry = value as Record<string, unknown>;
+	return typeof entry.revision === "string" && (entry.info === null || isIndexedSessionInfo(entry.info));
+}
+
+/**
+ * What the last listing of a session folder read from each session file, kept in a file in that folder: listing reads
+ * every line of every session, which took 0.5 s for 395 sessions (59 MB), and most sessions do not change between
+ * listings.
+ *
+ * An entry is used only while the file's device, inode, size and modification and change times are those it had before
+ * it was read: an append, a rewrite or a replacement changes them. A file that changed while it was read is not kept.
+ * The index is written to a temporary file and renamed over the old one, so a listing never sees a partly written index;
+ * listings running at once each write a whole index, and the last one wins. An index that cannot be read or parsed, or
+ * an entry of the wrong shape, counts as missing: the sessions are read again.
+ */
+class SessionInfoIndex {
+	private readonly path: string;
+	private readonly previous: Map<string, SessionIndexEntry>;
+	private readonly next = new Map<string, SessionIndexEntry>();
+	private changed = false;
+
+	private constructor(path: string, previous: Map<string, SessionIndexEntry>) {
+		this.path = path;
+		this.previous = previous;
+	}
+
+	static async load(dir: string): Promise<SessionInfoIndex> {
+		const path = join(dir, SESSION_INDEX_FILE);
+		const previous = new Map<string, SessionIndexEntry>();
+		try {
+			const parsed = JSON.parse(await readFile(path, "utf8")) as { version?: unknown; sessions?: unknown };
+			if (parsed.version === SESSION_INDEX_VERSION && typeof parsed.sessions === "object" && parsed.sessions) {
+				for (const [file, entry] of Object.entries(parsed.sessions)) {
+					if (isSessionIndexEntry(entry)) previous.set(file, entry);
+				}
+			}
+		} catch {
+			// No index yet, or one that cannot be used: every session is read.
+		}
+		return new SessionInfoIndex(path, previous);
+	}
+
+	/** The SessionInfo of `filePath` from the index, null for a file that is not a session, undefined when not known. */
+	get(filePath: string, stats: Stats): SessionInfo | null | undefined {
+		const entry = this.previous.get(filePath);
+		if (!entry || entry.revision !== sessionFileRevision(stats)) return undefined;
+		this.next.set(filePath, entry);
+		const info = entry.info;
+		if (!info) return null;
+		return {
+			path: filePath,
+			id: info.id,
+			cwd: info.cwd,
+			name: info.name,
+			parentSessionPath: info.parentSessionPath,
+			created: new Date(info.created ?? NaN),
+			modified: new Date(info.modified ?? NaN),
+			messageCount: info.messageCount,
+			firstMessage: info.firstMessage,
+			allMessagesText: info.allMessagesText,
+		};
+	}
+
+	set(filePath: string, stats: Stats, info: SessionInfo | null): void {
+		const created = info?.created.getTime();
+		const modified = info?.modified.getTime();
+		this.next.set(filePath, {
+			revision: sessionFileRevision(stats),
+			info: info && {
+				id: info.id,
+				cwd: info.cwd,
+				name: info.name,
+				parentSessionPath: info.parentSessionPath,
+				created: Number.isNaN(created) ? null : created!,
+				modified: Number.isNaN(modified) ? null : modified!,
+				messageCount: info.messageCount,
+				firstMessage: info.firstMessage,
+				allMessagesText: info.allMessagesText,
+			},
+		});
+		this.changed = true;
+	}
+
+	/** Writes the entries used or added by this listing, when they differ from the index that was read. */
+	async save(): Promise<void> {
+		if (!this.changed && this.next.size === this.previous.size) return;
+		const sessions: Record<string, SessionIndexEntry> = {};
+		for (const [file, entry] of this.next) sessions[file] = entry;
+		const tempPath = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+		try {
+			await writeFile(tempPath, JSON.stringify({ version: SESSION_INDEX_VERSION, sessions }));
+			await rename(tempPath, this.path);
+		} catch {
+			// The index only saves work. A folder that cannot be written is listed by reading every session.
+			await rm(tempPath, { force: true }).catch(() => {});
+		}
 	}
 }
 
@@ -923,21 +1192,27 @@ function sortSessionInfos(sessions: SessionInfo[]): SessionInfo[] {
 	return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 }
 
-function buildSessionInfosWithConcurrency(
+async function buildSessionInfosWithConcurrency(
+	indexDir: string,
 	files: SessionFileCandidate[],
 	onLoaded: (info: SessionInfo | null, index: number) => void,
 	signal?: AbortSignal,
 ): Promise<(SessionInfo | null)[]> {
-	return mapWithConcurrency(
+	const sessionIndex = await SessionInfoIndex.load(indexDir);
+	const results = await mapWithConcurrency(
 		files,
 		MAX_CONCURRENT_SESSION_INFO_LOADS,
 		async (file, index) => {
-			const info = await buildSessionInfo(file.path, signal, file.stats);
+			const info = await buildSessionInfo(file.path, signal, file.stats, sessionIndex);
 			onLoaded(info, index);
 			return info;
 		},
 		signal,
 	);
+	// A listing cancelled while its last reads finished is cancelled all the same.
+	signal?.throwIfAborted();
+	await sessionIndex.save();
+	return results;
 }
 
 async function listSessionsFromDir(
@@ -958,6 +1233,7 @@ async function listSessionsFromDir(
 		const partialSessions: SessionInfo[] = [];
 		let loaded = 0;
 		const results = await buildSessionInfosWithConcurrency(
+			dir,
 			files,
 			(info) => {
 				loaded++;
@@ -2097,6 +2373,7 @@ export class SessionManager {
 			let firstCandidateLoaded = false;
 			const partialSessions: SessionInfo[] = [];
 			const results = await buildSessionInfosWithConcurrency(
+				sessionsDir,
 				candidates,
 				(info, index) => {
 					loaded++;
