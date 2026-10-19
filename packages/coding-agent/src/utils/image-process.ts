@@ -1,5 +1,6 @@
 import { convertImageBytesToPng } from "./image-convert.ts";
 import { formatDimensionNote, type ImageResizeOptions, resizeImage } from "./image-resize.ts";
+import { resolveImageResizeOptions } from "./image-resize-core.ts";
 
 export interface ProcessImageOptions {
 	/** Whether to resize images to inline provider limits. Default: true */
@@ -116,4 +117,50 @@ export async function processImage(
 		mimeType: normalized.mimeType,
 		hints,
 	};
+}
+
+interface ProcessedImageBlock {
+	data: string;
+	mimeType: string;
+	autoResizeImages: boolean;
+	limits: Required<ImageResizeOptions>;
+}
+
+/** Image blocks built from processImage results, with what they were processed for. */
+const processedImageBlocks = new WeakMap<object, ProcessedImageBlock>();
+
+/**
+ * Record that `block` holds a processImage result for `options`. Processing such a block again with
+ * the same options returns it unchanged (the result is already within the limits and in a supported
+ * format), so tool-result normalization can skip it: see isProcessedImageBlock.
+ */
+export function markProcessedImageBlock(
+	block: { data: string; mimeType: string },
+	options: ProcessImageOptions | undefined,
+): void {
+	processedImageBlocks.set(block, {
+		data: block.data,
+		mimeType: block.mimeType,
+		autoResizeImages: options?.autoResizeImages ?? true,
+		limits: resolveImageResizeOptions(options?.resizeOptions),
+	});
+}
+
+/** Whether `block` is unchanged since markProcessedImageBlock recorded it for the same options. */
+export function isProcessedImageBlock(
+	block: { data: string; mimeType: string },
+	options: ProcessImageOptions | undefined,
+): boolean {
+	const processed = processedImageBlocks.get(block);
+	if (!processed || processed.data !== block.data || processed.mimeType !== block.mimeType) return false;
+	const autoResizeImages = options?.autoResizeImages ?? true;
+	if (processed.autoResizeImages !== autoResizeImages) return false;
+	if (!autoResizeImages) return true;
+	const limits = resolveImageResizeOptions(options?.resizeOptions);
+	return (
+		processed.limits.maxWidth === limits.maxWidth &&
+		processed.limits.maxHeight === limits.maxHeight &&
+		processed.limits.maxBytes === limits.maxBytes &&
+		processed.limits.jpegQuality === limits.jpegQuality
+	);
 }

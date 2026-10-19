@@ -2,10 +2,14 @@ import type { Worker } from "node:worker_threads";
 import {
 	IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
 	type ImageResizeOptions,
+	keepIfWithinLimits,
 	type ResizedImage,
 	type ResizeImageWorkerResponse,
+	readDisplayedImageSize,
 	resizeImageInProcess,
+	resolveImageResizeOptions,
 } from "./image-resize-core.ts";
+import { getNativeImage, resizeImageNative } from "./image-resize-native.ts";
 
 export type { ImageResizeOptions, ResizedImage } from "./image-resize-core.ts";
 
@@ -77,16 +81,32 @@ async function resizeImageInWorker(
 
 /**
  * Resize an image to fit within the specified max dimensions and encoded file size.
- * Runs Photon in a worker thread so WASM decoding, resizing, and encoding do not
- * block the TUI event loop. If the worker cannot be loaded (for example in some
- * Bun compiled executable layouts), fall back to in-process resizing so image
- * reads still work.
+ *
+ * - An image whose header shows it is within the limits is returned as it is, without decoding.
+ * - Otherwise, when the runtime has a native image pipeline (`Bun.Image`), it resizes there.
+ * - Otherwise, or when the header cannot be read or the native pipeline fails, Photon runs in a
+ *   worker thread so WASM decoding, resizing, and encoding do not block the TUI event loop. If the
+ *   worker cannot be loaded (for example in some Bun compiled executable layouts), fall back to
+ *   in-process resizing so image reads still work.
  */
 export async function resizeImage(
 	inputBytes: Uint8Array,
 	mimeType: string,
 	options?: ImageResizeOptions,
 ): Promise<ResizedImage | null> {
+	const opts = resolveImageResizeOptions(options);
+	const size = readDisplayedImageSize(inputBytes, mimeType);
+	if (size) {
+		const unchanged = keepIfWithinLimits(inputBytes, mimeType, size.width, size.height, opts);
+		if (unchanged) return unchanged;
+		const NativeImage = getNativeImage();
+		if (NativeImage) {
+			try {
+				return await resizeImageNative(NativeImage, inputBytes, size.width, size.height, opts);
+			} catch {}
+		}
+	}
+
 	const isTypeScriptRuntime = import.meta.url.endsWith(".ts");
 	const workerUrl = new URL(
 		isTypeScriptRuntime ? "./image-resize-worker.ts" : "./image-resize-worker.js",
