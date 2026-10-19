@@ -16,6 +16,7 @@ import {
 	appendFileSync,
 	closeSync,
 	existsSync,
+	fstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
@@ -23,6 +24,7 @@ import {
 	type Stats,
 	statSync,
 	writeFileSync,
+	writeSync,
 } from "fs";
 import { open, readdir, readFile, rename, rm, stat, writeFile } from "fs/promises";
 import { basename, join, resolve } from "path";
@@ -1251,6 +1253,83 @@ async function listSessionsFromDir(
 	}
 }
 
+/** How long a session file stays open for appends after the last one. */
+const APPEND_FILE_IDLE_MS = 1000;
+
+/**
+ * A session file kept open for appends while they come in quick succession: opening and closing the file for every
+ * entry cost 50-65 µs on macOS (APFS), a write on an open file 6 µs, and a turn appends an entry per message and tool
+ * result. Each append still writes its whole line with write() before it returns, as before, so a crash loses no more.
+ *
+ * The file is checked by path before each append (a stat, 3-4 µs): when the path no longer names the open file (deleted,
+ * renamed, replaced), the open file is closed and the path is opened again, so the line goes where appending by path
+ * puts it. The file is closed after APPEND_FILE_IDLE_MS without appends, and when the session changes.
+ */
+class SessionAppendFile {
+	private readonly path: string;
+	private readonly fd: number;
+	private readonly dev: number;
+	private readonly ino: number;
+	private lastAppend = 0;
+	private timer: ReturnType<typeof setTimeout> | undefined;
+	private closed = false;
+
+	constructor(path: string) {
+		this.path = path;
+		this.fd = openSync(path, "a");
+		try {
+			const stats = fstatSync(this.fd);
+			this.dev = stats.dev;
+			this.ino = stats.ino;
+		} catch (error) {
+			closeSync(this.fd);
+			throw error;
+		}
+	}
+
+	/** Whether `path` still names this open file. */
+	isFor(path: string): boolean {
+		if (this.closed || path !== this.path) return false;
+		const stats = statSync(path, { throwIfNoEntry: false });
+		return stats !== undefined && stats.ino === this.ino && stats.dev === this.dev;
+	}
+
+	append(line: string): void {
+		const written = writeSync(this.fd, line);
+		if (written !== Buffer.byteLength(line)) {
+			// A short write (a full disk): write the rest like appendFileSync would.
+			const bytes = Buffer.from(line);
+			for (let offset = written; offset < bytes.length; ) {
+				offset += writeSync(this.fd, bytes, offset, bytes.length - offset);
+			}
+		}
+		this.lastAppend = performance.now();
+		if (!this.timer) this.scheduleClose(APPEND_FILE_IDLE_MS);
+	}
+
+	close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		try {
+			closeSync(this.fd);
+		} catch {
+			// Nothing is buffered: every append was written before it returned.
+		}
+	}
+
+	private scheduleClose(delay: number): void {
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			const idle = performance.now() - this.lastAppend;
+			if (idle >= APPEND_FILE_IDLE_MS) this.close();
+			else this.scheduleClose(APPEND_FILE_IDLE_MS - idle);
+		}, delay);
+		this.timer.unref();
+	}
+}
+
 /**
  * Manages conversation sessions as append-only trees stored in JSONL files.
  *
@@ -1289,6 +1368,8 @@ export class SessionManager {
 	private projectionRevision = 0;
 	/** The latest session_info entry in file order (what getSessionName() reports). */
 	private latestSessionInfo: SessionInfoEntry | undefined;
+	/** The session file, kept open between appends that come in quick succession. Not used on Windows. */
+	private appendFile: SessionAppendFile | undefined;
 
 	private constructor(
 		cwd: string,
@@ -1320,6 +1401,7 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+		this._closeAppendFile();
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
@@ -1361,6 +1443,7 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
 		};
+		this._closeAppendFile();
 		this.fileEntries = [header];
 		this.leafPath = undefined;
 		this.projection = undefined;
@@ -1484,8 +1567,31 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this._appendLine(this.sessionFile, `${JSON.stringify(entry)}\n`);
 		}
+	}
+
+	private _appendLine(path: string, line: string): void {
+		// An open file can keep others from deleting or renaming it on Windows.
+		if (process.platform === "win32") {
+			appendFileSync(path, line);
+			return;
+		}
+		if (!this.appendFile?.isFor(path)) {
+			this._closeAppendFile();
+			this.appendFile = new SessionAppendFile(path);
+		}
+		try {
+			this.appendFile.append(line);
+		} catch (error) {
+			this._closeAppendFile();
+			throw error;
+		}
+	}
+
+	private _closeAppendFile(): void {
+		this.appendFile?.close();
+		this.appendFile = undefined;
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
