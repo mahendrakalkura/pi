@@ -3661,7 +3661,14 @@ export class InteractiveMode {
 				if (event.isError) this.maybeShowInstallChangeWarning();
 				const component = this.pendingTools.get(event.toolCallId);
 				if (component) {
-					component.updateResult({ ...event.result, isError: event.isError, durationMs: event.durationMs });
+					// Only what the component draws: the result's structuredContent can hold up to 1 MiB of bash output
+					// (2 MiB as a JavaScript string), which the component would keep for the rest of the session.
+					component.updateResult({
+						content: event.result.content,
+						details: event.result.details,
+						isError: event.isError,
+						durationMs: event.durationMs,
+					});
 					this.pendingTools.delete(event.toolCallId);
 					this.ui.requestRender();
 				}
