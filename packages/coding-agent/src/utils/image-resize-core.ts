@@ -1,4 +1,5 @@
-import { applyExifOrientation } from "./exif-orientation.ts";
+import { applyExifOrientation, getExifOrientation } from "./exif-orientation.ts";
+import { type ImageHeader, readImageHeader } from "./image-header.ts";
 import { loadPhoton } from "./photon.ts";
 
 export interface ImageResizeOptions {
@@ -38,41 +39,143 @@ const DEFAULT_OPTIONS: Required<ImageResizeOptions> = {
 	jpegQuality: 80,
 };
 
-interface EncodedCandidate {
-	data: string;
-	encodedSize: number;
-	mimeType: string;
+/** The limits with defaults applied. */
+export function resolveImageResizeOptions(options?: ImageResizeOptions): Required<ImageResizeOptions> {
+	return { ...DEFAULT_OPTIONS, ...options };
 }
 
-function encodeCandidate(buffer: Uint8Array, mimeType: string): EncodedCandidate {
-	const data = Buffer.from(buffer).toString("base64");
+/**
+ * Width and height as displayed, read from the file header: EXIF orientations 5-8 rotate the image
+ * by 90 degrees. Undefined when the header cannot be read; the caller then decodes the image.
+ */
+export function readDisplayedImageSize(inputBytes: Uint8Array, mimeType: string): ImageHeader | undefined {
+	// The header is checked first: it also validates the structure the EXIF reader walks.
+	const header = readImageHeader(inputBytes, mimeType);
+	if (!header) return undefined;
+	return getExifOrientation(inputBytes) >= 5 ? { width: header.height, height: header.width } : header;
+}
+
+function base64Size(byteLength: number): number {
+	return Math.ceil(byteLength / 3) * 4;
+}
+
+/**
+ * The input as it is when it is already within the dimension and size limits, else undefined.
+ * `width` and `height` are the displayed size (after EXIF orientation).
+ */
+export function keepIfWithinLimits(
+	inputBytes: Uint8Array,
+	mimeType: string,
+	width: number,
+	height: number,
+	opts: Required<ImageResizeOptions>,
+): ResizedImage | undefined {
+	if (width > opts.maxWidth || height > opts.maxHeight || base64Size(inputBytes.byteLength) >= opts.maxBytes) {
+		return undefined;
+	}
+	const format = mimeType.split("/")[1] ?? "png";
 	return {
-		data,
-		encodedSize: Buffer.byteLength(data, "utf-8"),
-		mimeType,
+		data: Buffer.from(inputBytes.buffer, inputBytes.byteOffset, inputBytes.byteLength).toString("base64"),
+		mimeType: mimeType || `image/${format}`,
+		originalWidth: width,
+		originalHeight: height,
+		width,
+		height,
+		wasResized: false,
 	};
+}
+
+/** One resized version of the image, encoded on demand. */
+export interface ResizedFrame {
+	png(): Uint8Array | Promise<Uint8Array>;
+	jpeg(quality: number): Uint8Array | Promise<Uint8Array>;
+	free(): void;
+}
+
+/**
+ * Resize to fit `maxWidth`/`maxHeight`, then find the first encoding under `maxBytes`: PNG, then JPEG
+ * at each quality step, then the same at 75% of the size, down to 1x1. Encodings are produced one at
+ * a time and the first that fits wins, so later candidates are not encoded at all.
+ * Returns null when nothing fits.
+ */
+export async function encodeWithinLimits(
+	originalWidth: number,
+	originalHeight: number,
+	opts: Required<ImageResizeOptions>,
+	resizeTo: (width: number, height: number) => ResizedFrame,
+): Promise<ResizedImage | null> {
+	let currentWidth = originalWidth;
+	let currentHeight = originalHeight;
+	if (currentWidth > opts.maxWidth) {
+		currentHeight = Math.round((currentHeight * opts.maxWidth) / currentWidth);
+		currentWidth = opts.maxWidth;
+	}
+	if (currentHeight > opts.maxHeight) {
+		currentWidth = Math.round((currentWidth * opts.maxHeight) / currentHeight);
+		currentHeight = opts.maxHeight;
+	}
+
+	const qualitySteps = Array.from(new Set([opts.jpegQuality, 85, 70, 55, 40]));
+	const result = (bytes: Uint8Array, mimeType: string): ResizedImage | undefined => {
+		const data = Buffer.from(bytes).toString("base64");
+		if (Buffer.byteLength(data, "utf-8") >= opts.maxBytes) return undefined;
+		return {
+			data,
+			mimeType,
+			originalWidth,
+			originalHeight,
+			width: currentWidth,
+			height: currentHeight,
+			wasResized: true,
+		};
+	};
+
+	while (true) {
+		const frame = resizeTo(currentWidth, currentHeight);
+		try {
+			const png = result(await frame.png(), "image/png");
+			if (png) return png;
+			for (const quality of qualitySteps) {
+				const jpeg = result(await frame.jpeg(quality), "image/jpeg");
+				if (jpeg) return jpeg;
+			}
+		} finally {
+			frame.free();
+		}
+
+		if (currentWidth === 1 && currentHeight === 1) {
+			return null;
+		}
+
+		const nextWidth = currentWidth === 1 ? 1 : Math.max(1, Math.floor(currentWidth * 0.75));
+		const nextHeight = currentHeight === 1 ? 1 : Math.max(1, Math.floor(currentHeight * 0.75));
+		if (nextWidth === currentWidth && nextHeight === currentHeight) {
+			return null;
+		}
+
+		currentWidth = nextWidth;
+		currentHeight = nextHeight;
+	}
 }
 
 /**
  * Resize an image to fit within the specified max dimensions and encoded file size.
  * Returns null if the image cannot be resized below maxBytes.
  *
- * Uses Photon (Rust/WASM) for image processing. If Photon is not available,
- * returns null.
- *
- * Strategy for staying under maxBytes:
- * 1. First resize to maxWidth/maxHeight
- * 2. Try both PNG and JPEG formats, pick the smaller one
- * 3. If still too large, try JPEG with decreasing quality
- * 4. If still too large, progressively reduce dimensions until 1x1
+ * An image whose header shows it is already within the limits is returned as it is, without
+ * decoding. Otherwise Photon (Rust/WASM) decodes it once and resizes it (see encodeWithinLimits).
+ * If Photon is not available, returns null.
  */
 export async function resizeImageInProcess(
 	inputBytes: Uint8Array,
 	mimeType: string,
 	options?: ImageResizeOptions,
 ): Promise<ResizedImage | null> {
-	const opts = { ...DEFAULT_OPTIONS, ...options };
-	const inputBase64Size = Math.ceil(inputBytes.byteLength / 3) * 4;
+	const opts = resolveImageResizeOptions(options);
+
+	const size = readDisplayedImageSize(inputBytes, mimeType);
+	const unchanged = size && keepIfWithinLimits(inputBytes, mimeType, size.width, size.height, opts);
+	if (unchanged) return unchanged;
 
 	const photon = await loadPhoton();
 	if (!photon) {
@@ -84,86 +187,21 @@ export async function resizeImageInProcess(
 		const rawImage = photon.PhotonImage.new_from_byteslice(inputBytes);
 		image = applyExifOrientation(photon, rawImage, inputBytes);
 		if (image !== rawImage) rawImage.free();
+		const decoded = image;
 
-		const originalWidth = image.get_width();
-		const originalHeight = image.get_height();
-		const format = mimeType.split("/")[1] ?? "png";
+		const originalWidth = decoded.get_width();
+		const originalHeight = decoded.get_height();
+		const decodedUnchanged = keepIfWithinLimits(inputBytes, mimeType, originalWidth, originalHeight, opts);
+		if (decodedUnchanged) return decodedUnchanged;
 
-		// Check if already within all limits (dimensions AND encoded size)
-		if (originalWidth <= opts.maxWidth && originalHeight <= opts.maxHeight && inputBase64Size < opts.maxBytes) {
+		return await encodeWithinLimits(originalWidth, originalHeight, opts, (width, height) => {
+			const resized = photon.resize(decoded, width, height, photon.SamplingFilter.Lanczos3);
 			return {
-				data: Buffer.from(inputBytes).toString("base64"),
-				mimeType: mimeType || `image/${format}`,
-				originalWidth,
-				originalHeight,
-				width: originalWidth,
-				height: originalHeight,
-				wasResized: false,
+				png: () => resized.get_bytes(),
+				jpeg: (quality) => resized.get_bytes_jpeg(quality),
+				free: () => resized.free(),
 			};
-		}
-
-		// Calculate initial dimensions respecting max limits
-		let targetWidth = originalWidth;
-		let targetHeight = originalHeight;
-
-		if (targetWidth > opts.maxWidth) {
-			targetHeight = Math.round((targetHeight * opts.maxWidth) / targetWidth);
-			targetWidth = opts.maxWidth;
-		}
-		if (targetHeight > opts.maxHeight) {
-			targetWidth = Math.round((targetWidth * opts.maxHeight) / targetHeight);
-			targetHeight = opts.maxHeight;
-		}
-
-		function tryEncodings(width: number, height: number, jpegQualities: number[]): EncodedCandidate[] {
-			const resized = photon!.resize(image!, width, height, photon!.SamplingFilter.Lanczos3);
-
-			try {
-				const candidates: EncodedCandidate[] = [encodeCandidate(resized.get_bytes(), "image/png")];
-				for (const quality of jpegQualities) {
-					candidates.push(encodeCandidate(resized.get_bytes_jpeg(quality), "image/jpeg"));
-				}
-				return candidates;
-			} finally {
-				resized.free();
-			}
-		}
-
-		const qualitySteps = Array.from(new Set([opts.jpegQuality, 85, 70, 55, 40]));
-		let currentWidth = targetWidth;
-		let currentHeight = targetHeight;
-
-		while (true) {
-			const candidates = tryEncodings(currentWidth, currentHeight, qualitySteps);
-			for (const candidate of candidates) {
-				if (candidate.encodedSize < opts.maxBytes) {
-					return {
-						data: candidate.data,
-						mimeType: candidate.mimeType,
-						originalWidth,
-						originalHeight,
-						width: currentWidth,
-						height: currentHeight,
-						wasResized: true,
-					};
-				}
-			}
-
-			if (currentWidth === 1 && currentHeight === 1) {
-				break;
-			}
-
-			const nextWidth = currentWidth === 1 ? 1 : Math.max(1, Math.floor(currentWidth * 0.75));
-			const nextHeight = currentHeight === 1 ? 1 : Math.max(1, Math.floor(currentHeight * 0.75));
-			if (nextWidth === currentWidth && nextHeight === currentHeight) {
-				break;
-			}
-
-			currentWidth = nextWidth;
-			currentHeight = nextHeight;
-		}
-
-		return null;
+		});
 	} catch {
 		return null;
 	} finally {

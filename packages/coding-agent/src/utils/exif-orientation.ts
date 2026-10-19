@@ -94,7 +94,8 @@ function hasExifHeader(bytes: Uint8Array, offset: number): boolean {
 	);
 }
 
-function getExifOrientation(bytes: Uint8Array): number {
+/** EXIF orientation (1-8) of a JPEG or WebP file; 1 when there is none. */
+export function getExifOrientation(bytes: Uint8Array): number {
 	let tiffOffset = -1;
 
 	// JPEG: starts with FF D8
