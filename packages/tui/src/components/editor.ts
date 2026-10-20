@@ -293,6 +293,15 @@ function canWrapStandalone(line: string, lineWidth: number, maxWidth: number): b
 	return lineWidth >= 0 && (maxWidth >= 2 || lineWidth === line.length);
 }
 
+/**
+ * visibleWidth() of an editor line: for a line of standalone characters, their widths added up, without segmenting it
+ * (visibleWidth() segments any line with a character it does not measure directly, such as CJK, every time).
+ */
+function editorLineWidth(line: string): number {
+	const width = standaloneTextWidth(line);
+	return width >= 0 ? width : visibleWidth(line);
+}
+
 /** isWhitespaceChar() for a standalone character, by its code. */
 function isStandaloneWhitespace(line: string, i: number, code: number): boolean {
 	return code === 0x20 || (code > 0x7e && isWhitespaceChar(line[i]!));
@@ -1254,7 +1263,7 @@ export class Editor implements Component, Focusable {
 		for (let i = 0; i < this.state.lines.length; i++) {
 			const line = this.state.lines[i] || "";
 			const isCurrentLine = i === this.state.cursorLine;
-			const lineVisibleWidth = visibleWidth(line);
+			const lineVisibleWidth = editorLineWidth(line);
 
 			if (lineVisibleWidth <= contentWidth) {
 				// Line fits in one layout line
@@ -2076,7 +2085,7 @@ export class Editor implements Component, Focusable {
 
 		for (let i = 0; i < this.state.lines.length; i++) {
 			const line = this.state.lines[i] || "";
-			const lineVisWidth = visibleWidth(line);
+			const lineVisWidth = editorLineWidth(line);
 			if (line.length === 0) {
 				// Empty line still takes one visual line
 				visualLines.push({ logicalLine: i, startCol: 0, length: 0 });
