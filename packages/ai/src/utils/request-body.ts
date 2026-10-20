@@ -196,7 +196,9 @@ export function jsonBodyParts(
 	if (!Array.isArray(items) || !isPlainItems(items, allowedToJSON) || !isPlainRecord(body) || hasToJSON(body)) {
 		return undefined;
 	}
-	for (const item of items) {
+	// By index, as JSON.stringify reads an array: an iterator of the array's own is never run.
+	for (let i = 0; i < items.length; i++) {
+		const item: unknown = items[i];
 		// JSON.stringify passes an item's own toJSON its index as the key; serialized alone it would get "".
 		if (typeof item === "object" && item !== null && hasToJSON(item)) return undefined;
 	}
