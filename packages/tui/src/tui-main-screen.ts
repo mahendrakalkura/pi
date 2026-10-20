@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import { renderSharedLines, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
@@ -175,6 +175,37 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.terminal.write("\r\n");
 	}
 
+	/** The lines of the last frame before and after resolveFakeCursors(), and whether the hardware cursor was shown. */
+	private unresolvedLines: string[] = [];
+	private resolvedLines: string[] = [];
+	private resolvedWithHardwareCursor = false;
+
+	/**
+	 * resolveFakeCursors() for a frame, taking each line that is the same string as the frame before from the frame
+	 * before: resolving looks for a cursor in every line of the transcript, each frame (0.5 ms at 27,500 lines). Returns
+	 * a new array, which the frame may change (extractCursorPosition() does).
+	 */
+	private resolveFrameFakeCursors(lines: string[]): string[] {
+		const showHardwareCursor = this.getShowHardwareCursor();
+		const previous = showHardwareCursor === this.resolvedWithHardwareCursor ? this.unresolvedLines : [];
+		const previousResolved = this.resolvedLines;
+		const resolved: string[] = new Array(lines.length);
+		const single = [""];
+		for (let i = 0; i < lines.length; i++) {
+			const line = lines[i]!;
+			if (i < previous.length && line === previous[i]) {
+				resolved[i] = previousResolved[i]!;
+			} else {
+				single[0] = line;
+				resolved[i] = this.resolveFakeCursors(single)[0]!;
+			}
+		}
+		this.unresolvedLines = lines;
+		this.resolvedLines = resolved;
+		this.resolvedWithHardwareCursor = showHardwareCursor;
+		return resolved.slice();
+	}
+
 	/** The lines of the last frame before and after applyLineResets(): finishLines(). */
 	private rawLines: string[] = [];
 	private finishedLines: string[] = [];
@@ -294,7 +325,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 
 		// Render all components to get new lines
 		// Resolve fake cursors before compositing so overlays and line slicing see plain SGR codes
-		let newLines = this.resolveFakeCursors(this.render(width));
+		let newLines = this.resolveFrameFakeCursors(renderSharedLines(this, width));
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.hasOverlayEntries) {

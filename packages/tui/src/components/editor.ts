@@ -101,6 +101,21 @@ function segmentWithMarkers(
 }
 
 /**
+ * The grapheme of `text` that contains code unit `index` (undefined outside the text), without segmenting the rest of
+ * the text. On the first code unit of a surrogate pair it asks for the second, which is always in the same grapheme:
+ * JSC's Segments.containing() returns the previous grapheme joined to the right one for the first (for "b👍" and
+ * index 1, "b👍" at 0).
+ */
+function graphemeAt(text: string, index: number): Intl.SegmentData | undefined {
+	const code = text.charCodeAt(index);
+	if (code >= 0xd800 && code <= 0xdbff) {
+		const next = text.charCodeAt(index + 1);
+		if (next >= 0xdc00 && next <= 0xdfff) return graphemeSegmenter.segment(text).containing(index + 1);
+	}
+	return graphemeSegmenter.segment(text).containing(index);
+}
+
+/**
  * Represents a chunk of text for word-wrap layout.
  * Tracks both the text content and its position in the original line.
  */
@@ -124,6 +139,13 @@ export interface TextChunk {
 export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl.SegmentData[]): TextChunk[] {
 	if (!line || maxWidth <= 0) {
 		return [{ text: "", startIndex: 0, endIndex: 0 }];
+	}
+
+	if (!preSegmented) {
+		const standaloneWidth = standaloneTextWidth(line);
+		if (canWrapStandalone(line, standaloneWidth, maxWidth)) {
+			return wordWrapStandaloneLine(line, maxWidth, standaloneWidth);
+		}
 	}
 
 	const lineWidth = visibleWidth(line);
@@ -215,6 +237,133 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 	// Push final chunk.
 	chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: line.length });
 
+	return chunks;
+}
+
+/**
+ * The width of a UTF-16 code unit that is always a grapheme of its own, whatever is beside it, or 0 for any other:
+ *
+ * - 1: printable ASCII, Latin-1 and Latin Extended letters and signs (not the soft hyphen), typographic punctuation,
+ *   arrows and mathematical operators, box drawing, block elements and geometric shapes (the set visibleWidth()
+ *   measures without segmenting);
+ * - 2: CJK ideographs, kana, Hangul syllables, CJK punctuation and fullwidth forms.
+ *
+ * Anything that could join one of these into a larger grapheme, such as a combining mark (the kana voicing marks
+ * included), a Hangul jamo, a zero-width joiner or a variation selector, is outside the set.
+ */
+function standaloneCharWidth(code: number): number {
+	if (code < 0x3000) {
+		return (code >= 0x20 && code <= 0x7e) ||
+			(code >= 0xa0 && code <= 0x2ff && code !== 0xad) ||
+			(code >= 0x2010 && code <= 0x2027) ||
+			(code >= 0x2190 && code <= 0x22ff) ||
+			(code >= 0x2500 && code <= 0x25fc)
+			? 1
+			: 0;
+	}
+	return code <= 0x3029 ||
+		(code >= 0x3041 && code <= 0x3096) ||
+		(code >= 0x309d && code <= 0x309f) ||
+		(code >= 0x30a1 && code <= 0x30ff) ||
+		(code >= 0x3400 && code <= 0x4dbf) ||
+		(code >= 0x4e00 && code <= 0x9fff) ||
+		(code >= 0xac00 && code <= 0xd7a3) ||
+		(code >= 0xff01 && code <= 0xff60) ||
+		(code >= 0xffe0 && code <= 0xffe6)
+		? 2
+		: 0;
+}
+
+/** The width of `text` when every character of it is a grapheme of its own (standaloneCharWidth()), else -1. */
+function standaloneTextWidth(text: string): number {
+	let width = 0;
+	for (let i = 0; i < text.length; i++) {
+		const charWidth = standaloneCharWidth(text.charCodeAt(i));
+		if (charWidth === 0) return -1;
+		width += charWidth;
+	}
+	return width;
+}
+
+/**
+ * Whether wordWrapStandaloneLine() wraps `line` at `maxWidth`: its characters are graphemes of their own, and none is
+ * wider than `maxWidth` (wordWrapLine() splits such a grapheme specially).
+ */
+function canWrapStandalone(line: string, lineWidth: number, maxWidth: number): boolean {
+	return lineWidth >= 0 && (maxWidth >= 2 || lineWidth === line.length);
+}
+
+/** isWhitespaceChar() for a standalone character, by its code. */
+function isStandaloneWhitespace(line: string, i: number, code: number): boolean {
+	return code === 0x20 || (code > 0x7e && isWhitespaceChar(line[i]!));
+}
+
+/**
+ * wordWrapLine() for a line whose characters are graphemes of their own (canWrapStandalone()), without segmenting it:
+ * the same greedy algorithm runs on character codes, with each character's width from standaloneCharWidth(). A long
+ * prompt line is wrapped again on every keystroke, and segmenting it cost O(line) Intl.Segmenter work per key (0.24 ms
+ * at 2,000 characters).
+ */
+function wordWrapStandaloneLine(line: string, maxWidth: number, lineWidth: number): TextChunk[] {
+	const length = line.length;
+	if (length === 0 || maxWidth <= 0) {
+		return [{ text: "", startIndex: 0, endIndex: 0 }];
+	}
+	if (lineWidth <= maxWidth) {
+		return [{ text: line, startIndex: 0, endIndex: length }];
+	}
+
+	const chunks: TextChunk[] = [];
+	let currentWidth = 0;
+	let chunkStart = 0;
+	let wrapOppIndex = -1;
+	let wrapOppWidth = 0;
+	let code = line.charCodeAt(0);
+	let isWs = isStandaloneWhitespace(line, 0, code);
+
+	for (let i = 0; i < length; i++) {
+		const charWidth = code < 0x3000 ? 1 : 2;
+
+		// Overflow check before advancing.
+		if (currentWidth + charWidth > maxWidth) {
+			if (wrapOppIndex >= 0 && currentWidth - wrapOppWidth + charWidth <= maxWidth) {
+				chunks.push({ text: line.slice(chunkStart, wrapOppIndex), startIndex: chunkStart, endIndex: wrapOppIndex });
+				chunkStart = wrapOppIndex;
+				currentWidth -= wrapOppWidth;
+			} else if (chunkStart < i) {
+				chunks.push({ text: line.slice(chunkStart, i), startIndex: chunkStart, endIndex: i });
+				chunkStart = i;
+				currentWidth = 0;
+			}
+			wrapOppIndex = -1;
+		}
+
+		currentWidth += charWidth;
+
+		// Wrap opportunity: after whitespace before non-whitespace, or between non-whitespace characters where
+		// either is CJK (no ASCII character is).
+		if (i + 1 < length) {
+			const nextCode = line.charCodeAt(i + 1);
+			const nextIsWs = isStandaloneWhitespace(line, i + 1, nextCode);
+			if (isWs) {
+				if (!nextIsWs) {
+					wrapOppIndex = i + 1;
+					wrapOppWidth = currentWidth;
+				}
+			} else if (
+				!nextIsWs &&
+				(code > 0x7e || nextCode > 0x7e) &&
+				(cjkBreakRegex.test(line[i]!) || cjkBreakRegex.test(line[i + 1]!))
+			) {
+				wrapOppIndex = i + 1;
+				wrapOppWidth = currentWidth;
+			}
+			code = nextCode;
+			isWs = nextIsWs;
+		}
+	}
+
+	chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: length });
 	return chunks;
 }
 
@@ -432,7 +581,12 @@ export class Editor implements Component, Focusable {
 	): TextChunk[] {
 		const known = cache[index];
 		if (known !== undefined && known.text === line) return known.chunks;
-		const chunks = wordWrapLine(line, width, [...this.segment(line, "grapheme")]);
+		// A line of standalone characters without paste markers wraps the same from its plain graphemes, which
+		// wordWrapStandaloneLine() does without segmenting it.
+		const standaloneWidth = this.hasNoPasteMarkers(line) ? standaloneTextWidth(line) : -1;
+		const chunks = canWrapStandalone(line, standaloneWidth, width)
+			? wordWrapStandaloneLine(line, width, standaloneWidth)
+			: wordWrapLine(line, width, [...this.segment(line, "grapheme")]);
 		cache[index] = { text: line, chunks };
 		return chunks;
 	}
@@ -445,6 +599,38 @@ export class Editor implements Component, Focusable {
 	/** Segment text with paste-marker awareness, only merging markers with valid IDs. */
 	private segment(text: string, mode: "word" | "grapheme"): Iterable<Intl.SegmentData> {
 		return segmentWithMarkers(text, mode === "word" ? wordSegmenter : graphemeSegmenter, this.validPasteIds());
+	}
+
+	/** Whether this.segment(text, ...) is the plain Intl.Segmenter segmentation (segmentWithMarkers()'s fast path). */
+	private hasNoPasteMarkers(text: string): boolean {
+		return this.pastes.size === 0 || !text.includes("[paste #");
+	}
+
+	/**
+	 * The first grapheme of `text`, as [...this.segment(text, "grapheme")][0]. Without paste markers it is looked up
+	 * directly rather than by segmenting all of the text, which cost O(line) per keystroke on a long line.
+	 */
+	private firstGrapheme(text: string): Intl.SegmentData | undefined {
+		if (this.hasNoPasteMarkers(text)) return graphemeAt(text, 0);
+		return [...this.segment(text, "grapheme")][0];
+	}
+
+	/** The last grapheme of `text`, as [...this.segment(text, "grapheme")].at(-1) (see firstGrapheme()). */
+	private lastGrapheme(text: string): Intl.SegmentData | undefined {
+		if (this.hasNoPasteMarkers(text)) return graphemeAt(text, text.length - 1);
+		const graphemes = [...this.segment(text, "grapheme")];
+		return graphemes[graphemes.length - 1];
+	}
+
+	/** The grapheme of this.segment(text, "grapheme") that contains code unit `index`, if any (see firstGrapheme()). */
+	private graphemeContaining(text: string, index: number): Intl.SegmentData | undefined {
+		if (index < 0 || index >= text.length) return undefined;
+		if (this.hasNoPasteMarkers(text)) return graphemeAt(text, index);
+		for (const seg of this.segment(text, "grapheme")) {
+			if (seg.index > index) break;
+			if (index < seg.index + seg.segment.length) return seg;
+		}
+		return undefined;
 	}
 
 	getPaddingX(): number {
@@ -641,8 +827,7 @@ export class Editor implements Component, Focusable {
 				if (after.length > 0) {
 					// Cursor is on a character (grapheme) - replace it with highlighted version
 					// Get the first grapheme from 'after'
-					const afterGraphemes = [...this.segment(after, "grapheme")];
-					const firstGrapheme = afterGraphemes[0]?.segment || "";
+					const firstGrapheme = this.firstGrapheme(after)?.segment || "";
 					const restAfter = after.slice(firstGrapheme.length);
 					const cursor = renderFakeCursor(firstGrapheme);
 					displayText = before + marker + cursor + restAfter;
@@ -1292,7 +1477,7 @@ export class Editor implements Component, Focusable {
 			else if (this.autocompleteTriggerCharacters.includes(char)) {
 				const currentLine = this.state.lines[this.state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
-				if (this.autocompleteTriggerPattern.test(textBeforeCursor)) {
+				if (this.matchesAutocompleteTrigger(textBeforeCursor)) {
 					this.tryTriggerAutocomplete();
 				}
 			}
@@ -1305,7 +1490,7 @@ export class Editor implements Component, Focusable {
 					this.tryTriggerAutocomplete();
 				}
 				// Check if we're in a symbol-based completion context like @, #, or provider triggers
-				else if (this.autocompleteTriggerPattern.test(textBeforeCursor)) {
+				else if (this.matchesAutocompleteTrigger(textBeforeCursor)) {
 					this.tryTriggerAutocomplete();
 				}
 			}
@@ -1446,8 +1631,7 @@ export class Editor implements Component, Focusable {
 			const beforeCursor = line.slice(0, this.state.cursorCol);
 
 			// Find the last grapheme in the text before cursor
-			const graphemes = [...this.segment(beforeCursor, "grapheme")];
-			const lastGrapheme = graphemes[graphemes.length - 1];
+			const lastGrapheme = this.lastGrapheme(beforeCursor)!;
 			const graphemeLength = lastGrapheme ? lastGrapheme.segment.length : 1;
 			const isPastedSegmented = PASTE_MARKER_SINGLE.exec(lastGrapheme.segment);
 
@@ -1513,7 +1697,7 @@ export class Editor implements Component, Focusable {
 				this.tryTriggerAutocomplete();
 			}
 			// Symbol-based completion context like @, #, or provider triggers
-			else if (this.autocompleteTriggerPattern.test(textBeforeCursor)) {
+			else if (this.matchesAutocompleteTrigger(textBeforeCursor)) {
 				this.tryTriggerAutocomplete();
 			}
 		}
@@ -1575,40 +1759,37 @@ export class Editor implements Component, Focusable {
 		// Snap cursor to atomic segment boundary (e.g. paste markers)
 		// so the cursor never lands in the middle of a multi-grapheme unit.
 		// Single-grapheme segments don't need snapping.
-		const segments = [...this.segment(logicalLine, "grapheme")];
-		for (const seg of segments) {
-			if (seg.index > this.state.cursorCol) break;
-			if (seg.segment.length <= 1) continue;
-			if (this.state.cursorCol < seg.index + seg.segment.length) {
-				const isContinuation = seg.index < targetVL.startCol;
-				const isMovingDown = targetVisualLine > currentVisualLine;
+		// (Only the grapheme that contains the cursor column can need it.)
+		const seg = this.graphemeContaining(logicalLine, this.state.cursorCol);
+		if (seg && seg.segment.length > 1) {
+			const isContinuation = seg.index < targetVL.startCol;
+			const isMovingDown = targetVisualLine > currentVisualLine;
 
-				if (isContinuation && isMovingDown) {
-					// The segment started on a previous visual line, and we
-					// already visited it on the way down. Skip all remaining
-					// continuation VLs and land on the first VL past it.
-					const segEnd = seg.index + seg.segment.length;
-					let next = targetVisualLine + 1;
-					while (
-						next < visualLines.length &&
-						visualLines[next].logicalLine === targetVL.logicalLine &&
-						visualLines[next].startCol < segEnd
-					) {
-						next++;
-					}
-					if (next < visualLines.length) {
-						this.moveToVisualLine(visualLines, currentVisualLine, next);
-						return;
-					}
+			if (isContinuation && isMovingDown) {
+				// The segment started on a previous visual line, and we
+				// already visited it on the way down. Skip all remaining
+				// continuation VLs and land on the first VL past it.
+				const segEnd = seg.index + seg.segment.length;
+				let next = targetVisualLine + 1;
+				while (
+					next < visualLines.length &&
+					visualLines[next].logicalLine === targetVL.logicalLine &&
+					visualLines[next].startCol < segEnd
+				) {
+					next++;
 				}
-
-				// Snap to the start of the segment so it gets highlighted.
-				// Store the pre-snap position so the next vertical move can
-				// resolve it to the correct visual column.
-				this.snappedFromCursorCol = this.state.cursorCol;
-				this.state.cursorCol = seg.index;
-				return;
+				if (next < visualLines.length) {
+					this.moveToVisualLine(visualLines, currentVisualLine, next);
+					return;
+				}
 			}
+
+			// Snap to the start of the segment so it gets highlighted.
+			// Store the pre-snap position so the next vertical move can
+			// resolve it to the correct visual column.
+			this.snappedFromCursorCol = this.state.cursorCol;
+			this.state.cursorCol = seg.index;
+			return;
 		}
 
 		// No snap occurred – we moved out of the atomic segment.
@@ -1846,8 +2027,7 @@ export class Editor implements Component, Focusable {
 			const afterCursor = currentLine.slice(this.state.cursorCol);
 
 			// Find the first grapheme at cursor
-			const graphemes = [...this.segment(afterCursor, "grapheme")];
-			const firstGrapheme = graphemes[0];
+			const firstGrapheme = this.firstGrapheme(afterCursor);
 			const graphemeLength = firstGrapheme ? firstGrapheme.segment.length : 1;
 
 			const before = currentLine.slice(0, this.state.cursorCol);
@@ -1877,7 +2057,7 @@ export class Editor implements Component, Focusable {
 				this.tryTriggerAutocomplete();
 			}
 			// Symbol-based completion context like @, #, or provider triggers
-			else if (this.autocompleteTriggerPattern.test(textBeforeCursor)) {
+			else if (this.matchesAutocompleteTrigger(textBeforeCursor)) {
 				this.tryTriggerAutocomplete();
 			}
 		}
@@ -1969,8 +2149,7 @@ export class Editor implements Component, Focusable {
 				// Moving right - move by one grapheme (handles emojis, combining characters, etc.)
 				if (this.state.cursorCol < currentLine.length) {
 					const afterCursor = currentLine.slice(this.state.cursorCol);
-					const graphemes = [...this.segment(afterCursor, "grapheme")];
-					const firstGrapheme = graphemes[0];
+					const firstGrapheme = this.firstGrapheme(afterCursor);
 					this.setCursorCol(this.state.cursorCol + (firstGrapheme ? firstGrapheme.segment.length : 1));
 				} else if (this.state.cursorLine < this.state.lines.length - 1) {
 					// Wrap to start of next logical line
@@ -1987,8 +2166,7 @@ export class Editor implements Component, Focusable {
 				// Moving left - move by one grapheme (handles emojis, combining characters, etc.)
 				if (this.state.cursorCol > 0) {
 					const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-					const graphemes = [...this.segment(beforeCursor, "grapheme")];
-					const lastGrapheme = graphemes[graphemes.length - 1];
+					const lastGrapheme = this.lastGrapheme(beforeCursor);
 					this.setCursorCol(this.state.cursorCol - (lastGrapheme ? lastGrapheme.segment.length : 1));
 				} else if (this.state.cursorLine > 0) {
 					// Wrap to end of previous logical line
@@ -2255,6 +2433,19 @@ export class Editor implements Component, Focusable {
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
 		return beforeCursor.trim() === "" || beforeCursor.trim() === "/";
+	}
+
+	/**
+	 * autocompleteTriggerPattern.test(textBeforeCursor). Every match has a trigger character (`@"` included), so text
+	 * without one is not tested: the anchored pattern is tried at each separator of the text, O(line) per keystroke.
+	 */
+	private matchesAutocompleteTrigger(textBeforeCursor: string): boolean {
+		const triggerCharacters = this.autocompleteTriggerCharacters;
+		for (let i = 0; i < triggerCharacters.length; i++) {
+			if (textBeforeCursor.includes(triggerCharacters[i]!))
+				return this.autocompleteTriggerPattern.test(textBeforeCursor);
+		}
+		return false;
 	}
 
 	private isInSlashCommandContext(textBeforeCursor: string): boolean {

@@ -1000,6 +1000,38 @@ describe("TUI fake cursor", () => {
 		tui.stop();
 	});
 
+	it("places the cursor and resolves fake cursors in frames where the cursor line did not change", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui = new TuiMainScreen(terminal, false);
+		const base = new TestComponent();
+		base.lines = ["first", `abc${CURSOR_MARKER}${renderFakeCursor("d")}ef`];
+		const other = new TestComponent();
+		other.lines = ["x"];
+		tui.addChild(base);
+		tui.addChild(other);
+		tui.start();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("abc\x1b[7md\x1b[27mef"));
+
+		// The cursor line is the same string as the frame before (resolved from the frame before): the cursor is placed.
+		terminal.clearWrites();
+		other.lines = ["y"];
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("y"));
+		assert.ok(terminal.getWrites().endsWith("\x1b[4G"));
+
+		// Showing the hardware cursor resolves the unchanged lines again: the focused fake cursor goes.
+		terminal.clearWrites();
+		tui.setShowHardwareCursor(true);
+		await terminal.waitForRender();
+		const viewport = await terminal.flushAndGetViewport();
+		assert.strictEqual(viewport[1]?.trimEnd(), "abcdef");
+		assert.ok(!terminal.getWrites().includes("\x1b[7md"));
+		assert.ok(terminal.getWrites().endsWith("\x1b[4G"));
+		tui.stop();
+	});
+
 	it("keeps the cursor when an overlay ends directly left of it", async () => {
 		for (const showHardwareCursor of [false, true]) {
 			const terminal = new LoggingVirtualTerminal(20, 5);
