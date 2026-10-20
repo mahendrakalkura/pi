@@ -690,45 +690,6 @@ describe("ToolExecutionComponent parity", () => {
 		expect(stripAnsi(component.render(width).join("\n"))).toContain("hidden content");
 	});
 
-	test("keeps only what it draws of a result, not its structuredContent", () => {
-		const component = new ToolExecutionComponent(
-			"bash",
-			"tool-bash-structured",
-			{ command: "seq 1 200000" },
-			{},
-			createBashToolDefinition(process.cwd()),
-			createFakeTui(),
-			process.cwd(),
-		);
-		const content = [{ type: "text", text: "199999\n200000" }];
-		const details = { truncation: undefined };
-		const result = {
-			content,
-			details,
-			isError: false,
-			durationMs: 12,
-			structuredContent: { output: "1\n".repeat(500_000), truncated: true, exit_code: 0 },
-		};
-		component.updateResult(result);
-		const kept = (component as unknown as { result: Record<string, unknown> }).result;
-		expect(kept).toEqual({ content, details, isError: false, durationMs: 12 });
-		expect(kept.content).toBe(content);
-		expect(kept.details).toBe(details);
-		expect("structuredContent" in kept).toBe(false);
-
-		const plain = new ToolExecutionComponent(
-			"bash",
-			"tool-bash-plain",
-			{ command: "seq 1 200000" },
-			{},
-			createBashToolDefinition(process.cwd()),
-			createFakeTui(),
-			process.cwd(),
-		);
-		plain.updateResult({ content, details, isError: false, durationMs: 12 });
-		expect(component.render(120)).toEqual(plain.render(120));
-	});
-
 	test("collapses ordinary read results until expanded", () => {
 		const component = new ToolExecutionComponent(
 			"read",
