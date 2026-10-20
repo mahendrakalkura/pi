@@ -283,11 +283,12 @@ async function runFdListing(
 	baseDir: string,
 	fdPath: string,
 	maxEntries: number,
+	signal: AbortSignal,
 ): Promise<IndexedFdEntry[] | undefined> {
 	const entries: IndexedFdEntry[] = [];
 	let lineCount = 0;
 	let partial = "";
-	const ok = await runFd(fdPath, fdWalkArgs(baseDir, "", maxEntries + 1), undefined, (chunk) => {
+	const ok = await runFd(fdPath, fdWalkArgs(baseDir, "", maxEntries + 1), signal, (chunk) => {
 		const lines = (partial + chunk).split("\n");
 		partial = lines.pop()!;
 		for (const line of lines) {
@@ -416,7 +417,9 @@ class FdFolderIndex {
 	private sessionGeneration = 0;
 	private listing: FdMatchList | undefined;
 	private narrowed: FdMatchList | undefined;
-	private building: { generation: number; promise: Promise<FdMatchList | undefined> } | undefined;
+	private building:
+		| { generation: number; promise: Promise<FdMatchList | undefined>; abort: AbortController }
+		| undefined;
 	private unusableUntil = 0;
 
 	constructor(fdPath: string, baseDir: string) {
@@ -431,6 +434,12 @@ class FdFolderIndex {
 			return;
 		}
 		this.sessionGeneration = this.build();
+	}
+
+	/** Stop the walk that is running, if any (a newer completion does not use it); its fd process is killed. */
+	cancelListing(): void {
+		this.building?.abort.abort();
+		this.building = undefined;
 	}
 
 	/** A complete list whose query `query` extends, from this completion's walk, if one is ready. */
@@ -483,12 +492,16 @@ class FdFolderIndex {
 	}
 
 	private build(): number {
+		// (A walk still running for an earlier completion would only be thrown away.)
+		this.cancelListing();
 		const generation = ++this.generation;
 		const walkedAt = Date.now();
-		const promise = runFdListing(this.baseDir, this.fdPath, FD_INDEX_MAX_ENTRIES)
+		const abort = new AbortController();
+		const promise = runFdListing(this.baseDir, this.fdPath, FD_INDEX_MAX_ENTRIES, abort.signal)
 			.catch(() => undefined)
 			.then((entries): FdMatchList | undefined => {
 				if (this.building?.generation === generation) this.building = undefined;
+				if (abort.signal.aborted) return undefined;
 				if (!entries) {
 					this.unusableUntil = Date.now() + FD_INDEX_RETRY_MS;
 					return undefined;
@@ -497,7 +510,7 @@ class FdFolderIndex {
 				if (!this.listing || this.listing.generation < generation) this.listing = list;
 				return list;
 			});
-		this.building = { generation, promise };
+		this.building = { generation, promise, abort };
 		return generation;
 	}
 }
@@ -564,6 +577,7 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	private fdIndexes = new Map<string, FdFolderIndex>();
 	/** The folder and @ token of the last @ completion request (a different one starts a new completion). */
 	private fdSessionKey: string | undefined;
+	private fdSessionIndex: FdFolderIndex | undefined;
 
 	constructor(commands: (SlashCommand | AutocompleteItem)[] = [], basePath: string, fdPath: string | null = null) {
 		this.commands = commands;
@@ -1081,14 +1095,19 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		} else {
 			index = new FdFolderIndex(this.fdPath!, fdBaseDir);
 			if (this.fdIndexes.size >= FD_INDEX_MAX_FOLDERS) {
-				this.fdIndexes.delete(this.fdIndexes.keys().next().value!);
+				const oldest = this.fdIndexes.keys().next().value!;
+				this.fdIndexes.get(oldest)?.cancelListing();
+				this.fdIndexes.delete(oldest);
 			}
 		}
 		this.fdIndexes.set(fdBaseDir, index);
 
 		const sessionKey = `${fdBaseDir}\0${tokenKey}`;
 		if (sessionKey !== this.fdSessionKey) {
+			// The previous completion is over: a walk of another folder still running for it is not needed.
+			if (this.fdSessionIndex !== index) this.fdSessionIndex?.cancelListing();
 			this.fdSessionKey = sessionKey;
+			this.fdSessionIndex = index;
 			index.startSession();
 		}
 
