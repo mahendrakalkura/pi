@@ -1,6 +1,16 @@
 import assert from "node:assert";
 import { spawnSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+	chmodSync,
+	existsSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	rmSync,
+	symlinkSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, mock, test } from "node:test";
@@ -255,6 +265,47 @@ describe("@ completion from an fd listing", { skip: !fdPath }, () => {
 		const items = await suggest(docsProvider, "see @notes");
 		assert.deepStrictEqual(items, await fdSuggestions(docsProvider, "notes"));
 		assert.ok(items.some((item) => item.value === `@"my folder/notes.txt"`));
+	});
+
+	test("stops a folder walk that a newer completion supersedes", async () => {
+		// An fd whose listing (the walk without a pattern) never ends, recording its process; the other walks work.
+		const pids = join(root, "listing-pids");
+		const wrapper = join(root, "fd-slow-listing.sh");
+		writeFileSync(
+			wrapper,
+			`#!/bin/sh\nfor arg in "$@"; do [ "$arg" = "100001" ] && { echo $$ >> "${pids}"; exec sleep 60; }; done\nexec "${fdPath}" "$@"\n`,
+		);
+		chmodSync(wrapper, 0o755);
+		const listings = () => readFileSync(pids, "utf-8").split("\n").filter(Boolean).map(Number);
+		const running = (pid: number) => {
+			try {
+				process.kill(pid, 0);
+				return true;
+			} catch {
+				return false;
+			}
+		};
+		const waitFor = async (check: () => boolean) => {
+			for (let i = 0; i < 200 && !check(); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+			return check();
+		};
+		const provider = new CombinedAutocompleteProvider([], root, wrapper);
+		try {
+			// Each key is answered by fd while the listing runs.
+			assert.deepStrictEqual(await suggest(provider, "see @readme.t"), await fdSuggestions(provider, "readme.t"));
+			assert.ok(await waitFor(() => existsSync(pids) && listings().length === 1));
+			// A new token in the same folder walks it again: the first walk is stopped.
+			await suggest(provider, "now see @readme.t");
+			assert.ok(await waitFor(() => listings().length === 2 && !running(listings()[0]!)));
+			// A completion in another folder: the walk of the first folder is stopped.
+			await suggest(provider, "and @docs/my");
+			assert.ok(await waitFor(() => listings().length === 3 && !running(listings()[1]!)));
+			assert.ok(running(listings()[2]!));
+		} finally {
+			for (const pid of existsSync(pids) ? listings() : []) {
+				if (running(pid)) process.kill(pid, "SIGKILL");
+			}
+		}
 	});
 
 	test("runs fd for each key when the folder cannot be listed, filtering complete results", async () => {
