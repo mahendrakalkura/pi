@@ -21,7 +21,13 @@ import {
 	readPngHeader,
 	readWebpHeader,
 } from "../src/utils/image-header.ts";
-import { resizeImageInProcess } from "../src/utils/image-resize-core.ts";
+import { keepValidImageWithinLimits, resizeImage } from "../src/utils/image-resize.ts";
+import {
+	readDisplayedImageSize,
+	resizeImageInProcess,
+	resolveImageResizeOptions,
+} from "../src/utils/image-resize-core.ts";
+import type { NativeImageConstructor } from "../src/utils/image-resize-native.ts";
 import { loadPhoton } from "../src/utils/photon.ts";
 
 // Small 2x2 blue JPEG image (baseline) - generated with ImageMagick
@@ -388,7 +394,76 @@ describe("image header parsers", () => {
 	});
 });
 
-describe("resizeImageInProcess without decoding", () => {
+/** Copy of `data` with byte `offset` set to `value`. */
+function withByte(data: Buffer, offset: number, value: number): Buffer {
+	const copy = Buffer.from(data);
+	copy[offset] = value;
+	return copy;
+}
+
+// Damaged image data with an intact structure: the header parsers accept these, photon rejects them.
+const DAMAGED_JPEG = withByte(bytes(JPEG_PROGRESSIVE_5X3), 555, 0xff);
+const DAMAGED_WEBP_LOSSLESS = withByte(bytes(WEBP_LOSSLESS_5X3), 59, 0xff);
+const DAMAGED_WEBP_LOSSY = withByte(bytes(WEBP_LOSSY_5X3), 31, 0x55);
+/** A GIF whose first LZW code after the clear code (4) is 7, a code not defined yet. */
+function damagedGif(): Buffer {
+	const gif = createGif(6, 4, [[0, 0, 6, 4]]);
+	// Image data starts after the header (13), colour table (6), GCE (8) and descriptor (10): the
+	// minimum code size, the sub-block size, then the codes packed 3 bits each, least significant first.
+	const codes = 13 + 6 + 8 + 10 + 2;
+	gif[codes] = 4 | (7 << 3);
+	return gif;
+}
+
+/** A PNG whose chunk CRCs are valid but whose compressed pixel data is cut short. */
+function damagedPng(): Buffer {
+	const ihdr = Buffer.alloc(13);
+	ihdr.writeUInt32BE(30, 0);
+	ihdr.writeUInt32BE(20, 4);
+	ihdr[8] = 8;
+	const raw = deflateSync(Buffer.alloc(31 * 20, 7));
+	return Buffer.concat([
+		PNG_SIGNATURE,
+		pngChunk("IHDR", ihdr),
+		pngChunk("IDAT", raw.subarray(0, 4)),
+		pngChunk("IEND", Buffer.alloc(0)),
+	]);
+}
+
+/** A stand-in for Bun.Image whose decode succeeds or fails, recording what it was given. */
+function fakeNativeImage(decodes: boolean, log: Uint8Array[]): NativeImageConstructor {
+	return class {
+		constructor(input: Uint8Array) {
+			log.push(input);
+		}
+		resize() {
+			return this;
+		}
+		rotate() {
+			return this;
+		}
+		flip() {
+			return this;
+		}
+		flop() {
+			return this;
+		}
+		png() {
+			return this;
+		}
+		jpeg() {
+			return this;
+		}
+		async bytes(): Promise<Uint8Array> {
+			if (!decodes) throw new Error("ERR_IMAGE_DECODE_FAILED");
+			return new Uint8Array(1);
+		}
+	};
+}
+
+describe("images within the limits", () => {
+	const opts = resolveImageResizeOptions();
+
 	beforeEach(() => {
 		photonLoads.count = 0;
 	});
@@ -396,22 +471,71 @@ describe("resizeImageInProcess without decoding", () => {
 		photonLoads.count = 0;
 	});
 
-	it("returns an image within the limits as it is, without loading photon", async () => {
-		const png = createPng(300, 200);
-		const result = await resizeImageInProcess(png, "image/png");
+	it("are returned as they are when the native decoder decodes them (PNG, WebP)", async () => {
+		const log: Uint8Array[] = [];
+		const webp = bytes(WEBP_LOSSY_5X3);
+		const result = await keepValidImageWithinLimits(webp, "image/webp", 5, 3, opts, fakeNativeImage(true, log));
 		expect(result).toEqual({
-			data: png.toString("base64"),
-			mimeType: "image/png",
-			originalWidth: 300,
-			originalHeight: 200,
-			width: 300,
-			height: 200,
+			data: WEBP_LOSSY_5X3,
+			mimeType: "image/webp",
+			originalWidth: 5,
+			originalHeight: 3,
+			width: 5,
+			height: 3,
 			wasResized: false,
+		});
+		expect(log).toEqual([webp]);
+		const png = createPng(300, 200);
+		expect(
+			await keepValidImageWithinLimits(png, "image/png", 300, 200, opts, fakeNativeImage(true, [])),
+		).toMatchObject({
+			data: png.toString("base64"),
 		});
 		expect(photonLoads.count).toBe(0);
 	});
 
-	it("uses the displayed size of an EXIF-rotated JPEG", async () => {
+	it("take the photon path when the native decoder fails", async () => {
+		expect(
+			await keepValidImageWithinLimits(DAMAGED_WEBP_LOSSY, "image/webp", 5, 3, opts, fakeNativeImage(false, [])),
+		).toBeUndefined();
+		expect(
+			await keepValidImageWithinLimits(damagedPng(), "image/png", 30, 20, opts, fakeNativeImage(false, [])),
+		).toBeUndefined();
+	});
+
+	it.each([
+		["JPEG", "image/jpeg", bytes(JPEG_2X2), 2, 2],
+		["GIF", "image/gif", createGif(6, 4, [[0, 0, 6, 4]]), 6, 4],
+	])(
+		"take the photon path for %s even when the native decoder accepts it",
+		async (_name, mimeType, data, width, height) => {
+			const log: Uint8Array[] = [];
+			expect(
+				await keepValidImageWithinLimits(data, mimeType, width, height, opts, fakeNativeImage(true, log)),
+			).toBeUndefined();
+			expect(log).toEqual([]);
+		},
+	);
+
+	it("take the photon path without a native decoder", async () => {
+		expect(
+			await keepValidImageWithinLimits(createPng(300, 200), "image/png", 300, 200, opts, undefined),
+		).toBeUndefined();
+		expect(await keepValidImageWithinLimits(bytes(JPEG_2X2), "image/jpeg", 2, 2, opts, undefined)).toBeUndefined();
+		expect(
+			await keepValidImageWithinLimits(bytes(WEBP_LOSSY_5X3), "image/webp", 5, 3, opts, undefined),
+		).toBeUndefined();
+	});
+
+	it("are not kept when over the limits", async () => {
+		const png = createPng(300, 200);
+		const small = resolveImageResizeOptions({ maxWidth: 299 });
+		expect(
+			await keepValidImageWithinLimits(png, "image/png", 300, 200, small, fakeNativeImage(true, [])),
+		).toBeUndefined();
+	});
+
+	it("use the displayed size of an EXIF-rotated JPEG", () => {
 		// 2x1 stored, orientation 6 (rotate 90 degrees): displayed as 1x2.
 		const jpeg2x1 = editJpegSegment(bytes(JPEG_2X2), 0xc0, (s) => {
 			s.writeUInt16BE(1, 5);
@@ -419,13 +543,51 @@ describe("resizeImageInProcess without decoding", () => {
 		});
 		const rotated = Buffer.concat([jpeg2x1.subarray(0, 2), app1Exif(6), jpeg2x1.subarray(2)]);
 		expect(readJpegHeader(rotated)).toEqual({ width: 2, height: 1 });
+		expect(readDisplayedImageSize(rotated, "image/jpeg")).toEqual({ width: 1, height: 2 });
+	});
+});
 
-		const result = await resizeImageInProcess(rotated, "image/jpeg", { maxWidth: 1, maxHeight: 2 });
-		expect(result).toMatchObject({ data: rotated.toString("base64"), width: 1, height: 2, wasResized: false });
-		expect(photonLoads.count).toBe(0);
+describe("resizeImage with damaged image data (as in 0.9.5: photon rejects it, the image is omitted)", () => {
+	const damaged: [string, string, Buffer][] = [
+		["JPEG", "image/jpeg", DAMAGED_JPEG],
+		["lossless WebP", "image/webp", DAMAGED_WEBP_LOSSLESS],
+		["lossy WebP", "image/webp", DAMAGED_WEBP_LOSSY],
+		["GIF", "image/gif", damagedGif()],
+		["PNG with valid CRCs", "image/png", damagedPng()],
+	];
+
+	it.each(damaged)(
+		"%s: the header is accepted, photon rejects the data, the result is null",
+		async (_name, mimeType, data) => {
+			expect(readImageHeader(data, mimeType)).toBeDefined();
+			const photon = (await loadPhoton())!;
+			expect(() => photon.PhotonImage.new_from_byteslice(data)).toThrow();
+			expect(await resizeImage(data, mimeType)).toBeNull();
+		},
+	);
+
+	it("PNG with a wrong checksum: the header is rejected, the result is null", async () => {
+		const png = createPng(30, 20);
+		png[png.length - 13] ^= 0xff;
+		expect(readPngHeader(png)).toBeUndefined();
+		expect(await resizeImage(png, "image/png")).toBeNull();
 	});
 
-	it("falls back to decoding when the header cannot be read", async () => {
+	it.each([
+		["PNG", "image/png", createPng(30, 20).toString("base64")],
+		["JPEG", "image/jpeg", JPEG_PROGRESSIVE_5X3],
+		["WebP", "image/webp", WEBP_LOSSY_5X3],
+	])("an intact %s is returned as it is", async (_name, mimeType, base64) => {
+		expect(await resizeImage(bytes(base64), mimeType)).toMatchObject({ data: base64, wasResized: false });
+	});
+});
+
+describe("resizeImageInProcess", () => {
+	beforeEach(() => {
+		photonLoads.count = 0;
+	});
+
+	it("decodes when the header cannot be read", async () => {
 		// Trailing bytes after IEND: the header parser gives up, photon still decodes the file.
 		const png = Buffer.concat([createPng(30, 20), Buffer.from("trailer")]);
 		expect(readPngHeader(png)).toBeUndefined();
@@ -435,12 +597,12 @@ describe("resizeImageInProcess without decoding", () => {
 		expect(photonLoads.count).toBe(1);
 	});
 
-	it("falls back to decoding, and omits the image, when a PNG checksum is wrong", async () => {
+	it("omits the image when a PNG checksum is wrong", async () => {
 		const png = createPng(30, 20);
 		png[png.length - 13] ^= 0xff;
 
+		expect(readPngHeader(png)).toBeUndefined();
 		expect(await resizeImageInProcess(png, "image/png")).toBeNull();
-		expect(photonLoads.count).toBe(1);
 	});
 
 	it("decodes an image over the limits and encodes only until a candidate fits", async () => {
