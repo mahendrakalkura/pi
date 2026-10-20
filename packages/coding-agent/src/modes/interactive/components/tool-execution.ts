@@ -213,14 +213,7 @@ export class ToolExecutionComponent extends Container {
 		},
 		isPartial = false,
 	): void {
-		// Only what is drawn: a result also carries what other consumers read, such as `structuredContent` (a bash call's
-		// output up to 1 MB, of which the content shows 50 KB), which the component would otherwise keep for the session.
-		this.result = {
-			content: result.content,
-			isError: result.isError,
-			...(result.details === undefined ? {} : { details: result.details }),
-			...(result.durationMs === undefined ? {} : { durationMs: result.durationMs }),
-		};
+		this.result = result;
 		this.isPartial = isPartial;
 		this.updateDisplay();
 	}
