@@ -100,14 +100,28 @@ function substituteItems(
 }
 
 /**
+ * The toJSON cacheJsonSerialization gives an array: a copy of it with long strings replaced by their cached raw JSON,
+ * which JSON.stringify serializes to the same text as the array.
+ */
+export function cachedArrayToJSON(this: unknown[]): unknown {
+	try {
+		if (!rawJSON) return this;
+		startGeneration();
+		return substituteItems(this, rawJSON, new Set());
+	} catch {
+		// JSON.stringify serializes what toJSON returns without calling it again: the array as it is.
+		return this;
+	}
+}
+
+/**
  * Makes JSON.stringify of `items` (a request's messages) reuse the serialized form of long strings serialized before,
  * by defining a non-enumerable toJSON on the array. Does nothing to anything but an extensible plain array without a
  * toJSON (an onPayload hook may return a frozen one). Never throws.
  */
 export function cacheJsonSerialization(items: unknown): void {
-	const toRaw = rawJSON;
 	if (
-		!toRaw ||
+		!rawJSON ||
 		!isRawJSON ||
 		!Array.isArray(items) ||
 		Object.getPrototypeOf(items) !== Array.prototype ||
@@ -118,15 +132,7 @@ export function cacheJsonSerialization(items: unknown): void {
 	}
 	try {
 		Object.defineProperty(items, "toJSON", {
-			value(this: unknown[]): unknown {
-				try {
-					startGeneration();
-					return substituteItems(this, toRaw, new Set());
-				} catch {
-					// JSON.stringify serializes what toJSON returns without calling it again: the array as it is.
-					return this;
-				}
-			},
+			value: cachedArrayToJSON,
 			configurable: true,
 			writable: true,
 			enumerable: false,
