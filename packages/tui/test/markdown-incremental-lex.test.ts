@@ -1,6 +1,11 @@
 import assert from "node:assert";
 import { describe, it } from "node:test";
-import { lexMarkdownForTest, Markdown, setMarkdownCachingForTest } from "../src/components/markdown.ts";
+import {
+	lexMarkdownForTest,
+	Markdown,
+	setMarkdownCachingForTest,
+	setMarkdownFastPathsForTest,
+} from "../src/components/markdown.ts";
 import { defaultMarkdownTheme } from "./test-themes.ts";
 
 // A message that streams in is lexed again each time it grows, from the last block on. The tokens must be what lexing all of
@@ -270,6 +275,42 @@ describe("Markdown lexing of a growing source", () => {
 			previous = tokens;
 		}
 		assert.ok(reused > 500, `only ${reused} tokens were reused`);
+	});
+
+	it("a block that the last one settles, or that lexes to the same token again, is the token from before", () => {
+		for (const fastPaths of [true, false]) {
+			setMarkdownFastPathsForTest(fastPaths);
+			try {
+				// A list, then a paragraph that grows past its first line: the list is not lexed again. A code block, then
+				// a paragraph on its first line: the code block is lexed again, to the same token.
+				const cases = [
+					{ head: "- one\n- two\n\nA paragraph", grow: [" that grows", "\nand a second line", " that grows too"] },
+					{ head: "```ts\nconst a = 1;\n```\nA paragraph", grow: [" that", " grows", " on its first line"] },
+				];
+				for (const { head, grow } of cases) {
+					let source = `<!-- settled ${Math.random()} -->\n\n${head}`;
+					let previous = lexMarkdownForTest(source);
+					const block = previous[2]!;
+					assert.ok(block.type === "list" || block.type === "code");
+					const lines = new Markdown(source, 1, 0, defaultMarkdownTheme).render(60);
+					for (const text of grow) {
+						source += text;
+						const tokens = lexMarkdownForTest(source);
+						assert.strictEqual(
+							tokens[2] === previous[2],
+							fastPaths,
+							`${JSON.stringify(source)}: ${tokens[2]!.type}`,
+						);
+						previous = tokens;
+					}
+					const grown = new Markdown(source, 1, 0, defaultMarkdownTheme).render(60);
+					// (The block's lines come first, after the comment's.)
+					assert.deepStrictEqual(grown.slice(0, 4), lines.slice(0, 4));
+				}
+			} finally {
+				setMarkdownFastPathsForTest(true);
+			}
+		}
 	});
 
 	it("a source that is not the earlier one with text added is lexed whole", () => {

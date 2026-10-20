@@ -230,20 +230,65 @@ function ownString(text: string): string {
 	return JSON.parse(JSON.stringify(text)) as string;
 }
 
+/** Whether two tokens are the same in every field, in every token in them. */
+function sameTokens(a: unknown, b: unknown): boolean {
+	if (a === b) return true;
+	if (typeof a !== "object" || typeof b !== "object" || a === null || b === null) return false;
+	if (Array.isArray(a)) {
+		if (!Array.isArray(b) || a.length !== b.length) return false;
+		for (let i = 0; i < a.length; i++) if (!sameTokens(a[i], b[i])) return false;
+		return true;
+	}
+	if (Array.isArray(b)) return false;
+	const aFields = a as Record<string, unknown>;
+	const bFields = b as Record<string, unknown>;
+	const keys = Object.keys(aFields);
+	if (keys.length !== Object.keys(bFields).length) return false;
+	for (const key of keys) {
+		if (!Object.hasOwn(bFields, key) || !sameTokens(aFields[key], bFields[key])) return false;
+	}
+	return true;
+}
+
+let fastPaths = true;
+
+/** Block types that marked tries before a paragraph or a setext heading: what they are is known from their first line. */
+const SELF_STARTING_BLOCKS = new Set(["code", "heading", "hr", "list", "blockquote", "table", "html"]);
+
+/**
+ * Whether the block at `before` ends where it does whatever text is added after the block at `last` (the last of
+ * `tokens`, with only blank lines between the two): when `last` is past its first line that is not blank, that line is
+ * known, and a block that starts as SELF_STARTING_BLOCKS do ends at the first line it cannot take. Not a paragraph: a
+ * setext underline lines later can make a heading of it and of the lines after it that an extension's block (`$$`) took.
+ */
+function lastBlockSettlesOneBefore(tokens: readonly Token[], before: number, last: number): boolean {
+	if (!fastPaths || before < 0 || !SELF_STARTING_BLOCKS.has(tokens[before]!.type)) return false;
+	// (A block's raw text can begin with lines of spaces.)
+	const raw = tokens[last]!.raw;
+	const text = raw.search(/\S/);
+	return text >= 0 && raw.includes("\n", text);
+}
+
 /**
  * The tokens of `source`, which is `previous.source` with text added at its end. Where a top-level block ends depends on the
  * line that follows it and on nothing after that line. The last block may still be on its first line ("2" turning into "2."
  * makes it an item of the list before it), so the block before it is not settled either: the blocks before those two are
- * what they were, and the text from the last two on is lexed.
+ * what they were, and the text from the last two on is lexed. Once the last block is past that line, the block before it
+ * is settled too when lastBlockSettlesOneBefore() says so, and only the last block is lexed.
  * Undefined when that would not give what lexing all of it gives: link definitions change how links before them read.
  */
 function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | undefined {
 	let last = previous.tokens.length;
+	let lastBlock = -1;
 	for (let blocks = 0; blocks < 2; blocks++) {
 		last--;
 		while (last >= 0 && previous.tokens[last].type === "space") {
 			last--;
 		}
+		if (blocks === 1 && lastBlock >= 0 && lastBlockSettlesOneBefore(previous.tokens, last, lastBlock)) {
+			last = lastBlock;
+		}
+		if (blocks === 0) lastBlock = last;
 	}
 	if (last <= 0) {
 		return undefined;
@@ -262,7 +307,27 @@ function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | un
 	}
 	const tokens = previous.tokens.slice(0, last);
 	let length = offset;
-	for (const token of added) {
+	// A block lexed again to what it was lexed to before (while a reply streams in, all of them but the last, which grows)
+	// is the token it was lexed to before: the lines rendered for that one are kept with it (renderBlock()), and a block
+	// such as a list or a code block is not rendered and highlighted again for each chunk added after it. The same text
+	// can be lexed to a token with other contents (a paragraph whose lines were added to it one by one keeps their
+	// indentation in one case and not in the other), so the tokens are compared in full. The last token is always the
+	// new one: trimPartialClosingFences() may change it.
+	let shared = last;
+	for (let i = 0; i < added.length; i++) {
+		let token = added[i]!;
+		const before = previous.tokens[last + i];
+		if (
+			fastPaths &&
+			shared === last + i &&
+			i < added.length - 1 &&
+			before !== undefined &&
+			before.raw === token.raw &&
+			sameTokens(before, token)
+		) {
+			token = before;
+			shared++;
+		}
 		tokens.push(token);
 		length += token.raw.length;
 	}
@@ -270,7 +335,7 @@ function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | un
 	if (length !== source.length) {
 		return undefined;
 	}
-	lexedFrom.set(tokens, { tokens: new WeakRef(previous.tokens), shared: last });
+	lexedFrom.set(tokens, { tokens: new WeakRef(previous.tokens), shared });
 	return tokens;
 }
 
@@ -430,6 +495,14 @@ let markdownCaching = true;
 /** For tests: with caching off, every render lexes and renders all of its text, taking and keeping nothing. */
 export function setMarkdownCachingForTest(enabled: boolean): void {
 	markdownCaching = enabled;
+}
+
+/**
+ * For tests: with this off, a source with text added is lexed again from its last two blocks always, and every block
+ * lexed again is a new token (lexAddedMarkdown()), as before either was kept.
+ */
+export function setMarkdownFastPathsForTest(enabled: boolean): void {
+	fastPaths = enabled;
 }
 
 /** For tests: lexes as render() does. */
