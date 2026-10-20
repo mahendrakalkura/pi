@@ -196,6 +196,32 @@ describe("jsonBodyParts", () => {
 		expect(() => encode({ messages: [{ n: 1n }] }, "messages", "c")).toThrow(TypeError);
 	});
 
+	it("reads the array by index, as JSON.stringify does, never through an iterator of its own", () => {
+		let iterated = 0;
+		const withIterator = <T>(items: T[]): T[] =>
+			Object.defineProperty(items, Symbol.iterator, {
+				value: () => {
+					iterated++;
+					// Skips everything, and changes the array: neither may affect the body.
+					items.push({ role: "user", content: "added by the iterator" } as T);
+					return [][Symbol.iterator]();
+				},
+			});
+		// An item with its own toJSON that the iterator would hide: still left to JSON.stringify.
+		expect(
+			encode({ messages: withIterator([{ role: "user" }, { toJSON: (key: string) => key }]) }, "messages", "c"),
+		).toBeUndefined();
+		const plain = withIterator([
+			{ role: "user", content: long("a ") },
+			{ role: "assistant", content: "b" },
+		]);
+		for (let request = 0; request < 2; request++) {
+			expectSame({ model: "m", messages: plain }, "messages", "iterator");
+		}
+		expect(iterated).toBe(0);
+		expect(plain).toHaveLength(2);
+	});
+
 	it("accepts the array toJSON of json-body.ts, which serializes the array as it is", () => {
 		const items = awkward();
 		cacheJsonSerialization(items);
