@@ -42,7 +42,6 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { type ClientIdentity, getIdentityHeaders } from "../utils/identity.ts";
-import { cacheJsonSerialization } from "../utils/json-body.ts";
 import { parseJsonWithRepair } from "../utils/json-parse.ts";
 import {
 	applyOpenRouterReportedCost,
@@ -51,6 +50,7 @@ import {
 } from "../utils/openrouter-cost.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { cacheRequestBody } from "../utils/request-body.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { iterateSseMessages } from "../utils/sse.ts";
 import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
@@ -766,7 +766,8 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				if (nextParams !== undefined) {
 					params = { ...(nextParams as MessageCreateParamsStreaming), stream: true };
 				}
-				cacheJsonSerialization(params.messages);
+				// A client passed in by the caller is not wrapped.
+				cacheRequestBody(options?.client ? undefined : client, params.messages, "messages", options?.sessionId);
 				const prepared =
 					threadSessionId !== undefined && options?.disableContinuation !== true
 						? prepareThreadRequest(model, threadSessionId, params)
