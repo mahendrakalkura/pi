@@ -6,7 +6,7 @@ import { encodeWithinLimits, type ImageResizeOptions, type ResizedImage } from "
  * so the shape is declared locally; it matches `packages/bun-types/bun.d.ts` of the pinned runtime.
  */
 interface NativeImagePipeline {
-	resize(width: number, height: number, options: { filter: "lanczos3"; fit: "fill" }): NativeImagePipeline;
+	resize(width: number, height: number, options: { filter: "lanczos3" | "box"; fit: "fill" }): NativeImagePipeline;
 	rotate(degrees: number): NativeImagePipeline;
 	flip(): NativeImagePipeline;
 	flop(): NativeImagePipeline;
@@ -15,7 +15,7 @@ interface NativeImagePipeline {
 	bytes(): Promise<Uint8Array>;
 }
 
-type NativeImageConstructor = new (input: Uint8Array, options: { autoOrient: boolean }) => NativeImagePipeline;
+export type NativeImageConstructor = new (input: Uint8Array, options: { autoOrient: boolean }) => NativeImagePipeline;
 
 /** `Bun.Image` when the runtime has it (Bun, including Pi-Bolt's runtime), else undefined (Node). */
 export function getNativeImage(): NativeImageConstructor | undefined {
@@ -80,4 +80,20 @@ export function resizeImageNative(
 			free: () => {},
 		};
 	});
+}
+
+/**
+ * Whether the native decoder decodes the whole image without an error. A full decode to a 1x1 box
+ * average: about 4-6 ms for a 1600x1200 JPEG or a 1800x1100 PNG, 25-35 ms for WebP and GIF.
+ */
+export async function decodesNatively(NativeImage: NativeImageConstructor, inputBytes: Uint8Array): Promise<boolean> {
+	try {
+		await new NativeImage(inputBytes, { autoOrient: false })
+			.resize(1, 1, { filter: "box", fit: "fill" })
+			.png()
+			.bytes();
+		return true;
+	} catch {
+		return false;
+	}
 }
