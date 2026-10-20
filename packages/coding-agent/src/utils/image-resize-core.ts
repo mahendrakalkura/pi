@@ -59,6 +59,16 @@ function base64Size(byteLength: number): number {
 	return Math.ceil(byteLength / 3) * 4;
 }
 
+/** Whether an image of this displayed size (after EXIF orientation) and byte length needs no change. */
+export function isWithinLimits(
+	width: number,
+	height: number,
+	byteLength: number,
+	opts: Required<ImageResizeOptions>,
+): boolean {
+	return width <= opts.maxWidth && height <= opts.maxHeight && base64Size(byteLength) < opts.maxBytes;
+}
+
 /**
  * The input as it is when it is already within the dimension and size limits, else undefined.
  * `width` and `height` are the displayed size (after EXIF orientation).
@@ -70,9 +80,7 @@ export function keepIfWithinLimits(
 	height: number,
 	opts: Required<ImageResizeOptions>,
 ): ResizedImage | undefined {
-	if (width > opts.maxWidth || height > opts.maxHeight || base64Size(inputBytes.byteLength) >= opts.maxBytes) {
-		return undefined;
-	}
+	if (!isWithinLimits(width, height, inputBytes.byteLength, opts)) return undefined;
 	const format = mimeType.split("/")[1] ?? "png";
 	return {
 		data: Buffer.from(inputBytes.buffer, inputBytes.byteOffset, inputBytes.byteLength).toString("base64"),
@@ -162,9 +170,9 @@ export async function encodeWithinLimits(
  * Resize an image to fit within the specified max dimensions and encoded file size.
  * Returns null if the image cannot be resized below maxBytes.
  *
- * An image whose header shows it is already within the limits is returned as it is, without
- * decoding. Otherwise Photon (Rust/WASM) decodes it once and resizes it (see encodeWithinLimits).
- * If Photon is not available, returns null.
+ * Photon (Rust/WASM) decodes the image once; an image within the limits is returned as it is, and
+ * one over them is resized (see encodeWithinLimits). If Photon is not available or cannot decode
+ * the image, returns null. resizeImage skips this decode when it can show the image is valid.
  */
 export async function resizeImageInProcess(
 	inputBytes: Uint8Array,
@@ -172,11 +180,6 @@ export async function resizeImageInProcess(
 	options?: ImageResizeOptions,
 ): Promise<ResizedImage | null> {
 	const opts = resolveImageResizeOptions(options);
-
-	const size = readDisplayedImageSize(inputBytes, mimeType);
-	const unchanged = size && keepIfWithinLimits(inputBytes, mimeType, size.width, size.height, opts);
-	if (unchanged) return unchanged;
-
 	const photon = await loadPhoton();
 	if (!photon) {
 		return null;

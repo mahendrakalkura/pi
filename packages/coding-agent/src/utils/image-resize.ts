@@ -2,6 +2,7 @@ import type { Worker } from "node:worker_threads";
 import {
 	IMAGE_RESIZE_WORKER_RESPONSE_TYPE,
 	type ImageResizeOptions,
+	isWithinLimits,
 	keepIfWithinLimits,
 	type ResizedImage,
 	type ResizeImageWorkerResponse,
@@ -9,7 +10,12 @@ import {
 	resizeImageInProcess,
 	resolveImageResizeOptions,
 } from "./image-resize-core.ts";
-import { getNativeImage, resizeImageNative } from "./image-resize-native.ts";
+import {
+	decodesNatively,
+	getNativeImage,
+	type NativeImageConstructor,
+	resizeImageNative,
+} from "./image-resize-native.ts";
 
 export type { ImageResizeOptions, ResizedImage } from "./image-resize-core.ts";
 
@@ -80,10 +86,35 @@ async function resizeImageInWorker(
 }
 
 /**
+ * The input as it is, when its header shows it is within the limits and its data is known to
+ * decode, else undefined (the caller then decodes it with photon, which also rejects damaged data).
+ *
+ * - PNG and WebP, with a native image pipeline: the native decoder must decode it.
+ * - Not JPEG or GIF: the native decoders accept damaged data photon rejects (libjpeg-turbo decodes
+ *   corrupt or truncated scan data with only a warning), and such an image must still be omitted.
+ * - Not without a native pipeline (Node, where photon runs with a JIT): photon decodes it as before.
+ */
+export async function keepValidImageWithinLimits(
+	inputBytes: Uint8Array,
+	mimeType: string,
+	width: number,
+	height: number,
+	opts: Required<ImageResizeOptions>,
+	NativeImage: NativeImageConstructor | undefined,
+): Promise<ResizedImage | undefined> {
+	if (!isWithinLimits(width, height, inputBytes.byteLength, opts)) return undefined;
+	if (!NativeImage || (mimeType !== "image/png" && mimeType !== "image/webp")) return undefined;
+	if (!(await decodesNatively(NativeImage, inputBytes))) return undefined;
+	return keepIfWithinLimits(inputBytes, mimeType, width, height, opts);
+}
+
+/**
  * Resize an image to fit within the specified max dimensions and encoded file size.
  *
- * - An image whose header shows it is within the limits is returned as it is, without decoding.
- * - Otherwise, when the runtime has a native image pipeline (`Bun.Image`), it resizes there.
+ * - An image within the limits whose data is known to decode is returned as it is, without photon
+ *   (see keepValidImageWithinLimits).
+ * - An image over the limits, when the runtime has a native image pipeline (`Bun.Image`), is
+ *   resized there.
  * - Otherwise, or when the header cannot be read or the native pipeline fails, Photon runs in a
  *   worker thread so WASM decoding, resizing, and encoding do not block the TUI event loop. If the
  *   worker cannot be loaded (for example in some Bun compiled executable layouts), fall back to
@@ -97,10 +128,18 @@ export async function resizeImage(
 	const opts = resolveImageResizeOptions(options);
 	const size = readDisplayedImageSize(inputBytes, mimeType);
 	if (size) {
-		const unchanged = keepIfWithinLimits(inputBytes, mimeType, size.width, size.height, opts);
-		if (unchanged) return unchanged;
 		const NativeImage = getNativeImage();
-		if (NativeImage) {
+		if (isWithinLimits(size.width, size.height, inputBytes.byteLength, opts)) {
+			const unchanged = await keepValidImageWithinLimits(
+				inputBytes,
+				mimeType,
+				size.width,
+				size.height,
+				opts,
+				NativeImage,
+			);
+			if (unchanged) return unchanged;
+		} else if (NativeImage) {
 			try {
 				return await resizeImageNative(NativeImage, inputBytes, size.width, size.height, opts);
 			} catch {}
