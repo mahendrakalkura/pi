@@ -107,6 +107,15 @@ describe("InteractiveMode tree navigation availability", () => {
 		expect(ui.showError).not.toHaveBeenCalled();
 	});
 
+	it("re-renders the branch without refilling editor history", async () => {
+		const { ui, select } = createTreeUI();
+
+		await select();
+
+		expect(ui.session.navigateTree).toHaveBeenCalledOnce();
+		expect(ui.renderInitialMessages).toHaveBeenCalledWith({ populateHistory: false });
+	});
+
 	it("still aborts an active response before navigating", async () => {
 		const { ui, select } = createTreeUI();
 		ui.session.isStreaming = true;
