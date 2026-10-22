@@ -167,6 +167,9 @@ const MESSAGES = [
 // (Not narrower: at a wrapping width of 1 the editor recurses without end on a wide character, before and after this.)
 const WIDTHS = [100, 120, 80, 40, 20, 12, 7, 8, 9, 200];
 
+/** Steps that change what both docks read (timers, the footer's data, the theme, the environment): applied once. */
+const SHARED_STEPS = new Set(["spinner", "footer", "theme kept", "environment"]);
+
 /** `draw(count)`: a choice from 0 to count - 1, the same for both docks. */
 type Step = { name: string; apply: (dock: Dock, draw: (count: number) => number) => void };
 
@@ -303,6 +306,29 @@ function steps(state: FooterState): Step[] {
 				dock.root.invalidate();
 			},
 		},
+		{
+			// The theme changed with nothing invalidated: what the editor and the footer keep must not hide it. (The
+			// spinner takes the new colors at its next tick.)
+			name: "theme kept",
+			apply: (_dock, draw) => {
+				initTheme(draw(2) === 0 ? "light" : "dark");
+				vi.advanceTimersByTime(80);
+			},
+		},
+		{
+			name: "focus",
+			apply: (dock) => {
+				dock.editor.focused = !dock.editor.focused;
+			},
+		},
+		{ name: "padding", apply: (dock, draw) => dock.editor.setPaddingX(draw(4)) },
+		{
+			name: "environment",
+			apply: (_dock, draw) => {
+				if (draw(2) === 0) vi.stubEnv("PI_EXPERIMENTAL", process.env.PI_EXPERIMENTAL === "1" ? "0" : "1");
+				else vi.stubEnv("HOME", choose(["/tmp", "/home/user", "/tmp/project"], draw));
+			},
+		},
 	];
 }
 
@@ -357,8 +383,7 @@ describe("input dock frames", () => {
 						});
 						// (The timers and the footer's data are shared: they changed for both.)
 						let replayed = 0;
-						if (step.name !== "spinner" && step.name !== "footer")
-							step.apply(reference, () => draws[replayed++]!);
+						if (!SHARED_STEPS.has(step.name)) step.apply(reference, () => draws[replayed++]!);
 						log.push(`${step.name}${draws.length > 0 ? `(${draws.join(",")})` : ""}`);
 						const label = log.slice(-12).join(" ");
 

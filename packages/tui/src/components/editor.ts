@@ -756,7 +756,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	invalidate(): void {
-		// No cached state to invalidate currently
+		this.renderedText = undefined;
 	}
 
 	protected renderTopBorder(width: number, hiddenLineCount: number): string {
@@ -767,6 +767,57 @@ export class Editor implements Component, Focusable {
 	protected renderBottomBorder(width: number, hiddenLineCount: number): string {
 		const border = hiddenLineCount > 0 ? createScrollBorder("↓", hiddenLineCount, width) : "─".repeat(width);
 		return this.borderColor(border);
+	}
+
+	/**
+	 * The text lines (between the borders) render() drew last without an autocomplete list, and everything they were drawn
+	 * from: the editor's text, cursor and scroll position, width, padding, focus, the terminal's height and the paste IDs.
+	 * While a reply streams in, the editor is drawn on every frame and nothing of this changes: its lines are kept, and only
+	 * the borders, whose colors and status the editor does not own, are drawn again.
+	 */
+	private renderedText?: {
+		width: number;
+		paddingX: number;
+		terminalRows: number;
+		focused: boolean;
+		pasteIds: string;
+		lines: readonly string[];
+		cursorLine: number;
+		cursorCol: number;
+		/** The scroll position the lines were drawn at: render() adjusts it, and it is what it was set to then. */
+		scrollOffset: number;
+		visibleLineCount: number;
+		linesBelow: number;
+		textLines: readonly string[];
+		/** The lines render() returned, with the borders they were returned with. */
+		result: readonly string[];
+	};
+
+	/** Whether the text lines in `known` are what render() would draw now (renderedText). */
+	private isRenderedText(
+		known: NonNullable<Editor["renderedText"]>,
+		width: number,
+		terminalRows: number,
+		pasteIds: string,
+	): boolean {
+		const lines = this.state.lines;
+		if (
+			known.width !== width ||
+			known.paddingX !== this.paddingX ||
+			known.terminalRows !== terminalRows ||
+			known.focused !== this.focused ||
+			known.pasteIds !== pasteIds ||
+			known.cursorLine !== this.state.cursorLine ||
+			known.cursorCol !== this.state.cursorCol ||
+			known.scrollOffset !== this.scrollOffset ||
+			known.lines.length !== lines.length
+		) {
+			return false;
+		}
+		for (let i = 0; i < lines.length; i++) {
+			if (known.lines[i] !== lines[i]) return false;
+		}
+		return true;
 	}
 
 	render(width: number): string[] {
@@ -781,11 +832,31 @@ export class Editor implements Component, Focusable {
 		// Store for cursor navigation (must match wrapping width)
 		this.lastWidth = layoutWidth;
 
+		const terminalRows = this.tui.terminal.rows;
+		const showAutocomplete = Boolean(this.autocompleteState && this.autocompleteList);
+		const known = this.renderedText;
+		if (!showAutocomplete && known !== undefined) {
+			const pasteIds = this.pastes.size === 0 ? "" : [...this.pastes.keys()].join(",");
+			if (this.isRenderedText(known, width, terminalRows, pasteIds)) {
+				this.renderedVisibleLineCount = known.visibleLineCount;
+				this.renderedAutocompleteHeight = 0;
+				const top = this.renderTopBorder(width, this.scrollOffset);
+				const bottom = this.renderBottomBorder(width, known.linesBelow);
+				const result = known.result;
+				if (top === result[0] && bottom === result[result.length - 1]) {
+					return result.slice();
+				}
+				const lines = [top, ...known.textLines, bottom];
+				known.result = lines;
+				return lines.slice();
+			}
+		}
+		this.renderedText = undefined;
+
 		// Layout the text
 		const layoutLines = this.layoutText(layoutWidth);
 
 		// Calculate max visible lines: 30% of terminal height, minimum 5 lines
-		const terminalRows = this.tui.terminal.rows;
 		const maxVisibleLines = Math.max(5, Math.floor(terminalRows * 0.3));
 
 		// Find the cursor line index in layoutLines
@@ -864,6 +935,24 @@ export class Editor implements Component, Focusable {
 		// Render bottom border (with scroll indicator if more content below)
 		const linesBelow = layoutLines.length - (this.scrollOffset + visibleLines.length);
 		result.push(this.renderBottomBorder(width, linesBelow));
+
+		if (!showAutocomplete) {
+			this.renderedText = {
+				width,
+				paddingX: this.paddingX,
+				terminalRows,
+				focused: this.focused,
+				pasteIds: this.pastes.size === 0 ? "" : [...this.pastes.keys()].join(","),
+				lines: this.state.lines.slice(),
+				cursorLine: this.state.cursorLine,
+				cursorCol: this.state.cursorCol,
+				scrollOffset: this.scrollOffset,
+				visibleLineCount: visibleLines.length,
+				linesBelow,
+				textLines: result.slice(1, -1),
+				result: result.slice(),
+			};
+		}
 
 		// Add autocomplete list if active
 		this.renderedAutocompleteHeight = 0;
