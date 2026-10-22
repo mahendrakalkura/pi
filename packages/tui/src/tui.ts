@@ -390,6 +390,80 @@ export function renderSharedLines(component: Component, width: number): string[]
 		: component.render(width);
 }
 
+/**
+ * Lines that their owner changes in place, from some line on, instead of making a new array for each change: a reply that
+ * streams in grows at its end, and making the lines of all of it again, at each level of components it is in, takes time
+ * in proportion to its length on every frame. Each change raises `revision` and records the first line it changed, so a
+ * reader that kept the revision it read knows which lines to read again (changedSince()).
+ * Only readers that do (renderLiveLines()) are given such lines; the others get arrays that never change (renderShared()).
+ */
+export interface LiveLines {
+	/** The lines. Not to be modified, and changed by their owner: read again after each render. */
+	readonly lines: readonly string[];
+	readonly revision: number;
+	/**
+	 * The first line that may differ from what the lines were at `revision` (lines added after that count as changed):
+	 * Infinity when nothing changed since, 0 when that revision is not known any more.
+	 */
+	changedSince(revision: number): number;
+}
+
+/** How many changes LiveLineArray remembers the first changed line of. */
+const LIVE_LINE_EDITS_KEPT = 32;
+
+/** LiveLines that its owner changes with edit(). */
+export class LiveLineArray implements LiveLines {
+	readonly lines: string[] = [];
+	revision = 0;
+	/** The first line changed by each of the last changes, the last one last: change `revision - k` at `starts.length - 1 - k`. */
+	private readonly starts: number[] = [];
+
+	changedSince(revision: number): number {
+		if (revision === this.revision) return Number.POSITIVE_INFINITY;
+		const changes = this.revision - revision;
+		if (changes < 0 || changes > this.starts.length) return 0;
+		let start = Number.POSITIVE_INFINITY;
+		for (let i = this.starts.length - changes; i < this.starts.length; i++) start = Math.min(start, this.starts[i]!);
+		return start;
+	}
+
+	/** Drops the lines from `start` on, for the owner to add the new ones (push()), and records the change. */
+	edit(start: number): void {
+		this.lines.length = Math.min(this.lines.length, start);
+		this.revision++;
+		this.starts.push(start);
+		if (this.starts.length > LIVE_LINE_EDITS_KEPT) this.starts.shift();
+	}
+}
+
+/** The live renderers (renderLiveLines()), by the method that identifies the class: render(), or renderShared() for a Container. */
+const liveRenders = new WeakMap<object, (this: Component, width: number) => LiveLines | undefined>();
+
+/**
+ * Declares how components render live lines (LiveLines): `renderLive` is called for a component whose render() is `key`, or,
+ * for a Container that does not override render(), whose renderShared() is `key`. A subclass that overrides that method is
+ * not covered, so it renders as it says it does. `renderLive` may return undefined: the component's lines are then taken as
+ * renderSharedLines() takes them.
+ */
+export function markLiveRender(
+	key: Component["render"] | Container["renderShared"],
+	renderLive: (this: Component, width: number) => LiveLines | undefined,
+): void {
+	liveRenders.set(key, renderLive);
+}
+
+/**
+ * A component's lines as LiveLines, for a reader that reads them again after each render as changedSince() says: for the
+ * components that render so (markLiveRender()); undefined for the others (renderSharedLines()).
+ */
+export function renderLiveLines(component: Component, width: number): LiveLines | undefined {
+	const key =
+		component instanceof Container && component.render === Container.prototype.render
+			? component.renderShared
+			: component.render;
+	return liveRenders.get(key)?.call(component, width);
+}
+
 /** What a list of children rendered to, joined (renderChildren()). */
 export interface RenderedChildren {
 	readonly width: number;
@@ -476,12 +550,35 @@ function sameLines(
 	return true;
 }
 
+/** What a Container's children rendered to (Container.renderLiveChildren()). */
+interface ContainerLines {
+	width: number;
+	children: Component[];
+	/** The lines each child rendered to, and the revision they were at for a child that renders live lines (else -1). */
+	arrays: (readonly string[])[];
+	revisions: number[];
+	heights: number[];
+	/** All the children's lines. */
+	live: LiveLineArray;
+}
+
+/** Whether `lines` are the `count` lines of `joined` from `offset` on. */
+function sameLinesAt(lines: readonly string[], joined: readonly string[], offset: number, count: number): boolean {
+	if (lines.length !== count) return false;
+	for (let i = 0; i < count; i++) {
+		if (lines[i] !== joined[offset + i]) return false;
+	}
+	return true;
+}
+
 /**
  * Container - a component that contains other components
  */
 export class Container implements Component {
 	children: Component[] = [];
-	private rendered?: RenderedChildren;
+	private rendered?: ContainerLines;
+	/** renderShared()'s copy of the live lines, made again when they change. */
+	private sharedLines?: { live: LiveLineArray; revision: number; lines: string[] };
 
 	addChild(component: Component): void {
 		this.children.push(component);
@@ -500,6 +597,7 @@ export class Container implements Component {
 
 	invalidate(): void {
 		this.rendered = undefined;
+		this.sharedLines = undefined;
 		for (const child of this.children) {
 			child.invalidate?.();
 		}
@@ -529,19 +627,91 @@ export class Container implements Component {
 	}
 
 	/**
+	 * The children's lines, joined, as LiveLines: changed in place from the first line that changed. A child's lines are
+	 * unchanged when it is the same child and: it renders live lines and they are the same LiveLines at the same revision
+	 * (or changed from the line changedSince() says); it keeps its lines (isStableRender()) and returned the same array; or
+	 * it returned the lines joined the time before. Only the lines from the first one changed on are joined again: while a
+	 * reply streams in at the end of the transcript, those are the last lines of the reply.
+	 */
+	protected renderLiveChildren(width: number): LiveLineArray {
+		const before = this.rendered?.width === width ? this.rendered : undefined;
+		const children = this.children;
+		const count = children.length;
+		const arrays: (readonly string[])[] = new Array(count);
+		const revisions: number[] = new Array(count);
+		const heights: number[] = new Array(count);
+		const offsets: number[] = new Array(count);
+		const live = before?.live ?? new LiveLineArray();
+		const joined = live.lines;
+		let changeAt = before === undefined ? 0 : Number.POSITIVE_INFINITY;
+		let offset = 0;
+		for (let i = 0; i < count; i++) {
+			const child = children[i]!;
+			const childLive = renderLiveLines(child, width);
+			const lines = childLive?.lines ?? renderSharedLines(child, width);
+			const revision = childLive?.revision ?? -1;
+			if (before !== undefined && changeAt === Number.POSITIVE_INFINITY) {
+				let changedFrom = 0;
+				if (i < before.children.length) {
+					const sameChild = before.children[i] === child;
+					if (childLive !== undefined) {
+						if (sameChild && before.arrays[i] === lines && before.revisions[i]! >= 0) {
+							changedFrom = childLive.changedSince(before.revisions[i]!);
+						}
+					} else if (
+						before.revisions[i] === -1 &&
+						((sameChild && before.arrays[i] === lines && isStableRender(child)) ||
+							sameLinesAt(lines, joined, offset, before.heights[i]!))
+					) {
+						// (The same lines: in the same array from a component that keeps its lines, or line for line, as from a
+						// component that does not keep its lines or one put in place of the one before, such as a new spacer.)
+						changedFrom = Number.POSITIVE_INFINITY;
+					}
+				}
+				if (changedFrom !== Number.POSITIVE_INFINITY) changeAt = offset + changedFrom;
+			}
+			arrays[i] = lines;
+			revisions[i] = revision;
+			heights[i] = lines.length;
+			offsets[i] = offset;
+			offset += lines.length;
+		}
+		if (before !== undefined && changeAt === Number.POSITIVE_INFINITY && count !== before.children.length) {
+			changeAt = offset;
+		}
+		this.rendered = { width, children: children.slice(), arrays, revisions, heights, live };
+		if (changeAt === Number.POSITIVE_INFINITY) return live;
+		live.edit(changeAt);
+		for (let i = 0; i < count; i++) {
+			const lines = arrays[i]!;
+			const from = Math.max(0, changeAt - offsets[i]!);
+			for (let j = from; j < lines.length; j++) joined.push(lines[j]!);
+		}
+		return live;
+	}
+
+	/**
 	 * The children's lines, kept from one call to the next: the same array while no child's lines changed. The caller
 	 * must not modify it; render() returns a copy. A subclass that adds to the children's lines overrides this, not
 	 * render(), and keeps the same contract: it returns the same array again only when its lines are unchanged.
 	 */
 	renderShared(width: number): string[] {
-		this.rendered = renderChildren(this.children, width, this.rendered);
-		return this.rendered.lines;
+		const live = this.renderLiveChildren(width);
+		const shared = this.sharedLines;
+		if (shared?.live === live && shared.revision === live.revision) return shared.lines;
+		const lines = live.lines.slice();
+		this.sharedLines = { live, revision: live.revision, lines };
+		return lines;
 	}
 
 	render(width: number): string[] {
 		return this.renderShared(width).slice();
 	}
 }
+
+markLiveRender(Container.prototype.renderShared, function (this: Component, width: number) {
+	return (this as Container)["renderLiveChildren"](width);
+});
 
 /**
  * TUI - Main class for managing terminal UI with differential rendering

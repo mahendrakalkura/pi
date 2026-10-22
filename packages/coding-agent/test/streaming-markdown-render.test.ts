@@ -1,5 +1,5 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { type Component, Container, Text } from "@earendil-works/pi-tui";
+import { type Component, Container, type LiveLines, renderLiveLines, Text } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
 import { setMarkdownCachingForTest, setMarkdownFastPathsForTest } from "../../tui/src/components/markdown.ts";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
@@ -167,9 +167,23 @@ function streamAndCompare(text: string, sizes: () => number, widths: () => numbe
 	const reply = new AssistantMessageComponent();
 	const container = transcript(earlier, reply);
 	let steps = 0;
+	// Every other step, the transcript is read as the fullscreen layout reads it: live lines, brought up to date from the
+	// line they changed from.
+	const follower = { lines: [] as string[], source: undefined as LiveLines | undefined, revision: -1 };
+	const readLive = (width: number): string[] => {
+		const live = renderLiveLines(container, width)!;
+		const from = live === follower.source ? live.changedSince(follower.revision) : 0;
+		if (from !== Number.POSITIVE_INFINITY) {
+			follower.lines.length = Math.min(follower.lines.length, from);
+			for (let i = from; i < live.lines.length; i++) follower.lines.push(live.lines[i]!);
+		}
+		follower.source = live;
+		follower.revision = live.revision;
+		return follower.lines.slice();
+	};
 	const check = (message: AssistantMessage, streaming: boolean, width: number, at: string): void => {
 		reply.updateContent(message, streaming);
-		const lines = container.render(width);
+		const lines = steps % 2 === 0 ? container.render(width) : readLive(width);
 		const fresh = renderFresh(earlier, message, streaming, width);
 		if (JSON.stringify(lines) !== JSON.stringify(fresh)) {
 			expect(lines, `${at}, width ${width}`).toEqual(fresh);
@@ -241,6 +255,40 @@ describe("a streaming reply renders as it does from nothing", () => {
 			() => 64,
 			THINKING,
 		);
+	});
+
+	test("a tool call that comes after the text, read live and rendered, with a thinking block before it", () => {
+		const document = `${DOCUMENTS.everything!.slice(0, 400)} ${Math.random()}`;
+		const earlier = assistantMessage("Earlier answer.");
+		const reply = new AssistantMessageComponent();
+		const container = transcript(earlier, reply);
+		let follower: { source?: LiveLines; revision: number; lines: string[] } = { revision: -1, lines: [] };
+		const read = (width: number): string[] => {
+			const live = renderLiveLines(container, width)!;
+			const from = live === follower.source ? live.changedSince(follower.revision) : 0;
+			if (from !== Number.POSITIVE_INFINITY) {
+				follower.lines.length = Math.min(follower.lines.length, from);
+				for (let i = from; i < live.lines.length; i++) follower.lines.push(live.lines[i]!);
+			}
+			follower = { source: live, revision: live.revision, lines: follower.lines };
+			return follower.lines.slice();
+		};
+		const withToolCall = (message: AssistantMessage): AssistantMessage => ({
+			...message,
+			content: [...message.content, { type: "toolCall", id: "call-1", name: "read", arguments: { path: "a.txt" } }],
+			stopReason: "toolUse",
+		});
+		for (let length = 1; length <= document.length; length += 17) {
+			let message = assistantMessage(document.slice(0, length), THINKING);
+			if (length > document.length / 2) message = withToolCall(message);
+			reply.updateContent(message, true);
+			const expected = renderFresh(earlier, message, true, 70);
+			expect(read(70), `${length}`).toEqual(expected);
+			expect(container.render(70), `${length}`).toEqual(expected);
+		}
+		const complete = withToolCall(assistantMessage(document, THINKING));
+		reply.updateContent(complete, false);
+		expect(read(70)).toEqual(renderFresh(earlier, complete, false, 70));
 	});
 
 	test("chunks of 24 characters, as bench/long_answer.py streams them", () => {

@@ -2,7 +2,9 @@ import {
 	type Component,
 	dispatchMouseEvent,
 	isStableRender,
+	markLiveRender,
 	markStableRender,
+	renderLiveLines,
 	renderSharedLines,
 	type TuiMouseDispatchResult,
 	type TuiMouseEvent,
@@ -46,3 +48,7 @@ export class MouseRegion implements Component {
 }
 
 markStableRender(MouseRegion);
+// (Its lines are its child's: live when the child's are.)
+markLiveRender(MouseRegion.prototype.render, function (this: Component, width: number) {
+	return renderLiveLines((this as unknown as { child: Component }).child, width);
+});

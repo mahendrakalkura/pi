@@ -58,6 +58,18 @@ function themedLines(art: MermaidArt, theme: Theme): string[] {
 
 /** Create a transformer that replaces top-level Mermaid code blocks with Unicode terminal diagrams. */
 export function createMermaidMarkdownTransformer(options: MermaidTransformerOptions): MarkdownTransformer {
+	// The last text found not to name Mermaid. A message that streams in is that text with text added: only the added text,
+	// and the last characters before it that a match could start in, are searched.
+	let withoutMermaid: string | undefined;
+	const namesMermaid = (markdown: string): boolean => {
+		const known = withoutMermaid;
+		const found =
+			known !== undefined && markdown.length >= known.length && markdown.startsWith(known)
+				? /mermaid/i.test(markdown.slice(Math.max(0, known.length - "mermaid".length + 1)))
+				: /mermaid/i.test(markdown);
+		withoutMermaid = found ? undefined : markdown;
+		return found;
+	};
 	return (markdown, context) => {
 		const mode = options.getMode();
 		if (
@@ -69,7 +81,7 @@ export function createMermaidMarkdownTransformer(options: MermaidTransformerOpti
 		}
 		// A Mermaid block names its language: without the word there is none, and no need to lex the text (again for every
 		// chunk of a message that streams in) to find that out.
-		if (!/mermaid/i.test(markdown)) {
+		if (!namesMermaid(markdown)) {
 			return markdown;
 		}
 
