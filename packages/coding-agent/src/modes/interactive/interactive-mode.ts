@@ -1231,8 +1231,31 @@ export class InteractiveMode {
 
 		void this.maybeWarnAboutAnthropicSubscriptionAuth();
 
-		// Process initial messages
+		await this.promptInitialMessages(initialMessage, initialImages, initialMessages);
+
+		// Main interactive loop
+		while (true) {
+			const userInput = await this.getUserInput();
+			try {
+				await this.session.prompt(userInput);
+			} catch (error: unknown) {
+				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+				this.showError(errorMessage);
+			}
+		}
+	}
+
+	/**
+	 * Send the prompts given on the command line. Each one enters editor history
+	 * first, so Up recalls it the same way it recalls a typed prompt.
+	 */
+	private async promptInitialMessages(
+		initialMessage: string | undefined,
+		initialImages: ImageContent[] | undefined,
+		initialMessages: string[] | undefined,
+	): Promise<void> {
 		if (initialMessage) {
+			this.editor.addToHistory?.(initialMessage);
 			try {
 				await this.session.prompt(initialMessage, { images: initialImages });
 			} catch (error: unknown) {
@@ -1241,22 +1264,10 @@ export class InteractiveMode {
 			}
 		}
 
-		if (initialMessages) {
-			for (const message of initialMessages) {
-				try {
-					await this.session.prompt(message);
-				} catch (error: unknown) {
-					const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
-					this.showError(errorMessage);
-				}
-			}
-		}
-
-		// Main interactive loop
-		while (true) {
-			const userInput = await this.getUserInput();
+		for (const message of initialMessages ?? []) {
+			this.editor.addToHistory?.(message);
 			try {
-				await this.session.prompt(userInput);
+				await this.session.prompt(message);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
