@@ -921,21 +921,27 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 		return [""];
 	}
 
+	// One line (what Markdown and most components wrap): no ANSI state to carry over to a line after it.
+	if (text.indexOf("\n") === -1 && text.indexOf("\r") === -1) {
+		return wrapSingleLine(text, width);
+	}
+
 	// Handle newlines by processing each line separately
 	// Track ANSI state across lines so styles carry over after literal newlines
 	const inputLines = text.split(/\r\n|\r|\n/);
 	const result: string[] = [];
 	const tracker = new AnsiCodeTracker();
 
-	for (const inputLine of inputLines) {
+	for (let index = 0; index < inputLines.length; index++) {
+		const inputLine = inputLines[index]!;
 		// Prepend active ANSI codes from previous lines (except for first line)
 		const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
 		const wrappedLines = wrapSingleLine(prefix + inputLine, width);
 		for (const wrappedLine of wrappedLines) {
 			result.push(wrappedLine);
 		}
-		// Update tracker with codes from this line for next iteration
-		updateTrackerFromText(inputLine, tracker);
+		// Update tracker with codes from this line for the next one (the last line has none after it)
+		if (index < inputLines.length - 1) updateTrackerFromText(inputLine, tracker);
 	}
 
 	return result.length > 0 ? result : [""];
