@@ -184,10 +184,14 @@ mise exec node@24 -- npm run check:browser-smoke
 # The experimental durable tests import `@earendil-works/pi-durable/tools` the same way and fail with
 # "Cannot find package" on a stale `packages/durable/dist`.
 mise exec node@24 -- npm --prefix packages/tui run build
-# pi-durable imports `@earendil-works/pi-codemode/portable` through its `dist/`, so its build fails with
-# TS2307 "Cannot find module" on a stale `packages/codemode/dist`. Build chord and codemode first.
+# pi-durable imports `@earendil-works/pi-codemode/portable` and `@earendil-works/pi-ai` through their `dist/`,
+# so its build fails with TS2307 "Cannot find module" or TS2353 on a stale `packages/codemode/dist` or
+# `packages/ai/dist`. Chord imports `@earendil-works/pi-telemetry` the same way and fails with TS2305 on a stale
+# `packages/telemetry/dist`. Build telemetry, chord, codemode, and ai first, in the root `build` script order.
+mise exec node@24 -- npm --prefix packages/telemetry run build
 mise exec node@24 -- npm --prefix packages/chord run build
 mise exec node@24 -- npm --prefix packages/codemode run build
+mise exec node@24 -- npm --prefix packages/ai run build:offline
 mise exec node@24 -- npm --prefix packages/durable run build
 # The pi-env tests spawn the Rust daemon and fail with "Build the daemon first" when
 # `packages/env/daemon/target/debug/pi-env` is missing. CI builds it the same way before `npm test`.
@@ -208,7 +212,8 @@ env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
 # 4. Extension packages, then the binary with the dotfiles extensions compiled in.
 (cd packages/coding-agent/bundle && mise exec node@24 -- npm install --no-audit --no-fund)
 #    `build:binary` does not build `pi-codemode` or `pi-mcp`, and `tsc` in coding-agent fails on their
-#    missing `dist/` without these two lines.
+#    missing `dist/` without these lines. Chord needs a fresh `packages/telemetry/dist` first.
+mise exec node@24 -- npm --prefix packages/telemetry run build
 mise exec node@24 -- npm --prefix packages/chord run build
 mise exec node@24 -- npm --prefix packages/codemode run build
 mise exec node@24 -- npm --prefix packages/mcp run build
