@@ -2141,7 +2141,8 @@ export class InteractiveMode {
 					}
 
 					this.chatContainer.clear();
-					this.renderInitialMessages();
+					// The branch's prompts are already in editor history.
+					this.renderInitialMessages({ populateHistory: false });
 					if (result.editorText && !this.editor.getText().trim()) {
 						this.editor.setText(result.editorText);
 					}
@@ -4410,11 +4411,11 @@ export class InteractiveMode {
 		);
 	}
 
-	renderInitialMessages(): void {
+	renderInitialMessages(options: { populateHistory: boolean } = { populateHistory: true }): void {
 		const entries = this.sessionManager.buildContextEntries();
 		this.renderSessionEntries(entries, {
 			updateFooter: true,
-			populateHistory: true,
+			populateHistory: options.populateHistory,
 		});
 		this.renderProjectTrustWarningIfNeeded();
 
@@ -5759,9 +5760,9 @@ export class InteractiveMode {
 							return;
 						}
 
-						// Update UI
+						// Update UI. The branch's prompts are already in editor history.
 						this.chatContainer.clear();
-						this.renderInitialMessages();
+						this.renderInitialMessages({ populateHistory: false });
 						if (result.editorText && !this.editor.getText().trim()) {
 							this.editor.setText(result.editorText);
 						}
