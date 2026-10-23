@@ -205,6 +205,46 @@ describe("frame spacing", () => {
 		tui.stop();
 	});
 
+	// A frame that is never drawn leaves the screen stale until something else asks for one (a run of benchmark.py
+	// waiting for its "Done" line would wait for ever). Whatever the order of requests, keys, resizes and forced redraws,
+	// and however long frames take, the last frame drawn shows the last state, and nothing is left waiting.
+	for (let seed = 1; seed <= 40; seed++) {
+		it(`draws the last state after any mix of requests and frame times (seed ${seed})`, async () => {
+			let state = seed >>> 0;
+			const draw = (count: number) => {
+				state = (Math.imul(state ^ (state >>> 15), 2246822507) + 0x9e3779b9) >>> 0;
+				return state % count;
+			};
+			const { tui, terminal, component } = setup(1);
+			tui.start();
+			await advance(5);
+			let text = "start";
+			for (let step = 0; step < 120; step++) {
+				component.cost = [1, 3, 8, 20, 40][draw(5)]!;
+				const event = draw(10);
+				if (event < 5) {
+					text = `stream ${step}`;
+					component.text = text;
+					tui.requestRender();
+				} else if (event < 8) {
+					text = `key ${step}`;
+					terminal.sendInput(text);
+				} else if (event === 8) {
+					terminal.resize(40 + draw(5), 10);
+				} else {
+					tui.requestRender(true);
+				}
+				await advance(draw(30));
+			}
+			await advance(1000);
+			assert.strictEqual(component.shown.at(-1), text, `seed ${seed}: the last state drawn`);
+			const frames = component.starts.length;
+			await advance(1000);
+			assert.strictEqual(component.starts.length, frames, `seed ${seed}: nothing left waiting`);
+			tui.stop();
+		});
+	}
+
 	it("draws a resize and a forced redraw as soon as before, and the first frame", async () => {
 		const { tui, terminal, component } = setup(30);
 		tui.start();
