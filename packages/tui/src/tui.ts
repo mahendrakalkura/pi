@@ -710,7 +710,6 @@ export class Container implements Component {
 }
 
 markLiveRender(Container.prototype.renderShared, function (this: Component, width: number) {
-	// biome-ignore lint/complexity/useLiteralKeys: renderLiveChildren is protected; the computed key reaches it from outside the class
 	return (this as Container)["renderLiveChildren"](width);
 });
 
