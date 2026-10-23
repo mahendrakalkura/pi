@@ -129,7 +129,7 @@ describe("frame spacing", () => {
 		tui.stop();
 	});
 
-	it("handles input at once, and draws its frame no later than the spacing", async () => {
+	it("draws a key's frame at once, not held by the spacing of slow frames", async () => {
 		const { tui, terminal, component } = setup(30);
 		tui.start();
 		await advance(20);
@@ -137,16 +137,71 @@ describe("frame spacing", () => {
 		await advance(1);
 		const last = component.starts.at(-1)!;
 		await advance(10);
+		// (The stream asks for a frame: it waits for the spacing.)
+		tui.requestRender();
+		await ticks();
 		const sent = now;
 		terminal.sendInput("x");
-		// (Handled at once, before any frame.)
 		assert.deepStrictEqual(component.inputs, [{ data: "x", at: sent }]);
-		await advance(200);
-		const frame = component.starts.find((start) => start > last)!;
-		assert.strictEqual(frame - last, 90);
+		await ticks();
+		// Drawn at once, as in 0.9.9: the key's frame, with what the stream asked for.
+		assert.strictEqual(component.starts.at(-1), sent);
 		assert.strictEqual(component.shown.at(-1), "x");
-		// Keystroke to screen: at most the spacing, here 90 - 10 ms after the key.
-		assert.ok(frame - sent <= 90, `latency ${frame - sent}`);
+		assert.ok(component.starts.at(-1)! - last < 90);
+		tui.stop();
+	});
+
+	it("draws a frame input asks for through a listener (the mouse) as soon as before", async () => {
+		const { tui, terminal, component } = setup(30);
+		// (A listener that consumes the input and asks for a frame, as the fullscreen viewport does for the wheel.)
+		tui.addInputListener((data) => {
+			if (data !== "wheel") return undefined;
+			component.text = "scrolled";
+			tui.requestRender();
+			return { consume: true };
+		});
+		tui.start();
+		await advance(20);
+		tui.requestRender();
+		await advance(1);
+		const last = component.starts.at(-1)!;
+		await advance(2);
+		// (A frame the stream asked for, waiting for the spacing, then the wheel.)
+		tui.requestRender();
+		await advance(3);
+		const sent = now;
+		terminal.sendInput("wheel");
+		await advance(40);
+		const frame = component.starts.find((start) => start > last)!;
+		// (16 ms after the frame before started have passed: drawn on the next timer tick, as in 0.9.9; not 90 ms after.)
+		assert.ok(frame - sent <= 1, `drawn ${frame - sent} ms after the wheel`);
+		assert.strictEqual(component.shown[component.starts.indexOf(frame)], "scrolled");
+		tui.stop();
+	});
+
+	it("keeps the thread from being busy with frames while someone types during a stream", async () => {
+		const { tui, terminal, component } = setup(30);
+		tui.start();
+		await advance(20);
+		component.starts = [];
+		const begin = now;
+		let keys = 0;
+		const echoes: number[] = [];
+		await advance(3000, () => {
+			tui.requestRender();
+			// (Typing fast: a key every 100 ms.)
+			if ((now - begin) % 100 === 0) {
+				const sent = now;
+				terminal.sendInput(`k${keys++}`);
+				echoes.push(sent);
+			}
+		});
+		await ticks();
+		// Each key's frame is drawn when the key is handled.
+		for (const sent of echoes) assert.ok(component.starts.includes(sent), `key at ${sent} drawn at once`);
+		const busy = (component.starts.length * 30) / (now - begin);
+		// (Key frames: 30 ms of every 100; the stream's frames are spaced after them.)
+		assert.ok(busy <= 0.5, `busy ${busy}`);
 		tui.stop();
 	});
 
