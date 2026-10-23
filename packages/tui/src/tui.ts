@@ -167,9 +167,10 @@ export function setRenderClockForTest(clock: (() => number) | undefined): void {
 }
 
 /**
- * When frames are slow, the next frame starts no sooner than this many times the last frame's duration after the last one
- * started (and frames other than input's never sooner than MIN_RENDER_INTERVAL_MS, as always): drawing takes at most about
- * a third of the thread however slow a frame is, and what waits for the thread (input, the model's stream) is not starved.
+ * When frames are slow, a frame that no input asked for (the model's stream, timers, widgets) starts no sooner than this
+ * many times the last frame's duration after the last one started (and never sooner than MIN_RENDER_INTERVAL_MS, as
+ * always): drawing for them takes at most about a third of the thread however slow a frame is, and what waits for the
+ * thread is not starved. A frame for input (a key, a paste, the mouse, a resize) is drawn as soon as before.
  */
 const FRAME_SPACING_FACTOR = 3;
 
@@ -1212,6 +1213,13 @@ export abstract class TuiBase extends Container implements TUI {
 	 * a resize's and a forced redraw's, which draw everything again, are drawn as soon as before.
 	 */
 	private nextFrameUnspaced = true;
+	/**
+	 * The next frame was asked for by input: it is not spaced by the last one's duration (its own duration spaces the frames
+	 * after it, so a typist cannot keep the thread busy with frames the stream asked for).
+	 */
+	private nextFrameForInput = false;
+	/** Terminal input is being handled: frames asked for meanwhile are for input. */
+	private handlingInput = false;
 	private showHardwareCursor = false;
 	private clearOnShrink = false;
 	protected fullRedrawCount = 0;
@@ -1253,6 +1261,7 @@ export abstract class TuiBase extends Container implements TUI {
 		this.doRender();
 		this.lastFrameDuration = this.nextFrameUnspaced ? 0 : renderClock() - start;
 		this.nextFrameUnspaced = false;
+		this.nextFrameForInput = false;
 	}
 
 	protected resetRenderState(): void {}
@@ -1660,7 +1669,14 @@ export abstract class TuiBase extends Container implements TUI {
 		process.on("exit", this.exitRestoreHandler);
 		this.beforeTerminalStart();
 		this.terminal.start(
-			(data) => this.handleTerminalInput(data),
+			(data) => {
+				this.handlingInput = true;
+				try {
+					this.handleTerminalInput(data);
+				} finally {
+					this.handlingInput = false;
+				}
+			},
 			() => {
 				// (A resize is drawn as soon as before, however slow frames are.)
 				this.nextFrameUnspaced = true;
@@ -1742,6 +1758,14 @@ export abstract class TuiBase extends Container implements TUI {
 			this.requestImmediateRender();
 			return;
 		}
+		if (this.handlingInput && !this.nextFrameForInput) {
+			// A frame for input: not held by the spacing of slow frames (FRAME_SPACING_FACTOR), also when one waits already.
+			this.nextFrameForInput = true;
+			if (this.renderTimer) {
+				this.cancelRenderTimer();
+				process.nextTick(() => this.scheduleRender());
+			}
+		}
 		if (this.renderRequested) return;
 		this.renderRequested = true;
 		process.nextTick(() => this.scheduleRender());
@@ -1758,14 +1782,6 @@ export abstract class TuiBase extends Container implements TUI {
 			// A previously queued scheduleRender() can create a timer before this
 			// callback runs. User input must preempt that throttled frame.
 			this.cancelRenderTimer();
-			// Unless frames are slow: then the frame waits until the last one is far enough behind (FRAME_SPACING_FACTOR).
-			// The input itself was handled already; only its frame waits.
-			const spacing = this.nextFrameUnspaced ? 0 : FRAME_SPACING_FACTOR * this.lastFrameDuration;
-			const wait = spacing > TuiBase.MIN_RENDER_INTERVAL_MS ? spacing - (renderClock() - this.lastRenderAt) : 0;
-			if (wait > 0) {
-				this.renderTimer = setTimeout(() => this.renderTimedFrame(), wait);
-				return;
-			}
 			this.renderRequested = false;
 			this.lastRenderAt = renderClock();
 			this.renderFrame();
@@ -1783,7 +1799,8 @@ export abstract class TuiBase extends Container implements TUI {
 			return;
 		}
 		const elapsed = renderClock() - this.lastRenderAt;
-		const spacing = this.nextFrameUnspaced ? 0 : FRAME_SPACING_FACTOR * this.lastFrameDuration;
+		const spacing =
+			this.nextFrameUnspaced || this.nextFrameForInput ? 0 : FRAME_SPACING_FACTOR * this.lastFrameDuration;
 		const delay = Math.max(0, Math.max(TuiBase.MIN_RENDER_INTERVAL_MS, spacing) - elapsed);
 		this.renderTimer = setTimeout(() => this.renderTimedFrame(), delay);
 	}
