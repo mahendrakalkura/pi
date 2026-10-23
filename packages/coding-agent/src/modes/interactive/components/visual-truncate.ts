@@ -5,7 +5,9 @@
 
 import {
 	type Component,
+	markReportsChanges,
 	markStableRender,
+	reportRenderChange,
 	Text,
 	truncateToWidth,
 	visibleWidth,
@@ -157,7 +159,9 @@ export class VisualLinePreview implements Component {
 	invalidate(): void {
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
 	}
 }
 
 markStableRender(VisualLinePreview);
+markReportsChanges(VisualLinePreview);

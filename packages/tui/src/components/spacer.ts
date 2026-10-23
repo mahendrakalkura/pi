@@ -1,4 +1,4 @@
-import { type Component, markStableRender } from "../tui.ts";
+import { type Component, markReportsChanges, markStableRender, reportRenderChange } from "../tui.ts";
 
 /**
  * Spacer component that renders empty lines
@@ -15,6 +15,7 @@ export class Spacer implements Component {
 
 	setLines(lines: number): void {
 		this.lines = lines;
+		reportRenderChange(this);
 	}
 
 	invalidate(): void {
@@ -35,3 +36,4 @@ export class Spacer implements Component {
 }
 
 markStableRender(Spacer);
+markReportsChanges(Spacer);

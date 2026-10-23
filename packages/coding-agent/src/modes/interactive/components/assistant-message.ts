@@ -8,6 +8,8 @@ import {
 	type MarkdownTheme,
 	MouseRegion,
 	markLiveRender,
+	markReportsChanges,
+	reportRenderChange,
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
@@ -196,6 +198,7 @@ export class AssistantMessageComponent extends Container {
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
 		this.lastMessage = message;
 		this.isStreaming = isStreaming;
+		reportRenderChange(this);
 		// While a reply streams, every delta of it comes here, and the screen is drawn a few dozen times a second at most: the
 		// components are made when it is (render()), from the latest message, not for each delta (and its text trimmed, a
 		// copy of all of it so far, each time).
@@ -368,6 +371,7 @@ export class AssistantMessageComponent extends Container {
 	}
 }
 
+markReportsChanges(AssistantMessageComponent);
 markLiveRender(AssistantMessageComponent.prototype.renderShared, function (this: Component, width: number) {
 	return (this as AssistantMessageComponent).renderLive(width);
 });

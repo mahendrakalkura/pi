@@ -3,7 +3,15 @@ import markedCjkFriendly from "marked-cjk-friendly";
 import { renderLatex } from "../latex.ts";
 import { invalidateRenderedMarkdown, renderedMarkdownGeneration } from "../rendered-markdown.ts";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
-import { type Component, LiveLineArray, type LiveLines, markLiveRender, markStableRender } from "../tui.ts";
+import {
+	type Component,
+	LiveLineArray,
+	type LiveLines,
+	markLiveRender,
+	markReportsChanges,
+	markStableRender,
+	reportRenderChange,
+} from "../tui.ts";
 import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
@@ -801,6 +809,7 @@ export class Markdown implements Component {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
 	}
 
 	invalidate(): void {
@@ -809,6 +818,7 @@ export class Markdown implements Component {
 		this.cachedLines = undefined;
 		// What the theme's functions give may have changed: nothing rendered with them is good any more.
 		invalidateRenderedMarkdown();
+		reportRenderChange(this);
 	}
 
 	/** Everything the lines of a block rendered at `width` depend on besides its token and the next token's type. */
@@ -1036,7 +1046,10 @@ export class Markdown implements Component {
 		this.cachedWidth = width;
 		this.cachedLines = result;
 
-		return result.length > 0 || rendered ? result : [""];
+		if (result.length > 0 || rendered) return result;
+		// (The next render returns none: a change, for containers that render this again only when told.)
+		reportRenderChange(this);
+		return [""];
 	}
 
 	/**
@@ -1119,6 +1132,8 @@ export class Markdown implements Component {
 			lines.edit(0);
 			lines.lines.push("");
 			live.substituted = true;
+			// (The next render returns none: a change, for containers that render this again only when told.)
+			reportRenderChange(this);
 		}
 		return lines;
 	}
@@ -1788,6 +1803,7 @@ export class Markdown implements Component {
 }
 
 markStableRender(Markdown);
+markReportsChanges(Markdown);
 markLiveRender(Markdown.prototype.render, function (this: Component, width: number) {
 	return (this as Markdown).renderLive(width);
 });
