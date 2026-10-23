@@ -571,6 +571,11 @@ function sameLinesAt(lines: readonly string[], joined: readonly string[], offset
 	return true;
 }
 
+/** Whether `child` and `lines` are what was recorded at `index`. */
+function sameChildAt(rendered: ContainerLines, index: number, child: Component, lines: readonly string[]): boolean {
+	return rendered.children[index] === child && rendered.arrays[index] === lines;
+}
+
 /**
  * Container - a component that contains other components
  */
@@ -634,58 +639,87 @@ export class Container implements Component {
 	 * reply streams in at the end of the transcript, those are the last lines of the reply.
 	 */
 	protected renderLiveChildren(width: number): LiveLineArray {
-		const before = this.rendered?.width === width ? this.rendered : undefined;
 		const children = this.children;
 		const count = children.length;
-		const arrays: (readonly string[])[] = new Array(count);
-		const revisions: number[] = new Array(count);
-		const heights: number[] = new Array(count);
-		const offsets: number[] = new Array(count);
-		const live = before?.live ?? new LiveLineArray();
+		let rendered = this.rendered?.width === width ? this.rendered : undefined;
+		if (rendered === undefined) {
+			rendered = { width, children: [], arrays: [], revisions: [], heights: [], live: new LiveLineArray() };
+			this.rendered = rendered;
+		}
+		const before = rendered;
+		const live = before.live;
 		const joined = live.lines;
-		let changeAt = before === undefined ? 0 : Number.POSITIVE_INFINITY;
+		// The leading children whose lines are what they were: nothing is recorded again for them, so a frame in which only
+		// the last message changed allocates and copies nothing in proportion to the transcript.
+		let first = 0;
 		let offset = 0;
-		for (let i = 0; i < count; i++) {
-			const child = children[i]!;
+		let changeAt = Number.POSITIVE_INFINITY;
+		let firstLines: readonly string[] | undefined;
+		let firstRevision = -1;
+		for (; first < count; first++) {
+			const child = children[first]!;
 			const childLive = renderLiveLines(child, width);
 			const lines = childLive?.lines ?? renderSharedLines(child, width);
-			const revision = childLive?.revision ?? -1;
-			if (before !== undefined && changeAt === Number.POSITIVE_INFINITY) {
-				let changedFrom = 0;
-				if (i < before.children.length) {
-					const sameChild = before.children[i] === child;
-					if (childLive !== undefined) {
-						if (sameChild && before.arrays[i] === lines && before.revisions[i]! >= 0) {
-							changedFrom = childLive.changedSince(before.revisions[i]!);
-						}
-					} else if (
-						before.revisions[i] === -1 &&
-						((sameChild && before.arrays[i] === lines && isStableRender(child)) ||
-							sameLinesAt(lines, joined, offset, before.heights[i]!))
-					) {
-						// (The same lines: in the same array from a component that keeps its lines, or line for line, as from a
-						// component that does not keep its lines or one put in place of the one before, such as a new spacer.)
-						changedFrom = Number.POSITIVE_INFINITY;
+			let changedFrom = 0;
+			if (first < before.children.length) {
+				const sameChild = before.children[first] === child;
+				if (childLive !== undefined) {
+					if (sameChild && before.arrays[first] === lines && before.revisions[first]! >= 0) {
+						changedFrom = childLive.changedSince(before.revisions[first]!);
 					}
+				} else if (
+					before.revisions[first] === -1 &&
+					((sameChild && before.arrays[first] === lines && isStableRender(child)) ||
+						sameLinesAt(lines, joined, offset, before.heights[first]!))
+				) {
+					// (The same lines: in the same array from a component that keeps its lines, or line for line, as from a
+					// component that does not keep its lines or one put in place of the one before, such as a new spacer.)
+					changedFrom = Number.POSITIVE_INFINITY;
 				}
-				if (changedFrom !== Number.POSITIVE_INFINITY) changeAt = offset + changedFrom;
 			}
-			arrays[i] = lines;
-			revisions[i] = revision;
-			heights[i] = lines.length;
-			offsets[i] = offset;
+			if (changedFrom !== Number.POSITIVE_INFINITY) {
+				changeAt = offset + changedFrom;
+				firstLines = lines;
+				firstRevision = childLive?.revision ?? -1;
+				break;
+			}
+			if (!sameChildAt(before, first, child, lines)) {
+				// (A new child with the same lines: recorded, without changing the lines joined.)
+				before.children[first] = child;
+				before.arrays[first] = lines;
+				before.revisions[first] = -1;
+			}
 			offset += lines.length;
 		}
-		if (before !== undefined && changeAt === Number.POSITIVE_INFINITY && count !== before.children.length) {
+		if (first === count) {
+			if (count === before.children.length) return live;
 			changeAt = offset;
 		}
-		this.rendered = { width, children: children.slice(), arrays, revisions, heights, live };
-		if (changeAt === Number.POSITIVE_INFINITY) return live;
+		// From the first changed child on: recorded again, in place, and its lines and those after it joined again.
+		before.children.length = first;
+		before.arrays.length = first;
+		before.revisions.length = first;
+		before.heights.length = first;
 		live.edit(changeAt);
-		for (let i = 0; i < count; i++) {
-			const lines = arrays[i]!;
-			const from = Math.max(0, changeAt - offsets[i]!);
+		for (let i = first; i < count; i++) {
+			const child = children[i]!;
+			let lines: readonly string[];
+			let revision: number;
+			if (i === first && firstLines !== undefined) {
+				lines = firstLines;
+				revision = firstRevision;
+			} else {
+				const childLive = renderLiveLines(child, width);
+				lines = childLive?.lines ?? renderSharedLines(child, width);
+				revision = childLive?.revision ?? -1;
+			}
+			before.children.push(child);
+			before.arrays.push(lines);
+			before.revisions.push(revision);
+			before.heights.push(lines.length);
+			const from = Math.max(0, changeAt - offset);
 			for (let j = from; j < lines.length; j++) joined.push(lines[j]!);
+			offset += lines.length;
 		}
 		return live;
 	}
