@@ -8,7 +8,6 @@ import { jsonBodyParts } from "../src/utils/request-body.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
 const long = (seed: string, length = 3000) => seed.repeat(Math.ceil(length / seed.length)).slice(0, length);
-const decoder = new TextDecoder();
 
 class Point {
 	x = 1;
@@ -47,14 +46,19 @@ function awkward(): unknown[] {
 }
 
 /** The text of jsonBodyParts(...), or undefined. */
-function encode(body: Record<string, unknown>, key: string, conversation: string, allowedToJSON?: unknown) {
+async function encode(
+	body: Record<string, unknown>,
+	key: string,
+	conversation: string,
+	allowedToJSON?: unknown,
+): Promise<string | undefined> {
 	const parts = jsonBodyParts(body, key, conversation, allowedToJSON);
-	return parts && decoder.decode(Buffer.concat(parts));
+	return parts && new Blob(parts).text();
 }
 
-function expectSame(body: Record<string, unknown>, key: string, conversation = "c"): void {
+async function expectSame(body: Record<string, unknown>, key: string, conversation = "c"): Promise<void> {
 	const expected = JSON.stringify(body);
-	expect(encode(body, key, conversation)).toBe(expected);
+	expect(await encode(body, key, conversation)).toBe(expected);
 }
 
 afterEach(() => {
@@ -63,72 +67,72 @@ afterEach(() => {
 });
 
 describe("jsonBodyParts", () => {
-	it("encodes JSON.stringify of the body as UTF-8, first serialized and then reused", () => {
+	it("encodes JSON.stringify of the body as UTF-8, first serialized and then reused", async () => {
 		const messages = awkward();
 		for (let request = 0; request < 3; request++) {
-			expectSame({ model: "m", messages: [...messages], stream: true, tools: [{ name: "é" }] }, "messages");
+			await expectSame({ model: "m", messages: [...messages], stream: true, tools: [{ name: "é" }] }, "messages");
 		}
 	});
 
-	it("serializes only the items that are new or changed", () => {
+	it("serializes only the items that are new or changed", async () => {
 		const messages: Record<string, unknown>[] = [];
 		for (let i = 0; i < 20; i++) messages.push({ role: "user", content: [{ type: "text", text: long(`m${i} `) }] });
-		expectSame({ model: "m", messages: [...messages] }, "messages", "counted");
+		await expectSame({ model: "m", messages: [...messages] }, "messages", "counted");
 		const stringify = vi.spyOn(JSON, "stringify");
 		messages.push({ role: "assistant", content: "new" });
-		expectSame({ model: "m", messages: [...messages] }, "messages", "counted");
+		await expectSame({ model: "m", messages: [...messages] }, "messages", "counted");
 		// Only the new message is serialized on its own.
 		const itemsSerialized = stringify.mock.calls.filter(([value]) => value === messages[20]).length;
 		expect(itemsSerialized).toBe(1);
 		expect(stringify.mock.calls.filter(([value]) => messages.slice(0, 20).includes(value as never)).length).toBe(0);
 	});
 
-	it("serializes again what changed in place, was replaced, or moved", () => {
+	it("serializes again what changed in place, was replaced, or moved", async () => {
 		const messages: Record<string, unknown>[] = [];
 		const body = () => ({ model: "m", messages: [...messages], stream: true });
 		for (let i = 0; i < 10; i++) {
 			messages.push({ role: i % 2 ? "assistant" : "user", content: [{ type: "text", text: long(`turn ${i} `) }] });
 		}
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		// A cache marker added to an earlier message's block, in place.
 		const block = (messages[3].content as Record<string, unknown>[])[0];
 		block.cache_control = { type: "ephemeral" };
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		// ...and removed again, the next message marked instead.
 		delete block.cache_control;
 		(messages[4].content as Record<string, unknown>[])[0].cache_control = { type: "ephemeral" };
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		// The same keys in another order, a string changed by one character, a number by sign.
 		messages[1] = { content: messages[1].content, role: messages[1].role };
 		(messages[2].content as Record<string, unknown>[])[0].text = `${long("turn 2 ").slice(0, -1)}!`;
 		messages[5].n = 0;
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		messages[5].n = -0;
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		// Compaction: earlier messages replaced by a summary, everything after moves.
 		messages.splice(0, 6, { role: "user", content: "summary" });
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		// An item that becomes a class instance or gets an inherited toJSON, a nested Date.
 		messages[1] = Object.assign(new Point(), messages[1]);
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		(messages[2].content as Record<string, unknown>[])[0].when = new Date(5);
-		expectSame(body(), "messages");
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		// Fields added or removed, undefined values, an array grown.
 		messages[0].extra = undefined;
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		messages[0].extra = [1, 2];
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		(messages[0].extra as number[]).push(3);
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		delete messages[0].extra;
-		expectSame(body(), "messages");
+		await expectSame(body(), "messages");
 		// The rest of the body changes.
-		expectSame({ ...body(), stream: false, tools: [{ name: "t" }] }, "messages");
-		expectSame({ tools: [], messages: [...messages] }, "messages");
+		await expectSame({ ...body(), stream: false, tools: [{ name: "t" }] }, "messages");
+		await expectSame({ tools: [], messages: [...messages] }, "messages");
 	});
 
-	it("stays byte-identical through random edits of a growing conversation", () => {
+	it("stays byte-identical through random edits of a growing conversation", async () => {
 		let seed = 7;
 		const random = (n: number) => {
 			seed = (seed * 1103515245 + 12345) % 2147483648;
@@ -159,44 +163,48 @@ describe("jsonBodyParts", () => {
 			} else {
 				messages.reverse();
 			}
-			expectSame({ model: "m", messages: [...messages], n: random(3) }, "messages", `fuzz${random(2)}`);
+			await expectSame({ model: "m", messages: [...messages], n: random(3) }, "messages", `fuzz${random(2)}`);
 		}
 	});
 
-	it("keeps conversations apart", () => {
+	it("keeps conversations apart", async () => {
 		const a = [{ role: "user", content: long("a ") }];
 		const b = [{ role: "user", content: long("b ") }];
 		for (let request = 0; request < 5; request++) {
 			a.push({ role: "user", content: `a${request}` });
 			b.push({ role: "user", content: `b${request}` });
-			expectSame({ messages: [...a] }, "messages", "a");
-			expectSame({ messages: [...b] }, "messages", "b");
+			await expectSame({ messages: [...a] }, "messages", "a");
+			await expectSame({ messages: [...b] }, "messages", "b");
 			// The same key used by both: still correct, only not reused.
-			expectSame({ messages: [...a] }, "messages", "shared");
-			expectSame({ messages: [...b] }, "messages", "shared");
+			await expectSame({ messages: [...a] }, "messages", "shared");
+			await expectSame({ messages: [...b] }, "messages", "shared");
 		}
 	});
 
-	it("leaves to JSON.stringify what it cannot reproduce exactly", () => {
+	it("leaves to JSON.stringify what it cannot reproduce exactly", async () => {
 		const items = [{ role: "user", content: "x" }];
 		// An item's own toJSON gets its index as the key.
-		expect(encode({ messages: [{ toJSON: (key: string) => key }] }, "messages", "c")).toBeUndefined();
-		expect(encode({ messages: [new Date(0)] }, "messages", "c")).toBeUndefined();
+		expect(await encode({ messages: [{ toJSON: (key: string) => key }] }, "messages", "c")).toBeUndefined();
+		expect(await encode({ messages: [new Date(0)] }, "messages", "c")).toBeUndefined();
 		// A toJSON on the array or the body, an array that is not plain, no array.
 		const withToJSON = Object.assign([...items], { toJSON: () => [] });
-		expect(encode({ messages: withToJSON }, "messages", "c")).toBeUndefined();
-		expect(encode({ messages: items, toJSON: () => ({}) }, "messages", "c")).toBeUndefined();
+		expect(await encode({ messages: withToJSON }, "messages", "c")).toBeUndefined();
+		expect(await encode({ messages: items, toJSON: () => ({}) }, "messages", "c")).toBeUndefined();
 		class Items extends Array {}
-		expect(encode({ messages: Items.from(items) }, "messages", "c")).toBeUndefined();
-		expect(encode({ messages: "x" }, "messages", "c")).toBeUndefined();
+		expect(await encode({ messages: Items.from(items) }, "messages", "c")).toBeUndefined();
+		expect(await encode({ messages: "x" }, "messages", "c")).toBeUndefined();
 		expect(
-			encode(Object.assign(new Point(), { messages: items }) as unknown as Record<string, unknown>, "messages", "c"),
+			await encode(
+				Object.assign(new Point(), { messages: items }) as unknown as Record<string, unknown>,
+				"messages",
+				"c",
+			),
 		).toBeUndefined();
 		// A BigInt makes JSON.stringify throw: the SDK's own serialization throws it.
-		expect(() => encode({ messages: [{ n: 1n }] }, "messages", "c")).toThrow(TypeError);
+		await expect(encode({ messages: [{ n: 1n }] }, "messages", "c")).rejects.toThrow(TypeError);
 	});
 
-	it("reads the array by index, as JSON.stringify does, never through an iterator of its own", () => {
+	it("reads the array by index, as JSON.stringify does, never through an iterator of its own", async () => {
 		let iterated = 0;
 		const withIterator = <T>(items: T[]): T[] =>
 			Object.defineProperty(items, Symbol.iterator, {
@@ -209,25 +217,29 @@ describe("jsonBodyParts", () => {
 			});
 		// An item with its own toJSON that the iterator would hide: still left to JSON.stringify.
 		expect(
-			encode({ messages: withIterator([{ role: "user" }, { toJSON: (key: string) => key }]) }, "messages", "c"),
+			await encode(
+				{ messages: withIterator([{ role: "user" }, { toJSON: (key: string) => key }]) },
+				"messages",
+				"c",
+			),
 		).toBeUndefined();
 		const plain = withIterator([
 			{ role: "user", content: long("a ") },
 			{ role: "assistant", content: "b" },
 		]);
 		for (let request = 0; request < 2; request++) {
-			expectSame({ model: "m", messages: plain }, "messages", "iterator");
+			await expectSame({ model: "m", messages: plain }, "messages", "iterator");
 		}
 		expect(iterated).toBe(0);
 		expect(plain).toHaveLength(2);
 	});
 
-	it("accepts the array toJSON of json-body.ts, which serializes the array as it is", () => {
+	it("accepts the array toJSON of json-body.ts, which serializes the array as it is", async () => {
 		const items = awkward();
 		cacheJsonSerialization(items);
 		const toJSON = (items as unknown as { toJSON: unknown }).toJSON;
-		expect(encode({ messages: items }, "messages", "c")).toBeUndefined();
-		expect(encode({ messages: items }, "messages", "c", toJSON)).toBe(JSON.stringify({ messages: items }));
+		expect(await encode({ messages: items }, "messages", "c")).toBeUndefined();
+		expect(await encode({ messages: items }, "messages", "c", toJSON)).toBe(JSON.stringify({ messages: items }));
 	});
 });
 

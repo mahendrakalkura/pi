@@ -8,8 +8,10 @@
  * sendJsonBodyAsBytes(client, items, key, conversation) makes the SDK client send the body that holds `items` (the
  * request's messages or input array) as a Blob of UTF-8 bytes. Each item is compared with a snapshot of the item at the
  * same index in the conversation's previous request; an equal item reuses that request's bytes, any other is
- * serialized again. Only the comparison walks the whole conversation, and it copies nothing. The Blob joins the parts
- * (one copy), and fetch sends the Blob's bytes as they are (it would copy a string or a Uint8Array once more).
+ * serialized again. Only the comparison walks the whole conversation, and it copies nothing. The parts are Blobs, and
+ * the body is a Blob made of them: Pi-Bolt's runtime keeps such a Blob as its parts and fetch sends them one after the
+ * other (other runtimes join them: one copy); fetch sends a Blob's bytes as they are (it would copy a string or a
+ * Uint8Array once more).
  *
  * The bytes are the UTF-8 encoding of what JSON.stringify(body) returns, which is what the SDK would send:
  * - JSON.stringify of an array is "[" + the items' JSON joined with "," + "]", and an item's JSON depends only on the
@@ -36,7 +38,8 @@ import { cachedArrayToJSON, cacheJsonSerialization } from "./json-body.ts";
 
 const { isRawJSON } = JSON as unknown as { isRawJSON?: (value: unknown) => boolean };
 
-type Bytes = Uint8Array<ArrayBuffer>;
+/** UTF-8 bytes: a Blob, which cannot change, so a Blob made of them can keep them as they are. */
+type Bytes = Blob;
 
 /** The structure of an object serialized before; strings are shared with it. */
 class ObjectSnapshot {
@@ -146,8 +149,9 @@ const MAX_IDLE_REQUESTS = 32;
 
 const conversations = new Map<string, Conversation>();
 let requests = 0;
-const encoder = new TextEncoder();
-const EMPTY: Bytes = new Uint8Array(0);
+/** The UTF-8 bytes of `text`. */
+const utf8 = (text: string): Bytes => new Blob([text]);
+const EMPTY: Bytes = new Blob([]);
 
 function conversationFor(key: string): Conversation {
 	requests++;
@@ -180,7 +184,7 @@ function isPlainItems(items: unknown[], allowedToJSON: unknown): boolean {
 	return toJSON === undefined || toJSON === allowedToJSON;
 }
 
-const COMMA: Bytes = encoder.encode(",");
+const COMMA: Bytes = utf8(",");
 
 /**
  * The UTF-8 bytes of JSON.stringify(body) in parts, in order, reusing the conversation's previous bytes of each item
@@ -209,8 +213,8 @@ export function jsonBodyParts(
 	const tail = `]${text.slice(at + PLACEHOLDER_JSON.length)}`;
 
 	const state = conversationFor(conversation);
-	const headBytes = head === state.head ? state.headBytes : encoder.encode(head);
-	const tailBytes = tail === state.tail ? state.tailBytes : encoder.encode(tail);
+	const headBytes = head === state.head ? state.headBytes : utf8(head);
+	const tailBytes = tail === state.tail ? state.tailBytes : utf8(tail);
 	const snapshots = new Array<unknown>(items.length);
 	const bytes = new Array<Bytes>(items.length);
 	const parts: Bytes[] = [headBytes];
@@ -222,7 +226,7 @@ export function jsonBodyParts(
 			bytes[i] = state.bytes[i];
 		} else {
 			// An item that serializes to nothing (undefined, a function) is null in an array.
-			bytes[i] = encoder.encode(JSON.stringify(item) ?? "null");
+			bytes[i] = utf8(JSON.stringify(item) ?? "null");
 			snapshots[i] = snapshot(item);
 		}
 		if (i > 0) parts.push(COMMA);
