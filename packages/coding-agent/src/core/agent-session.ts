@@ -185,6 +185,16 @@ export function parseSkillBlock(text: string): ParsedSkillBlock | null {
 	};
 }
 
+/**
+ * One-line label for user message text: an expanded skill block becomes the
+ * `/skill:` command that produced it, and any other text passes through.
+ */
+export function formatSkillInvocation(text: string): string {
+	const skill = parseSkillBlock(text);
+	if (!skill) return text;
+	return skill.userMessage ? `/skill:${skill.name} ${skill.userMessage}` : `/skill:${skill.name}`;
+}
+
 /** Tool execution events of calls a tool made through `ctx.executeTool()` carry `parentToolCallId`. */
 type WithParentToolCallId<E> = E extends {
 	type: "tool_execution_start" | "tool_execution_update" | "tool_execution_end";

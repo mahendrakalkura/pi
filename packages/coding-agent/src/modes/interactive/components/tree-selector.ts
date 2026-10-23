@@ -12,6 +12,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import { formatSkillInvocation } from "../../../core/agent-session.ts";
 import type { SessionTreeNode } from "../../../core/session-manager.ts";
 import { formatReadLineRange } from "../../../core/tools/render-utils.ts";
 import { theme } from "../theme/theme.ts";
@@ -783,7 +784,9 @@ class TreeList implements Component {
 				const role = msg.role;
 				if (role === "user") {
 					const msgWithContent = msg as { content?: unknown };
-					const content = normalize(this.extractContent(msgWithContent.content));
+					// Parse the full text: truncating first would cut the closing </skill> tag.
+					const text = formatSkillInvocation(this.extractFullContent(msgWithContent.content));
+					const content = normalize(text.slice(0, 200));
 					result = theme.fg("accent", "user: ") + content;
 				} else if (role === "assistant") {
 					const msgWithContent = msg as { content?: unknown; stopReason?: string; errorMessage?: string };
