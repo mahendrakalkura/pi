@@ -183,6 +183,7 @@ export {
 	renderFakeCursor,
 	renderSharedLines,
 	type SizeValue,
+	setRenderClockForTest,
 	type TUI,
 	type TuiInputListener,
 	type TuiInputListenerResult,
