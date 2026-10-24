@@ -234,7 +234,7 @@ Pi-Bolt performance commits left out, and why:
 - `5886ff86b` and `48a88f629` target the models.json validation of an older upstream `model-config.ts`. On the current code, with the 65 KB `models.json`, the compiled validator (about 7 ms) costs no more than `Value.Check` (6 to 10 ms).
 - `d6eb4f61b` needs Pi-Bolt's switch from substring to host matching of provider base URLs, which upstream does not have.
 - `b8183a712` needs Pi-Bolt's rewrite of `AgentSession._emitExtensionEvent`.
-- `08d3c1c8f`, `75c3920c4`, `0c66e6831`, and `587afc211` reuse the serialized JSON of unchanged messages in each request body. They change how every model request is built, including the Anthropic OAuth requests that `accounts.ts` reshapes in `before_provider_request`, so requests stay exactly as upstream builds them.
+- `587afc211` reused the JSON of long strings in openai-completions requests; Pi-Bolt reverted it in `d23d4c3b4` for the memory it held. Its successors `08d3c1c8f`, `16483320b`, `75c3920c4`, `ff235b1b1`, and `0c66e6831` are ported; on 2026-10-24 every request of a 20-tool-call session on nine providers, Anthropic OAuth through `accounts.ts` included, matched `JSON.stringify` byte for byte.
 - `bd6fd0605`, `8dea8b749`, and `d9b8a371d` build each provider's model catalog on first use, which rewrites the generated model data that upstream regenerates every release.
 - `0d04707ee`, `1d46e7784`, `68a250c85`, `e831e1439`, `557aa0276`, and `f6236cc0d` change Windows only.
 
