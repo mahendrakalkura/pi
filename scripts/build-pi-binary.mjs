@@ -292,7 +292,12 @@ if (bundling) {
 }
 
 const result = await Bun.build({
+	// Precompiled JavaScriptCore bytecode spares every start the parse of the whole bundle (about 15 MB of source):
+	// `pi --version` drops from about 250 ms to 50 ms. Without format "esm", Bun compiles the bytecode as CommonJS,
+	// which rejects the bundle's import.meta at startup.
+	bytecode: true,
 	compile: { autoloadBunfig: false, autoloadDotenv: false, outfile },
+	format: "esm",
 	// Workers are embedded only as explicit entrypoints, at their path relative to `root`. Upstream's
 	// main entry is dist/bun/cli.js, which puts that root at the package directory; config.ts and
 	// image-resize.ts look the workers up under ./src/ accordingly, so the root is pinned to match.
