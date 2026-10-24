@@ -471,6 +471,14 @@ export interface SshConnectOptions extends SshTarget {
 	onLog?: ConnectionOptions["onLog"];
 }
 
+/** POSIX `sh` script that starts `$0` with `"$@"` through the login shell `$SHELL`, fish included. */
+const LOGIN_SHELL_LAUNCH = [
+	'case "${SHELL##*/}" in',
+	'fish) exec "$SHELL" -l -c "exec \\$argv" "$0" "$@" ;;',
+	`*) exec "$SHELL" -lc 'exec "$0" "$@"' "$0" "$@" ;;`,
+	"esac",
+].join(" ");
+
 /** The remote command that starts the daemon at `file`, before the `serve` arguments. */
 function launchCommand(remote: RemotePlatform, file: string, loginShell: boolean): string {
 	if (remote.platform === "windows") {
@@ -478,8 +486,10 @@ function launchCommand(remote: RemotePlatform, file: string, loginShell: boolean
 		if (remote.shell === "powershell") return `& ${quotePowerShell(file)}`;
 		return file.includes(" ") ? `"${file}"` : file;
 	}
-	// `$0` is the daemon, `"$@"` its arguments; `$SHELL` is the login shell's own name for itself.
-	if (loginShell) return `exec "$SHELL" -lc 'exec "$0" "$@"' ${quotePosix(file)}`;
+	// `$0` is the daemon, `"$@"` its arguments; `$SHELL` is the login shell's own name for itself. sshd hands the whole
+	// line to the account's shell, which may be fish: `sh` parses it instead, and starts fish's login shell with `$argv`,
+	// fish's name for the arguments, since fish rejects `"$@"`.
+	if (loginShell) return `exec sh -c ${quotePosix(LOGIN_SHELL_LAUNCH)} ${quotePosix(file)}`;
 	return quotePosix(file);
 }
 
