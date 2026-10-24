@@ -199,15 +199,7 @@ mise exec node@24 -- npm run build:daemon --workspace packages/env
 env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
 # test.sh must not see the provider API keys the Fish shell exports: with keys present, Pi's
 # test harness sees hundreds of available models and the selector tests assert on a short list.
-# Always run the pi-env SSH tests under bash, never under the account shell. The test sshd starts the
-# daemon through the account's login shell, which is fish on both machines, and fish rejects the
-# `exec "$SHELL" -lc 'exec "$0" "$@"'` in `launchCommand`, so "starts the daemon through the login shell
-# only when asked" exits 127 inside test.sh. That one failure in test.sh is expected; the bash run below
-# is authoritative for `packages/env/test/ssh.test.ts`, and every other test.sh failure still stops the sync.
-(cd packages/env \
-    && sed 's|`SetEnv HOME=${home}`|`SetEnv HOME=${home} SHELL=/bin/bash`|' test/ssh.test.ts > test/ssh-bash.scratch.test.ts \
-    && env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- node ../../node_modules/vitest/dist/cli.js --run test/ssh-bash.scratch.test.ts; \
-    status=$?; rm -f test/ssh-bash.scratch.test.ts; exit $status)
+# test.sh passes in full under fish, the account shell on both machines; any failure stops the sync.
 
 # 4. Extension packages, then the binary with the dotfiles extensions compiled in.
 (cd packages/coding-agent/bundle && mise exec node@24 -- npm install --no-audit --no-fund)
@@ -229,6 +221,22 @@ git push --force-with-lease fork mahendra
 ```
 
 `~/.local/bin/pi` already points at `packages/coding-agent/dist/pi`, so the new binary is live as soon as step 4 finishes; there is nothing to relink.
+
+### Pi-Bolt performance port
+
+`mahendra` carries the performance commits of github.com/opensec-git/Pi-Bolt (MIT, credited in `LICENSE`), cherry-picked with `-x`, so `git log --grep "cherry picked from commit" mahendra` lists each one with its Pi-Bolt digest and OpenSec as author. The selection is Pi-Bolt's `perf` commits for the TUI, tools, sessions, and streaming, plus the fixes and tests that follow them. Pi-Bolt's AOT compiler, installer, update channel, themes, and branding stay out.
+
+To take later Pi-Bolt commits, fetch with `git fetch --no-tags https://github.com/opensec-git/Pi-Bolt pi-bolt:refs/pi-bolt/main`, cherry-pick with `-x`, then delete the ref with `git update-ref -d refs/pi-bolt/main`. Without `--no-tags`, the fetch adds Pi-Bolt's 36 `bolt-v*` tags.
+
+Pi-Bolt performance commits left out, and why:
+
+- `5053b8724` and `42c2eab76` change fullscreen mode only, and `tuiMode` is `regular`.
+- `5886ff86b` and `48a88f629` target the models.json validation of an older upstream `model-config.ts`. On the current code, with the 65 KB `models.json`, the compiled validator (about 7 ms) costs no more than `Value.Check` (6 to 10 ms).
+- `d6eb4f61b` needs Pi-Bolt's switch from substring to host matching of provider base URLs, which upstream does not have.
+- `b8183a712` needs Pi-Bolt's rewrite of `AgentSession._emitExtensionEvent`.
+- `08d3c1c8f`, `75c3920c4`, `0c66e6831`, and `587afc211` reuse the serialized JSON of unchanged messages in each request body. They change how every model request is built, including the Anthropic OAuth requests that `accounts.ts` reshapes in `before_provider_request`, so requests stay exactly as upstream builds them.
+- `bd6fd0605`, `8dea8b749`, and `d9b8a371d` build each provider's model catalog on first use, which rewrites the generated model data that upstream regenerates every release.
+- `0d04707ee`, `1d46e7784`, `68a250c85`, `e831e1439`, `557aa0276`, and `f6236cc0d` change Windows only.
 
 ### Bumping an extension package
 
