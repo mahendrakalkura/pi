@@ -553,7 +553,8 @@ class ModelsImpl implements MutableModels {
 		const stored = await this.modelsStore.read(provider.id, { signal });
 		await provider.refreshModels({
 			credential,
-			stored: stored ? withKnownModelTypes(structuredClone(stored)) : undefined,
+			// The store's read() returns an entry this call owns, so the provider gets it without another copy.
+			stored: stored ? withKnownModelTypes(stored) : undefined,
 			publish: (publication) => this.publishProviderModels(provider.id, generation, signal, publication),
 			allowNetwork,
 			force: allowNetwork ? force : undefined,
