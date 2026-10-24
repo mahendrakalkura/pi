@@ -11,7 +11,7 @@ import {
 	modelsAreEqual,
 } from "@earendil-works/pi-ai";
 import chalk from "chalk";
-import { minimatch } from "minimatch";
+import { Minimatch } from "minimatch";
 import { isValidThinkingLevel } from "../cli/args.ts";
 import { DEFAULT_THINKING_LEVEL } from "./defaults.ts";
 import type { ModelRuntime } from "./model-runtime.ts";
@@ -374,11 +374,9 @@ export function resolveModelScopeFromModels(
 			} else {
 				// Match against "provider/modelId" format OR just model ID
 				// This allows "*sonnet*" to match without requiring "anthropic/*sonnet*"
-				matches = models.filter(
-					(m) =>
-						minimatch(`${m.provider}/${m.id}`, globPattern, { nocase: true }) ||
-						minimatch(m.id, globPattern, { nocase: true }),
-				);
+				// One compiled pattern for every model: minimatch() compiles the pattern again on each call.
+				const glob = new Minimatch(globPattern, { nocase: true });
+				matches = models.filter((m) => glob.match(`${m.provider}/${m.id}`) || glob.match(m.id));
 			}
 			if (matches.length === 0) noMatch(pattern);
 			for (const model of matches) add(model, thinkingLevel);
