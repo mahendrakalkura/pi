@@ -178,8 +178,7 @@ async function streamWriteCall(json: string, chunks: string[], expanded: boolean
 
 	await update({ type: "toolcall_start", contentIndex: 1, partial: output });
 	expect(renderRequests()).toBe(1);
-	let drawn = host.chatContainer.render(WIDTH);
-	expect(drawn).toEqual(renderFromNothing(output, block.arguments, expanded));
+	expect(host.chatContainer.render(WIDTH)).toEqual(renderFromNothing(output, block.arguments, expanded));
 
 	let frames = 1;
 	for (let index = 0; index < chunks.length; index++) {
@@ -195,21 +194,27 @@ async function streamWriteCall(json: string, chunks: string[], expanded: boolean
 			expect(block.arguments, label).toEqual(new ToolCallArgumentsStream().append(received));
 		}
 
+		// The transcript is rendered around a delta that keeps the arguments, and at checkpoints. The TUI draws many deltas
+		// in one frame, and rendering it for every delta of a large file takes minutes.
+		const changed = block.arguments !== before;
+		const screenBefore = changed ? undefined : host.chatContainer.render(WIDTH);
+
 		const requestsBefore = renderRequests();
 		await update({ type: "toolcall_delta", contentIndex: 1, delta: chunk, partial: output });
 		const requested = renderRequests() > requestsBefore;
 		if (requested) frames++;
 		// A frame is asked for exactly when the delta gave the tool call new arguments.
-		expect(requested, label).toBe(block.arguments !== before);
+		expect(requested, label).toBe(changed);
+		if (screenBefore === undefined && !checkpoint) continue;
+
 		const lines = host.chatContainer.render(WIDTH);
-		if (!requested) {
-			// The frame that was not drawn would have drawn what the last one did.
-			expect(lines, label).toEqual(drawn);
+		if (screenBefore !== undefined) {
+			// The frame that was not asked for would have drawn what the screen showed before the delta.
+			expect(lines, label).toEqual(screenBefore);
 		}
 		if (checkpoint) {
 			expect(lines, label).toEqual(renderFromNothing(output, block.arguments, expanded));
 		}
-		drawn = lines;
 	}
 
 	expect(received).toBe(json);
