@@ -63,7 +63,13 @@ describe("tmux hyperlink probe", { skip: process.platform === "win32", timeout: 
 		const started = performance.now();
 		assert.strictEqual(getCapabilities().hyperlinks, false);
 		assert.ok(performance.now() - started < 40, "getCapabilities() waited for tmux");
-		await changed;
+		// The probe unrefs its child process, so on Node 22 nothing else keeps the event loop alive during the wait.
+		const keepAlive = setInterval(() => {}, 1_000);
+		try {
+			await changed;
+		} finally {
+			clearInterval(keepAlive);
+		}
 		assert.strictEqual(getCapabilities().hyperlinks, true);
 	});
 
