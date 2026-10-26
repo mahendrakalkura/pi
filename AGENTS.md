@@ -238,6 +238,7 @@ Pi-Bolt performance commits left out, and why:
 - `587afc211` reused the JSON of long strings in openai-completions requests; Pi-Bolt reverted it in `d23d4c3b4` for the memory it held. Its successors `08d3c1c8f`, `16483320b`, `75c3920c4`, `ff235b1b1`, and `0c66e6831` are ported; on 2026-10-24 every request of a 20-tool-call session on nine providers, Anthropic OAuth through `accounts.ts` included, matched `JSON.stringify` byte for byte.
 - `bd6fd0605`, `8dea8b749`, and `d9b8a371d` build each provider's model catalog on first use, which rewrites the generated model data that upstream regenerates every release.
 - `0d04707ee`, `1d46e7784`, `68a250c85`, `e831e1439`, `557aa0276`, and `f6236cc0d` change Windows only.
+- `94559b68f` and `c9a8e4472` parsed streamed tool-call arguments only when they had grown by an eighth, then without partial-json. Upstream `f715a15c1` (#9265) replaced every provider's streaming parse with `ToolCallArgumentsStream`, so the 2026-10-27 sync dropped both. The streaming parts of `1f13ad060` and `f67707c4c` now build on `ToolCallArgumentsStream`, and the Pi Messages, Mistral, agent proxy and session search changes of `1f13ad060` gave way to upstream's own.
 
 ### Bumping an extension package
 
