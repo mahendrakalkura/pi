@@ -164,7 +164,15 @@ export function createGrepToolDefinition(
 
 						// --no-config: the tool contract (literal, glob, limit, ...) must not depend on
 						// ambient user config like RIPGREP_CONFIG_PATH. Users can customize via bash or extensions.
-						const args: string[] = ["--no-config", "--json", "--line-number", "--color=never", "--hidden"];
+						// --one-file-system: a search rooted above a mount point never walks into other drives.
+						const args: string[] = [
+							"--no-config",
+							"--json",
+							"--line-number",
+							"--color=never",
+							"--hidden",
+							"--one-file-system",
+						];
 						if (ignoreCase) args.push("--ignore-case");
 						if (literal) args.push("--fixed-strings");
 						// rg never matches a leading "./" ("./src/*.ts" finds nothing), so drop it; "!" negates.

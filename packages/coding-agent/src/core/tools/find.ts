@@ -183,7 +183,8 @@ export function createFindToolDefinition(
 							return;
 						}
 
-						const args: string[] = ["--color=never", "--hidden"];
+						// --one-file-system: a search rooted above a mount point never walks into other drives.
+						const args: string[] = ["--color=never", "--hidden", "--one-file-system"];
 
 						// fd normally ignores .gitignore outside git repos, so keep --no-require-git
 						// there. Inside repos, use fd's default git-aware behavior so parent
