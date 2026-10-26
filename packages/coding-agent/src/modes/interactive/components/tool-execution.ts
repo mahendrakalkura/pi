@@ -193,6 +193,8 @@ export class ToolExecutionComponent extends Container {
 		if (args === this.args) return false;
 		this.args = args;
 		this.argsPending = true;
+		// The containers this is in keep its lines until told of a change: without this they would draw the old arguments.
+		reportRenderChange(this);
 		this.ui.requestRender();
 		return true;
 	}
