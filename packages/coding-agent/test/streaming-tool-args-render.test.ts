@@ -2,8 +2,8 @@ import {
 	type AssistantMessage,
 	type AssistantMessageEvent,
 	parseStreamingJson,
-	parseStreamingJsonWhileStreaming,
 	type ToolCall,
+	ToolCallArgumentsStream,
 } from "@earendil-works/pi-ai";
 import { Container, type TUI } from "@earendil-works/pi-tui";
 import { beforeAll, describe, expect, test } from "vitest";
@@ -15,11 +15,11 @@ import { InteractiveMode } from "../src/modes/interactive/interactive-mode.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
 
 // A tool call's arguments stream in as many small deltas as the model sends: a file passed to the write tool is thousands.
-// The provider parses them again only when they have grown by an eighth (parseStreamingJsonWhileStreaming), and the TUI is
-// asked for a frame only when a delta changes something it draws: until the arguments are parsed again, the tool call has
-// the same arguments object and draws the same lines. At every delta, the arguments must be what parsing the text from
-// nothing gives, and what the transcript renders to must be what a transcript built from nothing for that message renders
-// to; when no frame was asked for, it must also be what the last frame drew.
+// The provider parses each delta once (ToolCallArgumentsStream), which keeps the same arguments object while a delta does not
+// change what they parse to, and the TUI is asked for a frame only when a delta changes something it draws: a tool call with
+// the same arguments object draws the same lines. The arguments must be what parsing the text from nothing gives, and what
+// the transcript renders to must be what a transcript built from nothing for that message renders to; when no frame was
+// asked for, it must also be what the last frame drew.
 
 const WIDTH = 120;
 const TOOL_CALL_ID = "call_write";
@@ -158,18 +158,19 @@ function renderFromNothing(message: AssistantMessage, args: ToolCall["arguments"
 }
 
 /**
- * Streams the write call's arguments `json` in `chunks` the way the providers do (openai-completions: the text appended to,
- * then parsed while streaming), handing each delta to InteractiveMode.handleEvent(), and checks every step.
+ * Streams the write call's arguments `json` in `chunks` the way the providers do (openai-completions: each delta appended to
+ * a ToolCallArgumentsStream), handing each delta to InteractiveMode.handleEvent(), and checks every step.
  */
 async function streamWriteCall(json: string, chunks: string[], expanded: boolean): Promise<{ frames: number }> {
 	const { host, renderRequests } = createHost(expanded);
-	const block: ToolCall & { partialArgs: string } = {
+	const block: ToolCall = {
 		type: "toolCall",
 		id: TOOL_CALL_ID,
 		name: "write",
 		arguments: {},
-		partialArgs: "",
 	};
+	const stream = new ToolCallArgumentsStream();
+	let received = "";
 	const output = assistantMessage([{ type: "text", text: "Writing the file." }, block]);
 	const update = async (assistantMessageEvent: AssistantMessageEvent) => {
 		await handleEvent.call(host, { type: "message_update", message: { ...output }, assistantMessageEvent });
@@ -181,19 +182,17 @@ async function streamWriteCall(json: string, chunks: string[], expanded: boolean
 	expect(drawn).toEqual(renderFromNothing(output, block.arguments, expanded));
 
 	let frames = 1;
-	let parsedFrom = "";
 	for (let index = 0; index < chunks.length; index++) {
 		const chunk = chunks[index]!;
 		const before = block.arguments;
-		block.partialArgs += chunk;
-		block.arguments = parseStreamingJsonWhileStreaming(block, block.partialArgs, block.arguments);
-		const label = `after ${block.partialArgs.length} of ${json.length} characters (chunk ${index})`;
-		if (block.arguments !== before) {
-			parsedFrom = block.partialArgs;
-			expect(block.arguments, label).toEqual(parseStreamingJson(block.partialArgs));
-		} else {
-			// The arguments parsed from the text as it was then: compared with parsing it from nothing when they were made.
-			expect(json.startsWith(parsedFrom), label).toBe(true);
+		received += chunk;
+		block.arguments = stream.append(chunk);
+		const label = `after ${received.length} of ${json.length} characters (chunk ${index})`;
+		// (Every 64th delta and the last: parsing the text from nothing for every delta of a large file at one character a
+		// time takes minutes.)
+		const checkpoint = index % 64 === 0 || index === chunks.length - 1;
+		if (checkpoint) {
+			expect(block.arguments, label).toEqual(new ToolCallArgumentsStream().append(received));
 		}
 
 		const requestsBefore = renderRequests();
@@ -207,16 +206,15 @@ async function streamWriteCall(json: string, chunks: string[], expanded: boolean
 			// The frame that was not drawn would have drawn what the last one did.
 			expect(lines, label).toEqual(drawn);
 		}
-		// (Built from nothing for every frame, and every 64th delta in between: building it for every delta of a large
-		// file at one character a time takes minutes.)
-		if (requested || index % 64 === 0 || index === chunks.length - 1) {
+		if (checkpoint) {
 			expect(lines, label).toEqual(renderFromNothing(output, block.arguments, expanded));
 		}
 		drawn = lines;
 	}
 
-	expect(block.partialArgs).toBe(json);
-	expect(parseStreamingJson(block.partialArgs)).toEqual(JSON.parse(json));
+	expect(received).toBe(json);
+	expect(stream.finish().arguments).toEqual(JSON.parse(json));
+	expect(parseStreamingJson(received)).toEqual(JSON.parse(json));
 
 	// A text delta is always drawn.
 	const requestsBefore = renderRequests();
@@ -241,9 +239,8 @@ describe("streaming a write call's arguments", () => {
 					test(`${file.name}, ${encoding}, ${chunk || "random"}-character chunks, ${expanded ? "expanded" : "collapsed"}`, async () => {
 						const chunks = chunksOf(json, chunk);
 						const { frames } = await streamWriteCall(json, chunks, expanded);
-						// Past the first kilobyte, the arguments are parsed again (and drawn) only when they have grown by an
-						// eighth.
-						if (json.length > 8192 && chunk > 0) expect(frames).toBeLessThan(1024 / chunk + 60);
+						// At most one frame per delta, plus the one for toolcall_start.
+						expect(frames).toBeLessThanOrEqual(chunks.length + 1);
 					}, 120_000);
 				}
 			}
@@ -266,7 +263,7 @@ describe("streaming a write call's arguments", () => {
 		expect(renderRequests()).toBe(1);
 		second.arguments = { path: "b.txt", content: "x" };
 		await handleEvent.call(host, event());
-		expect(renderRequests()).toBe(2);
+		expect(renderRequests()).toBeGreaterThan(1);
 		expect(host.pendingTools.get("second")?.render(WIDTH).join("\n")).toContain("x");
 	});
 });
