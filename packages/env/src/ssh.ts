@@ -473,6 +473,7 @@ export interface SshConnectOptions extends SshTarget {
 
 /** POSIX `sh` script that starts `$0` with `"$@"` through the login shell `$SHELL`, fish included. */
 const LOGIN_SHELL_LAUNCH = [
+	// biome-ignore lint/suspicious/noTemplateCurlyInString: shell parameter expansion, not a template placeholder
 	'case "${SHELL##*/}" in',
 	'fish) exec "$SHELL" -l -c "exec \\$argv" "$0" "$@" ;;',
 	`*) exec "$SHELL" -lc 'exec "$0" "$@"' "$0" "$@" ;;`,
