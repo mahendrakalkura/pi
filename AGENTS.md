@@ -219,6 +219,9 @@ packages/coding-agent/dist/pi --version
 
 # 6. Publish the rebased branch. The rebase rewrote history, so a lease-protected force push is required.
 git push --force-with-lease fork mahendra
+#    The fetch above brings upstream's release tags but nothing pushes them to fork, and fork's Publish Model Catalog
+#    workflow fails with "not a valid object name: v<version>" when the latest release tag is missing there.
+git push fork --tags
 ```
 
 `~/.local/bin/pi` already points at `packages/coding-agent/dist/pi`, so the new binary is live as soon as step 4 finishes; there is nothing to relink.
