@@ -3,9 +3,6 @@
   "private": true,
   "type": "module",
   "description": "Published Pi extension packages compiled into the binary by scripts/build-pi-binary.mjs, plus any third-party dependency that a bundled local extension imports.",
-  "scripts": {
-    "postinstall": "bash patches/apply.sh"
-  },
   "dependencies": {
     "@gotgenes/pi-subagents": "21.7.3",
     "@gotgenes/pi-subagents-worktrees": "0.3.3",
@@ -15,5 +12,8 @@
   },
   "devDependencies": {
     "pi-browser-use": "0.11.6"
+  },
+  "overrides": {
+    "chrome-devtools-mcp": "1.12.0"
   }
 }
