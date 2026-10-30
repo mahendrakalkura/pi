@@ -376,7 +376,9 @@ function getResumeArgs(sessionManager: SessionManager): string[] | undefined {
 /** The resume command as shell text for the user to copy. */
 export function formatResumeCommand(sessionManager: SessionManager): string | undefined {
 	if (!process.stdout.isTTY) return undefined;
-	return getResumeArgs(sessionManager)?.map(quoteIfNeeded).join(" ");
+	const args = getResumeArgs(sessionManager);
+	if (!args) return undefined;
+	return ["cd", quoteIfNeeded(sessionManager.getCwd()), "&&", ...args.map(quoteIfNeeded)].join(" ");
 }
 
 /**

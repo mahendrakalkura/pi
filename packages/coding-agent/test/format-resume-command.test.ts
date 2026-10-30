@@ -44,20 +44,20 @@ function createTempFile(): string {
 }
 
 function createSessionManager(options: {
+	cwd?: string;
 	persisted?: boolean;
 	sessionFile?: string;
 	sessionId?: string;
 	sessionDir?: string;
 	usesDefaultSessionDir?: boolean;
-	cwd?: string;
 }): SessionManager {
 	return {
+		getCwd: () => options.cwd ?? "/tmp/project",
 		isPersisted: () => options.persisted ?? true,
 		getSessionFile: () => options.sessionFile,
 		getSessionId: () => options.sessionId ?? "0197f6e4-4cf9-7f44-a2d8-f8f7f49ee9d3",
 		getSessionDir: () => options.sessionDir ?? "/tmp/pi-sessions",
 		usesDefaultSessionDir: () => options.usesDefaultSessionDir ?? true,
-		getCwd: () => options.cwd ?? process.cwd(),
 	} as unknown as SessionManager;
 }
 
@@ -67,7 +67,19 @@ describe("formatResumeCommand", () => {
 		const sessionFile = createTempFile();
 		const sessionManager = createSessionManager({ sessionFile, sessionId: "test-session" });
 
-		expect(formatResumeCommand(sessionManager)).toBe(`${APP_NAME} --session test-session`);
+		expect(formatResumeCommand(sessionManager)).toBe(`cd /tmp/project && ${APP_NAME} --session test-session`);
+	});
+
+	it("quotes working directories containing spaces", () => {
+		setStdoutIsTTY(true);
+		const sessionFile = createTempFile();
+		const sessionManager = createSessionManager({
+			cwd: "/tmp/my project",
+			sessionFile,
+			sessionId: "test-session",
+		});
+
+		expect(formatResumeCommand(sessionManager)).toBe(`cd '/tmp/my project' && ${APP_NAME} --session test-session`);
 	});
 
 	it("includes unquoted safe session dirs for non-default session dirs", () => {
@@ -81,7 +93,7 @@ describe("formatResumeCommand", () => {
 		});
 
 		expect(formatResumeCommand(sessionManager)).toBe(
-			`${APP_NAME} --session-dir /tmp/custom-pi-sessions --session test-session`,
+			`cd /tmp/project && ${APP_NAME} --session-dir /tmp/custom-pi-sessions --session test-session`,
 		);
 	});
 
@@ -96,7 +108,7 @@ describe("formatResumeCommand", () => {
 		});
 
 		expect(formatResumeCommand(sessionManager)).toBe(
-			`${APP_NAME} --session-dir '/tmp/custom pi sessions' --session test-session`,
+			`cd /tmp/project && ${APP_NAME} --session-dir '/tmp/custom pi sessions' --session test-session`,
 		);
 	});
 
@@ -111,7 +123,7 @@ describe("formatResumeCommand", () => {
 		});
 
 		expect(formatResumeCommand(sessionManager)).toBe(
-			`${APP_NAME} --session-dir '/tmp/custom pi'\\''s sessions' --session test-session`,
+			`cd /tmp/project && ${APP_NAME} --session-dir '/tmp/custom pi'\\''s sessions' --session test-session`,
 		);
 	});
 
@@ -127,7 +139,7 @@ describe("formatResumeCommand", () => {
 		});
 
 		expect(formatResumeCommand(sessionManager)).toBe(
-			`${APP_NAME} --agent-dir /tmp/custom-pi-agent --session-dir /tmp/custom-pi-agent/sessions --session test-session`,
+			`cd /tmp/project && ${APP_NAME} --agent-dir /tmp/custom-pi-agent --session-dir /tmp/custom-pi-agent/sessions --session test-session`,
 		);
 	});
 
@@ -137,7 +149,7 @@ describe("formatResumeCommand", () => {
 		const sessionFile = createTempFile();
 		const sessionManager = createSessionManager({ sessionFile, sessionId: "test-session" });
 
-		expect(formatResumeCommand(sessionManager)).toBe(`${APP_NAME} --session test-session`);
+		expect(formatResumeCommand(sessionManager)).toBe(`cd /tmp/project && ${APP_NAME} --session test-session`);
 	});
 
 	it("returns undefined when stdout is not a TTY", () => {
@@ -174,7 +186,7 @@ describe("formatResumeCommand", () => {
 describe("getProgramResumeCommand", () => {
 	it("appends the flags as typed after the session, in the session's directory", () => {
 		const sessionFile = createTempFile();
-		const sessionManager = createSessionManager({ sessionFile, sessionId: "test-session" });
+		const sessionManager = createSessionManager({ cwd: process.cwd(), sessionFile, sessionId: "test-session" });
 
 		expect(getProgramResumeCommand(sessionManager, ["-t", "read", "-e", "./ext.ts"])).toEqual({
 			argv: [APP_NAME, "--session", "test-session", "-t", "read", "-e", "./ext.ts"],
@@ -189,7 +201,7 @@ describe("getProgramResumeCommand", () => {
 
 		getProgramResumeCommand(sessionManager, ["-t", "read"]);
 
-		expect(formatResumeCommand(sessionManager)).toBe(`${APP_NAME} --session test-session`);
+		expect(formatResumeCommand(sessionManager)).toBe(`cd /tmp/project && ${APP_NAME} --session test-session`);
 	});
 
 	it("is undefined when flags were typed in another directory than the session's", () => {
