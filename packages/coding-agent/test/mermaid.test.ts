@@ -25,6 +25,28 @@ function transformMermaid(markdown: string, options: TransformOptions = {}): str
 }
 
 describe("Mermaid rendering", () => {
+	it("finds the word in a streaming text whatever chunk it is split across", () => {
+		// The transformer searches only what was added to the text it last found without the word (and the characters
+		// before it a match can start in): every prefix must be transformed as a transformer that never saw the others does.
+		const document =
+			"Some text first.\n\n```MerMaid\nflowchart LR\n  A[Start] --> B[Done]\n```\nThen more text, and a second mention: mermaid.";
+		for (const step of [1, 2, 3, 5, 7, 11]) {
+			const streaming = createMermaidMarkdownTransformer({ getMode: () => "streaming" });
+			for (let length = 1; length <= document.length; length += step) {
+				const markdown = document.slice(0, length);
+				const context = { availableWidth: 100, isStreaming: true, messageType: "assistant" as const };
+				expect(streaming(markdown, context), `${step}: ${length}`).toBe(
+					transformMermaid(markdown, { isStreaming: true }),
+				);
+			}
+			// Another text, not this one with text added.
+			const other = "mermaid alone";
+			expect(streaming(other, { availableWidth: 100, isStreaming: true, messageType: "assistant" })).toBe(
+				transformMermaid(other, { isStreaming: true }),
+			);
+		}
+	});
+
 	it("replaces Mermaid code blocks with Unicode diagrams", () => {
 		const markdown = "Before\n\n```mermaid\nflowchart LR\n  A[Start] --> B[Done]\n```\nAfter";
 		const rendered = transformMermaid(markdown);

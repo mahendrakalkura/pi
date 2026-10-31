@@ -4,13 +4,14 @@
 
 import { performance } from "node:perf_hooks";
 import { isKeyRelease, matchesKey } from "./keys.ts";
+import { invalidateRenderedMarkdown } from "./rendered-markdown.ts";
 import type { Terminal } from "./terminal.ts";
 import {
-	isOsc11BackgroundColorResponse,
-	parseOsc11BackgroundColor,
+	parseOscColorResponse,
 	parseTerminalColorSchemeReport,
 	type RgbColor,
 	type TerminalColorScheme,
+	type TerminalColors,
 } from "./terminal-colors.ts";
 import { getCapabilities, isImageLine, setCellDimensions } from "./terminal-image.ts";
 import { extractSegments, normalizeTerminalOutput, sliceByColumn, sliceWithWidth, visibleWidth } from "./utils.ts";
@@ -81,7 +82,13 @@ export interface TuiMouseDispatchResult extends TuiMouseEventResult {
 export function dispatchMouseEvent(component: Component, event: TuiMouseEvent): TuiMouseDispatchResult | undefined {
 	const result = component.handleMouse?.(event);
 	if (!result) return undefined;
-	if ("target" in result) return result as TuiMouseDispatchResult;
+	if ("target" in result) {
+		// The component forwarded the event to a child it hosts. Like a delegating container, it routes
+		// keys to that child itself, so it keeps keyboard focus. Focusing the child directly would leave
+		// focus on a detached component once the host removes it, e.g. a closed settings submenu.
+		const forwarded = result as TuiMouseDispatchResult;
+		return forwarded.focus && component.handleInput ? { ...forwarded, focusTarget: component } : forwarded;
+	}
 	if (!result.handled && !result.capture && !result.focus) return undefined;
 	return {
 		...result,
@@ -137,11 +144,49 @@ export interface Component {
 
 export type TuiInputListenerResult = { consume?: boolean; data?: string } | undefined;
 export type TuiInputListener = (data: string) => TuiInputListenerResult;
-type PendingOsc11BackgroundQuery = {
-	settled: boolean;
-	resolve: ((rgb: RgbColor | undefined) => void) | undefined;
+type PendingTerminalColorQuery = {
+	foreground?: RgbColor;
+	background?: RgbColor;
+	palette: Array<RgbColor | undefined>;
+	/** Targets that already replied, so duplicates do not count twice. */
+	replied: Set<string>;
+	/**
+	 * Receives the result: the promise's resolve until the timeout, then `onLateReply`. Unset once the
+	 * query completed (on the DA1 reply or once every color replied); later replies are ignored.
+	 */
+	deliver: ((colors: TerminalColors) => void) | undefined;
 	timer: NodeJS.Timeout | undefined;
 };
+
+/** The clock frames are spaced by (setRenderClockForTest()). */
+let renderClock: () => number = () => performance.now();
+
+/** For tests: the clock frames are spaced by, in milliseconds; undefined for the real one. */
+export function setRenderClockForTest(clock: (() => number) | undefined): void {
+	renderClock = clock ?? (() => performance.now());
+}
+
+/**
+ * When frames are slow, a frame that no input asked for (the model's stream, timers, widgets) starts no sooner than this
+ * many times the last frame's duration after the last one started (and never sooner than MIN_RENDER_INTERVAL_MS, as
+ * always): drawing for them takes at most about a third of the thread however slow a frame is, and what waits for the
+ * thread is not starved. A frame for input (a key, a paste, the mouse, a resize) is drawn as soon as before.
+ */
+const FRAME_SPACING_FACTOR = 3;
+
+const TERMINAL_PALETTE_SIZE = 16;
+/** OSC 10 and 11 plus OSC 4 for every palette color. */
+const TERMINAL_COLOR_REPLY_COUNT = 2 + TERMINAL_PALETTE_SIZE;
+/**
+ * Default colors, palette colors 0-15, and a trailing primary device attributes (DA1) request.
+ * Every terminal answers DA1 and terminals answer in order, so the DA1 reply marks the end of
+ * the color replies, including for terminals that ignore the color queries.
+ */
+const TERMINAL_COLOR_QUERY = `\x1b]10;?\x07\x1b]11;?\x07${Array.from(
+	{ length: TERMINAL_PALETTE_SIZE },
+	(_, index) => `\x1b]4;${index};?\x07`,
+).join("")}\x1b[c`;
+const DEVICE_ATTRIBUTES_RESPONSE_PATTERN = /^\x1b\[\?[\d;]*c$/;
 
 /**
  * Interface for components that can receive focus and display a hardware cursor.
@@ -166,6 +211,17 @@ export function isFocusable(component: Component | null): component is Component
  * TUI finds and strips this marker, then positions the hardware cursor there.
  */
 export const CURSOR_MARKER = "\x1b_pi:c\x07";
+
+/** Fake cursor markers - zero-width APC sequences around the text drawn as the cursor. See resolveFakeCursors(). */
+export const FAKE_CURSOR_START = "\x1b_pi:fc\x07";
+export const FAKE_CURSOR_END = "\x1b_pi:/fc\x07";
+// CURSOR_MARKER + FAKE_CURSOR_START + text + FAKE_CURSOR_END. Truncating the line right after the cursor cell drops the end.
+const FOCUSED_FAKE_CURSOR = /(\x1b_pi:c\x07)\x1b_pi:fc\x07(.*?)(?:\x1b_pi:\/fc\x07|$)/s;
+
+/** Wrap text in fake cursor markers. */
+export function renderFakeCursor(text: string): string {
+	return `${FAKE_CURSOR_START}${text}${FAKE_CURSOR_END}`;
+}
 
 export { visibleWidth };
 
@@ -313,42 +369,508 @@ type ActiveOverlayFocusRestoreState = EligibleOverlayFocusRestoreState | Blocked
 type OverlayFocusRestoreState = { status: "inactive" } | ActiveOverlayFocusRestoreState;
 type OverlayFocusRestorePolicy = "clear" | "preserve";
 
+/** render() functions whose component keeps its lines: see markStableRender(). */
+const stableRenders = new WeakSet<Component["render"]>();
+
+/**
+ * Declares that the components of a class keep their lines: their render() returns the same array again only while
+ * their lines are unchanged, and never modifies an array it returned. Containers then take an unchanged array as
+ * unchanged lines and a new array as changed lines instead of comparing them line by line, which keeps a frame from
+ * costing time in proportion to the whole transcript. (A new array with the same lines is taken as changed: the lines
+ * after it are joined again, and what is drawn is the same.) A subclass that overrides render() is not covered: it
+ * declares this itself if it keeps its lines. Components that do not declare it render exactly as before; their lines
+ * are compared.
+ */
+export function markStableRender(componentClass: { prototype: Component }): void {
+	stableRenders.add(componentClass.prototype.render);
+}
+
+/**
+ * Whether `component` keeps its lines (markStableRender()). A Container that does not override render() does:
+ * renderSharedLines() takes its lines from renderShared().
+ */
+export function isStableRender(component: Component): boolean {
+	return (
+		(component instanceof Container && component.render === Container.prototype.render) ||
+		stableRenders.has(component.render)
+	);
+}
+
+/**
+ * A component's lines, without the copy Container.render() makes: Container.renderShared() for a Container that does
+ * not override render(). The caller must not modify them.
+ */
+export function renderSharedLines(component: Component, width: number): string[] {
+	return component instanceof Container && component.render === Container.prototype.render
+		? component.renderShared(width)
+		: component.render(width);
+}
+
+/**
+ * Lines that their owner changes in place, from some line on, instead of making a new array for each change: a reply that
+ * streams in grows at its end, and making the lines of all of it again, at each level of components it is in, takes time
+ * in proportion to its length on every frame. Each change raises `revision` and records the first line it changed, so a
+ * reader that kept the revision it read knows which lines to read again (changedSince()).
+ * Only readers that do (renderLiveLines()) are given such lines; the others get arrays that never change (renderShared()).
+ */
+export interface LiveLines {
+	/** The lines. Not to be modified, and changed by their owner: read again after each render. */
+	readonly lines: readonly string[];
+	readonly revision: number;
+	/**
+	 * The first line that may differ from what the lines were at `revision` (lines added after that count as changed):
+	 * Infinity when nothing changed since, 0 when that revision is not known any more.
+	 */
+	changedSince(revision: number): number;
+}
+
+/** How many changes LiveLineArray remembers the first changed line of. */
+const LIVE_LINE_EDITS_KEPT = 32;
+
+/** LiveLines that its owner changes with edit(). */
+export class LiveLineArray implements LiveLines {
+	readonly lines: string[] = [];
+	revision = 0;
+	/** The first line changed by each of the last changes, the last one last: change `revision - k` at `starts.length - 1 - k`. */
+	private readonly starts: number[] = [];
+
+	changedSince(revision: number): number {
+		if (revision === this.revision) return Number.POSITIVE_INFINITY;
+		const changes = this.revision - revision;
+		if (changes < 0 || changes > this.starts.length) return 0;
+		let start = Number.POSITIVE_INFINITY;
+		for (let i = this.starts.length - changes; i < this.starts.length; i++) start = Math.min(start, this.starts[i]!);
+		return start;
+	}
+
+	/** Drops the lines from `start` on, for the owner to add the new ones (push()), and records the change. */
+	edit(start: number): void {
+		this.lines.length = Math.min(this.lines.length, start);
+		this.revision++;
+		this.starts.push(start);
+		if (this.starts.length > LIVE_LINE_EDITS_KEPT) this.starts.shift();
+	}
+}
+
+/** The live renderers (renderLiveLines()), by the method that identifies the class: render(), or renderShared() for a Container. */
+const liveRenders = new WeakMap<object, (this: Component, width: number) => LiveLines | undefined>();
+
+/**
+ * Declares how components render live lines (LiveLines): `renderLive` is called for a component whose render() is `key`, or,
+ * for a Container that does not override render(), whose renderShared() is `key`. A subclass that overrides that method is
+ * not covered, so it renders as it says it does. `renderLive` may return undefined: the component's lines are then taken as
+ * renderSharedLines() takes them.
+ */
+export function markLiveRender(
+	key: Component["render"] | Container["renderShared"],
+	renderLive: (this: Component, width: number) => LiveLines | undefined,
+): void {
+	liveRenders.set(key, renderLive);
+}
+
+/**
+ * A component's lines as LiveLines, for a reader that reads them again after each render as changedSince() says: for the
+ * components that render so (markLiveRender()); undefined for the others (renderSharedLines()).
+ */
+export function renderLiveLines(component: Component, width: number): LiveLines | undefined {
+	const key =
+		component instanceof Container && component.render === Container.prototype.render
+			? component.renderShared
+			: component.render;
+	return liveRenders.get(key)?.call(component, width);
+}
+
+/** What a list of children rendered to, joined (renderChildren()). */
+export interface RenderedChildren {
+	readonly width: number;
+	readonly children: readonly Component[];
+	/** The array each child returned. */
+	readonly arrays: readonly string[][];
+	readonly heights: readonly number[];
+	/** All the children's lines. Shared: not to be modified. */
+	readonly lines: string[];
+}
+
+/**
+ * Renders `children` at `width` and joins their lines, starting from what they rendered to the frame before:
+ * `previous` itself when no child's lines changed, otherwise new lines that keep the unchanged leading children's
+ * lines. A child's lines are unchanged when it is the same child and either keeps its lines (isStableRender()) and
+ * returned the same array, or does not keep its lines and returned the lines joined the frame before. The second check
+ * covers any component, including one that modifies its array in place. A child that keeps its lines and returned a new
+ * array is taken as changed without comparing its lines: while a reply streams in, that is the message growing, and
+ * comparing it line by line (at each level of containers it is in) would take time in proportion to its length every
+ * frame.
+ */
+export function renderChildren(
+	children: readonly Component[],
+	width: number,
+	previous: RenderedChildren | undefined,
+): RenderedChildren {
+	const count = children.length;
+	const before = previous?.width === width ? previous : undefined;
+	let index = 0;
+	let offset = 0;
+	let changedLines: string[] | undefined;
+	if (before !== undefined) {
+		for (; index < count; index++) {
+			const child = children[index]!;
+			const lines = renderSharedLines(child, width);
+			if (
+				index >= before.children.length ||
+				before.children[index] !== child ||
+				!sameLines(child, lines, before, index, offset)
+			) {
+				changedLines = lines;
+				break;
+			}
+			offset += lines.length;
+		}
+		if (index === count && count === before.children.length) return before;
+	}
+	const arrays: string[][] = new Array(count);
+	const heights: number[] = new Array(count);
+	for (let i = 0; i < index; i++) {
+		arrays[i] = before!.arrays[i]!;
+		heights[i] = before!.heights[i]!;
+	}
+	const first = index;
+	for (; index < count; index++) {
+		const lines = changedLines ?? renderSharedLines(children[index]!, width);
+		changedLines = undefined;
+		arrays[index] = lines;
+		heights[index] = lines.length;
+	}
+	// (concat() copies the lines in bulk, which a loop that pushes them one by one takes several times as long to do; in
+	// groups of arrays, as a call takes a bounded number of arguments.)
+	let joined = before !== undefined && offset > 0 ? before.lines.slice(0, offset) : [];
+	for (let i = first; i < count; i += 1024) {
+		joined = joined.concat(...arrays.slice(i, Math.min(count, i + 1024)));
+	}
+	return { width, children: children.slice(), arrays, heights, lines: joined };
+}
+
+function sameLines(
+	child: Component,
+	lines: string[],
+	previous: RenderedChildren,
+	index: number,
+	offset: number,
+): boolean {
+	if (isStableRender(child)) return lines === previous.arrays[index];
+	const height = previous.heights[index]!;
+	if (lines.length !== height) return false;
+	const joined = previous.lines;
+	for (let i = 0; i < height; i++) {
+		if (lines[i] !== joined[offset + i]) return false;
+	}
+	return true;
+}
+
+/**
+ * Components whose lines change only in ways they report (markReportsChanges()), by the method that identifies the class:
+ * render(), or renderShared() for a Container that does not override render().
+ */
+const reportingRenders = new WeakSet<object>();
+
+/**
+ * Composite components (a Container, a Box, a MouseRegion) whose last render had a component inside them that does not
+ * report its changes: their lines may change unreported.
+ */
+const unreportedSubtrees = new WeakSet<Component>();
+
+/** The components that render each component's lines into theirs, told of its changes (reportRenderChange()). */
+const renderOwners = new WeakMap<Component, Component | Component[]>();
+
+/** The Container method that takes a child's report (Container[CHILD_CHANGED]). */
+const CHILD_CHANGED = Symbol("pi-tui.childChanged");
+
+function renderKey(component: Component): object {
+	return component instanceof Container && component.render === Container.prototype.render
+		? component.renderShared
+		: component.render;
+}
+
+/**
+ * Declares that the components of a class report every change to their lines: each call that changes what render() returns
+ * (other than a change of width) calls reportRenderChange() on the component. The containers they are in then render them
+ * again only when they reported a change, instead of every frame: a frame then costs time in proportion to what changed, not
+ * to the length of the transcript. A subclass that overrides render() (for a Container: render() or renderShared()) is not
+ * covered: it declares this itself if it does the same. A Container that does not override either reports its changes:
+ * its lines are its children's, and it reports changes to its children (addChild(), removeChild(), clear(), and any use of
+ * `children`, which may change the array). Components that do not declare it are rendered again on every frame, as before.
+ */
+export function markReportsChanges(componentClass: { prototype: Component }): void {
+	const prototype = componentClass.prototype;
+	reportingRenders.add(
+		prototype.render === Container.prototype.render ? (prototype as Container).renderShared : prototype.render,
+	);
+}
+
+let changeReportsUsed = true;
+
+/** For tests: false renders every child of every container on every render, as when no component reported its changes. */
+export function setChangeReportsForTest(enabled: boolean): void {
+	changeReportsUsed = enabled;
+}
+
+/**
+ * Whether every change to `component`'s lines is reported (markReportsChanges()), including those of the components inside
+ * it, as of its last render.
+ */
+export function reportsChanges(component: Component): boolean {
+	return changeReportsUsed && reportingRenders.has(renderKey(component)) && !unreportedSubtrees.has(component);
+}
+
+/**
+ * Records whether every component inside `component` reported its changes at its last render (reportsChanges()): for a
+ * component that renders others' lines into its own and declares markReportsChanges(), after each render.
+ */
+export function setSubtreeReportsChanges(component: Component, reports: boolean): void {
+	if (reports) unreportedSubtrees.delete(component);
+	else unreportedSubtrees.add(component);
+}
+
+/** Records that `owner` renders `child`'s lines into its own: `owner` is told of `child`'s reported changes. */
+export function setRenderOwner(child: Component, owner: Component): void {
+	const owners = renderOwners.get(child);
+	if (owners === owner) return;
+	if (owners === undefined) renderOwners.set(child, owner);
+	else if (Array.isArray(owners)) {
+		if (!owners.includes(owner)) owners.push(owner);
+	} else renderOwners.set(child, [owners, owner]);
+}
+
+function dropRenderOwner(child: Component, owner: Component): void {
+	const owners = renderOwners.get(child);
+	if (owners === owner) renderOwners.delete(child);
+	else if (Array.isArray(owners)) {
+		const index = owners.indexOf(owner);
+		if (index !== -1) owners.splice(index, 1);
+	}
+}
+
+/** renderSharedLines() for `owner`, which renders `child`'s lines into its own: `owner` is told of `child`'s changes. */
+export function renderChildLines(owner: Component, child: Component, width: number): string[] {
+	setRenderOwner(child, owner);
+	return renderSharedLines(child, width);
+}
+
+/**
+ * Reports that `component`'s lines may have changed (markReportsChanges()): the components that render them into theirs
+ * render it again at their next render.
+ */
+export function reportRenderChange(component: Component): void {
+	const owners = renderOwners.get(component);
+	if (owners === undefined) return;
+	if (Array.isArray(owners)) {
+		for (const owner of owners.slice()) notifyOwner(owner, component);
+	} else notifyOwner(owners, component);
+}
+
+function notifyOwner(owner: Component, child: Component): void {
+	if (owner instanceof Container) owner[CHILD_CHANGED](child);
+	else reportRenderChange(owner);
+}
+
+/** What a Container's children rendered to (Container.renderLiveChildren()), changed in place from one render to the next. */
+interface ContainerLines {
+	width: number;
+	children: Component[];
+	/** The lines each child rendered to; for a child that renders live lines, those and the revision they were at (else -1). */
+	arrays: (readonly string[])[];
+	lives: (LiveLines | undefined)[];
+	revisions: number[];
+	heights: number[];
+	/** The first line of each child's lines in `live`. */
+	offsets: number[];
+	/** Whether each child reports its changes (reportsChanges()), and the indexes of those that do not, in order. */
+	reports: boolean[];
+	unreported: number[];
+	/** All the children's lines. */
+	live: LiveLineArray;
+}
+
+/** How many reported children a Container lists before it renders all of them again instead. */
+const LISTED_CHANGES = 64;
+
+function emptyContainerLines(width: number): ContainerLines {
+	return {
+		width,
+		children: [],
+		arrays: [],
+		lives: [],
+		revisions: [],
+		heights: [],
+		offsets: [],
+		reports: [],
+		unreported: [],
+		live: new LiveLineArray(),
+	};
+}
+
+/** Whether `lines` are the `count` lines of `joined` from `offset` on. */
+function sameLinesAt(lines: readonly string[], joined: readonly string[], offset: number, count: number): boolean {
+	if (lines.length !== count) return false;
+	for (let i = 0; i < count; i++) {
+		if (lines[i] !== joined[offset + i]) return false;
+	}
+	return true;
+}
+
+/** A child's lines at one render, as Container.renderLiveChildren() reads them. */
+interface ChildLines {
+	lines: readonly string[];
+	live: LiveLines | undefined;
+	revision: number;
+}
+
+function renderChildForContainer(owner: Container, child: Component, width: number): ChildLines {
+	setRenderOwner(child, owner);
+	const live = renderLiveLines(child, width);
+	return live === undefined
+		? { lines: renderSharedLines(child, width), live: undefined, revision: -1 }
+		: { lines: live.lines, live, revision: live.revision };
+}
+
+/**
+ * The first line of `child`'s lines that may differ from what was recorded at `index` (whose lines start at `offset` in
+ * `joined`, which still holds the lines of the render before): Infinity for the same lines. The same lines are: the same live
+ * lines at the same revision (or changed from where changedSince() says); the same array from a component that keeps its
+ * lines (isStableRender()); or line for line, as from a component that does not keep its lines or one put in place of the
+ * one before, such as a new spacer.
+ */
+function childChangedFrom(
+	before: ContainerLines,
+	index: number,
+	child: Component,
+	rendered: ChildLines,
+	joined: readonly string[],
+	offset: number,
+): number {
+	if (index >= before.children.length) return 0;
+	if (rendered.live !== undefined) {
+		return before.lives[index] === rendered.live && before.arrays[index] === rendered.lines
+			? rendered.live.changedSince(before.revisions[index]!)
+			: 0;
+	}
+	if (before.lives[index] !== undefined) return 0;
+	if (before.children[index] === child && before.arrays[index] === rendered.lines && isStableRender(child)) {
+		return Number.POSITIVE_INFINITY;
+	}
+	return sameLinesAt(rendered.lines, joined, offset, before.heights[index]!) ? Number.POSITIVE_INFINITY : 0;
+}
+
 /**
  * Container - a component that contains other components
  */
 export class Container implements Component {
-	children: Component[] = [];
-	private mouseLayout?: { width: number; children: Array<{ component: Component; height: number }> };
+	private childList: Component[] = [];
+	private rendered?: ContainerLines;
+	/** renderShared()'s copy of the live lines, made again when they change. */
+	private sharedLines?: { live: LiveLineArray; revision: number; lines: string[] };
+	/** The children that reported a change since the last render (reportRenderChange()), up to LISTED_CHANGES. */
+	private changedChildren: Component[] = [];
+	/** More children reported a change than are listed: all are rendered again. */
+	private changesUnlisted = false;
+	/** `children` was used, by which the array may have been changed: it is compared with the children rendered. */
+	private childrenUsed = false;
+	/** This container's owners were told of a change since its last render. */
+	private changeReported = false;
+
+	/**
+	 * The children. Changing the array (or using it, which may change it) is a change to this container's lines, reported
+	 * to the containers it is in (markReportsChanges()).
+	 */
+	get children(): Component[] {
+		this.noteChildrenUsed();
+		return this.childList;
+	}
+
+	set children(children: Component[]) {
+		this.childList = children;
+		this.noteChildrenUsed();
+	}
+
+	/**
+	 * The children, without reporting a use: a subclass that defines `children` as a property of its own (a class field in
+	 * JavaScript) has its array read, and is then rendered as one that does not report its changes.
+	 */
+	private ownChildren(): Component[] {
+		return Object.hasOwn(this, "children") ? (this as { children: Component[] }).children : this.childList;
+	}
+
+	private noteChildrenUsed(): void {
+		this.childrenUsed = true;
+		this.reportChange();
+	}
+
+	/** Tells the containers this is in that its lines may have changed, once until its next render. */
+	private reportChange(): void {
+		if (this.changeReported) return;
+		this.changeReported = true;
+		reportRenderChange(this);
+	}
+
+	/**
+	 * For a renderShared() override that renders without super.renderShared() (or renderLiveChildren()): what this container
+	 * is told after it is reported to the containers it is in again (reportRenderChange()), as after a render.
+	 */
+	protected noteRendered(): void {
+		this.changeReported = false;
+	}
+
+	/** A child reported a change (reportRenderChange()). */
+	[CHILD_CHANGED](child: Component): void {
+		if (this.rendered !== undefined && !this.changesUnlisted) {
+			const changed = this.changedChildren;
+			if (changed[changed.length - 1] !== child) {
+				if (changed.length < LISTED_CHANGES) changed.push(child);
+				else this.changesUnlisted = true;
+			}
+		}
+		this.reportChange();
+	}
 
 	addChild(component: Component): void {
-		this.children.push(component);
+		this.ownChildren().push(component);
+		this.noteChildrenUsed();
 	}
 
 	removeChild(component: Component): void {
-		const index = this.children.indexOf(component);
+		const children = this.ownChildren();
+		const index = children.indexOf(component);
 		if (index !== -1) {
-			this.children.splice(index, 1);
+			children.splice(index, 1);
+			this.noteChildrenUsed();
 		}
 	}
 
 	clear(): void {
-		this.children = [];
+		if (Object.hasOwn(this, "children")) (this as { children: Component[] }).children = [];
+		else this.childList = [];
+		this.noteChildrenUsed();
 	}
 
 	invalidate(): void {
-		for (const child of this.children) {
+		this.rendered = undefined;
+		this.sharedLines = undefined;
+		this.changedChildren = [];
+		this.changesUnlisted = false;
+		for (const child of this.ownChildren()) {
 			child.invalidate?.();
 		}
+		this.reportChange();
 	}
 
 	handleMouse(event: TuiMouseEvent): TuiMouseDispatchResult | undefined {
 		if (event.y < 0 || event.y >= event.height) return undefined;
-		const mouseChildren =
-			this.mouseLayout?.width === event.width
-				? this.mouseLayout.children
-				: this.children.map((component) => ({ component, height: component.render(event.width).length }));
+		// The children as last drawn, at their drawn heights.
+		const rendered = this.rendered?.width === event.width ? this.rendered : undefined;
+		const children = rendered?.children ?? this.ownChildren();
 		let childY = 0;
-		for (const { component: child, height: childHeight } of mouseChildren) {
+		for (let i = 0; i < children.length; i++) {
+			const child = children[i]!;
+			const childHeight = rendered ? rendered.heights[i]! : child.render(event.width).length;
 			if (event.y >= childY && event.y < childY + childHeight) {
 				const result = dispatchMouseEvent(child, {
 					...event,
@@ -363,20 +885,227 @@ export class Container implements Component {
 		return undefined;
 	}
 
-	render(width: number): string[] {
-		const lines: string[] = [];
-		const mouseChildren: Array<{ component: Component; height: number }> = [];
-		for (const child of this.children) {
-			const childLines = child.render(width);
-			mouseChildren.push({ component: child, height: childLines.length });
-			for (const line of childLines) {
-				lines.push(line);
+	/**
+	 * The children's lines, joined, as LiveLines: changed in place from the first line that changed. Only these children are
+	 * rendered again: those that reported a change since the last render, those that do not report their changes
+	 * (reportsChanges()), and those from the first place where the children are not the ones rendered the last time; the
+	 * lines of the others are what they were, and are neither copied nor compared. Of those rendered, a child's lines are
+	 * unchanged as childChangedFrom() says. The lines from the first one changed on are joined again: while a reply streams
+	 * in at the end of the transcript, those are the last lines of the reply. So a frame costs time in proportion to what
+	 * changed, not to the number of children.
+	 */
+	protected renderLiveChildren(width: number): LiveLineArray {
+		this.changeReported = false;
+		const children = this.ownChildren();
+		const shadowed = children !== this.childList;
+		const count = children.length;
+		let state = this.rendered;
+		if (state === undefined || state.width !== width) {
+			state = emptyContainerLines(width);
+			this.rendered = state;
+		}
+		const before = state;
+		const joined = before.live.lines;
+		const beforeCount = before.children.length;
+		// (Reports made while this renders are for the next render.)
+		const changed = this.changedChildren;
+		if (changed.length > 0) this.changedChildren = [];
+		const renderAll = this.changesUnlisted || shadowed;
+		this.changesUnlisted = false;
+
+		// From `tail` on, the children may not be those rendered at the same places.
+		let tail = count;
+		if (this.childrenUsed || renderAll || beforeCount !== count) {
+			this.childrenUsed = false;
+			const common = Math.min(count, beforeCount);
+			let index = 0;
+			while (index < common && children[index] === before.children[index]) index++;
+			if (index < common || count !== beforeCount) tail = index;
+		}
+
+		// The children before `tail` to render again: those reported, and those that do not report their changes.
+		let again: number[];
+		if (renderAll) {
+			again = [];
+			for (let i = 0; i < tail; i++) again.push(i);
+		} else {
+			again = [];
+			for (const child of changed) {
+				const index = before.children.lastIndexOf(child);
+				if (index === -1) dropRenderOwner(child, this);
+				else if (index < tail) again.push(index);
+			}
+			for (const index of before.unreported) {
+				if (index >= tail) break;
+				again.push(index);
+			}
+			if (again.length > 1) {
+				again.sort((a, b) => a - b);
+				again = again.filter((index, i) => i === 0 || index !== again[i - 1]);
 			}
 		}
-		this.mouseLayout = { width, children: mouseChildren };
+
+		let changeAt = Number.POSITIVE_INFINITY;
+		/** The first child whose recorded lines or height may differ from those of the render before. */
+		let firstChanged = tail;
+		let reportsChanged = false;
+		for (const index of again) {
+			const child = children[index]!;
+			const rendered = renderChildForContainer(this, child, width);
+			const changedFrom = childChangedFrom(before, index, child, rendered, joined, before.offsets[index]!);
+			if (changedFrom !== Number.POSITIVE_INFINITY) {
+				changeAt = Math.min(changeAt, before.offsets[index]! + changedFrom);
+			}
+			if (rendered.lines.length !== before.heights[index]) firstChanged = Math.min(firstChanged, index);
+			before.arrays[index] = rendered.lines;
+			before.lives[index] = rendered.live;
+			before.revisions[index] = rendered.revision;
+			before.heights[index] = rendered.lines.length;
+			const reports = reportsChanges(child);
+			if (reports !== before.reports[index]) {
+				before.reports[index] = reports;
+				reportsChanged = true;
+			}
+		}
+
+		if (tail < count || tail < beforeCount) {
+			// The children from `tail` on: the ones rendered before (somewhere after `tail`) that reported no change are taken
+			// as they were, the others rendered. While nothing before changed, each is compared with what was at its place.
+			const moved = new Map<Component, number>();
+			for (let i = beforeCount - 1; i >= tail; i--) moved.set(before.children[i]!, i);
+			const changedSet = changed.length > 0 ? new Set(changed) : undefined;
+			const tailChildren: Component[] = [];
+			const tailLines: ChildLines[] = [];
+			const tailReports: boolean[] = [];
+			let offset =
+				tail < beforeCount
+					? before.offsets[tail]!
+					: tail === 0
+						? 0
+						: before.offsets[tail - 1]! + before.heights[tail - 1]!;
+			for (let i = tail; i < count; i++) {
+				const child = children[i]!;
+				const from = moved.get(child);
+				let rendered: ChildLines;
+				let reports: boolean;
+				const live = from === undefined ? undefined : before.lives[from];
+				if (
+					from !== undefined &&
+					!renderAll &&
+					before.reports[from] === true &&
+					changedSet?.has(child) !== true &&
+					(live === undefined || live.revision === before.revisions[from])
+				) {
+					moved.delete(child);
+					rendered = { lines: before.arrays[from]!, live, revision: before.revisions[from]! };
+					reports = true;
+				} else {
+					if (from !== undefined) moved.delete(child);
+					rendered = renderChildForContainer(this, child, width);
+					reports = reportsChanges(child);
+				}
+				if (changeAt === Number.POSITIVE_INFINITY) {
+					const changedFrom = childChangedFrom(before, i, child, rendered, joined, offset);
+					if (changedFrom !== Number.POSITIVE_INFINITY) changeAt = offset + changedFrom;
+				}
+				tailChildren.push(child);
+				tailLines.push(rendered);
+				tailReports.push(reports);
+				offset += rendered.lines.length;
+			}
+			if (changeAt === Number.POSITIVE_INFINITY && count !== beforeCount) changeAt = offset;
+			before.children.length = tail;
+			before.arrays.length = tail;
+			before.lives.length = tail;
+			before.revisions.length = tail;
+			before.heights.length = tail;
+			before.offsets.length = tail;
+			before.reports.length = tail;
+			for (let i = 0; i < tailChildren.length; i++) {
+				const rendered = tailLines[i]!;
+				before.children.push(tailChildren[i]!);
+				before.arrays.push(rendered.lines);
+				before.lives.push(rendered.live);
+				before.revisions.push(rendered.revision);
+				before.heights.push(rendered.lines.length);
+				before.offsets.push(0);
+				before.reports.push(tailReports[i]!);
+			}
+			reportsChanged = true;
+		}
+
+		if (changeAt !== Number.POSITIVE_INFINITY) {
+			// The first child whose lines are joined again: the one changeAt is in (or the first after it).
+			let first = Math.min(firstChanged, count);
+			while (first > 0 && before.offsets[first - 1]! + before.heights[first - 1]! > changeAt) first--;
+			while (first < count && first < firstChanged && before.offsets[first]! + before.heights[first]! <= changeAt) {
+				first++;
+			}
+			firstChanged = Math.min(firstChanged, first);
+		}
+		if (firstChanged < count) {
+			// The lines of a child that renders live lines and was not rendered again here are what the array holds now only if it
+			// is at the revision recorded: rendered again if not (someone else rendered it, at another width).
+			let offset = firstChanged === 0 ? 0 : before.offsets[firstChanged - 1]! + before.heights[firstChanged - 1]!;
+			for (let i = firstChanged; i < count; i++) {
+				const live = before.lives[i];
+				if (live !== undefined && live.revision !== before.revisions[i] && changeAt <= offset) {
+					const rendered = renderChildForContainer(this, children[i]!, width);
+					before.arrays[i] = rendered.lines;
+					before.lives[i] = rendered.live;
+					before.revisions[i] = rendered.revision;
+					before.heights[i] = rendered.lines.length;
+				}
+				before.offsets[i] = offset;
+				offset += before.heights[i]!;
+			}
+		}
+		if (changeAt !== Number.POSITIVE_INFINITY) {
+			const live = before.live;
+			live.edit(changeAt);
+			for (let i = firstChanged; i < count; i++) {
+				const end = before.offsets[i]! + before.heights[i]!;
+				if (end <= changeAt) continue;
+				const lines = before.arrays[i]!;
+				for (let j = Math.max(0, changeAt - before.offsets[i]!); j < lines.length; j++) joined.push(lines[j]!);
+			}
+		}
+		if (reportsChanged) {
+			before.unreported.length = 0;
+			for (let i = 0; i < count; i++) if (!before.reports[i]) before.unreported.push(i);
+		}
+		setSubtreeReportsChanges(this, !shadowed && before.unreported.length === 0);
+		return before.live;
+	}
+
+	/**
+	 * The children's lines, kept from one call to the next: the same array while no child's lines changed. The caller
+	 * must not modify it; render() returns a copy. A subclass that adds to the children's lines overrides this, not
+	 * render(), and keeps the same contract: it returns the same array again only when its lines are unchanged.
+	 */
+	renderShared(width: number): string[] {
+		const live = this.renderLiveChildren(width);
+		const shared = this.sharedLines;
+		if (shared?.live === live && shared.revision === live.revision) return shared.lines;
+		const lines = live.lines.slice();
+		this.sharedLines = { live, revision: live.revision, lines };
 		return lines;
 	}
+
+	render(width: number): string[] {
+		return this.renderShared(width).slice();
+	}
+
+	/** renderLiveLines() for a Container that does not override render() or renderShared(). */
+	static renderLive(container: Container, width: number): LiveLines {
+		return container.renderLiveChildren(width);
+	}
 }
+
+markLiveRender(Container.prototype.renderShared, function (this: Component, width: number) {
+	return Container.renderLive(this as Container, width);
+});
+markReportsChanges(Container);
 
 /**
  * TUI - Main class for managing terminal UI with differential rendering
@@ -447,8 +1176,10 @@ export interface TUI extends Component {
 	removeInputListener(listener: TuiInputListener): void;
 	onTerminalColorSchemeChange(listener: (scheme: TerminalColorScheme) => void): () => void;
 	setTerminalColorSchemeNotifications(enabled: boolean): void;
-	queryTerminalBackgroundColor(options: { timeoutMs: number }): Promise<RgbColor | undefined>;
-	queryTerminalColorScheme(options: { timeoutMs: number }): Promise<TerminalColorScheme | undefined>;
+	queryTerminalColors(options: {
+		timeoutMs: number;
+		onLateReply?: (colors: TerminalColors) => void;
+	}): Promise<TerminalColors>;
 }
 
 export const VIEWPORT_TUI = Symbol.for("@earendil-works/pi-tui/viewport");
@@ -475,12 +1206,29 @@ export abstract class TuiBase extends Container implements TUI {
 	private renderTimer: NodeJS.Timeout | undefined;
 	private lastRenderAt = 0;
 	private static readonly MIN_RENDER_INTERVAL_MS = 16;
+	/** How long the last frame took to draw (FRAME_SPACING_FACTOR). */
+	private lastFrameDuration = 0;
+	/**
+	 * The next frame is not spaced by the last one's duration, and its own does not space the one after it: the first frame,
+	 * a resize's and a forced redraw's, which draw everything again, are drawn as soon as before.
+	 */
+	private nextFrameUnspaced = true;
+	/**
+	 * The next frame was asked for by input: it is not spaced by the last one's duration (its own duration spaces the frames
+	 * after it, so a typist cannot keep the thread busy with frames the stream asked for).
+	 */
+	private nextFrameForInput = false;
+	/** Terminal input is being handled: frames asked for meanwhile are for input. */
+	private handlingInput = false;
 	private showHardwareCursor = false;
 	private clearOnShrink = false;
 	protected fullRedrawCount = 0;
 	protected stopped = false;
-	private pendingOsc11BackgroundReplies = 0;
-	private pendingOsc11BackgroundQueries: PendingOsc11BackgroundQuery[] = [];
+	/**
+	 * Color queries waiting for their DA1 reply, oldest first. Terminals answer in order, so color
+	 * replies belong to the oldest one. Queries stay here after a timeout to collect late replies.
+	 */
+	private pendingTerminalColorQueries: PendingTerminalColorQuery[] = [];
 	private terminalColorSchemeListeners = new Set<(scheme: TerminalColorScheme) => void>();
 	private terminalColorSchemeNotificationsEnabled = false;
 	/** Directory for debug/crash logs. When undefined, debug logging is disabled and crash dumps fall back to the OS temp directory. */
@@ -507,6 +1255,15 @@ export abstract class TuiBase extends Container implements TUI {
 
 	protected abstract doRender(): void;
 
+	/** Render a frame and record how long it took to draw (FRAME_SPACING_FACTOR). */
+	private renderFrame(): void {
+		const start = renderClock();
+		this.doRender();
+		this.lastFrameDuration = this.nextFrameUnspaced ? 0 : renderClock() - start;
+		this.nextFrameUnspaced = false;
+		this.nextFrameForInput = false;
+	}
+
 	protected resetRenderState(): void {}
 
 	protected beforeTerminalStart(): void {}
@@ -516,6 +1273,29 @@ export abstract class TuiBase extends Container implements TUI {
 	protected beforeTerminalStop(_options: TuiStopOptions): void {}
 
 	protected afterTerminalStop(_options: TuiStopOptions): void {}
+
+	/** Mode resets written before the terminal's own resets when the process exits without stop(). */
+	protected getExitRestorePrefix(): string {
+		return `${this.terminalColorSchemeNotificationsEnabled ? "\x1b[?2031l" : ""}\x1b[?25h`;
+	}
+
+	/** Mode resets written after the terminal's own resets when the process exits without stop(). */
+	protected getExitRestoreSuffix(): string {
+		return "";
+	}
+
+	/**
+	 * Last-resort restore for exit paths that skip stop(), e.g. a direct process.exit() (#11170).
+	 * Hard kills and native aborts run no JavaScript and cannot be covered.
+	 */
+	private readonly exitRestoreHandler = (): void => {
+		if (this.stopped) return;
+		try {
+			this.terminal.restoreOnExit?.(this.getExitRestorePrefix(), this.getExitRestoreSuffix());
+		} catch {
+			// Never throw from an exit handler.
+		}
+	};
 
 	get fullRedraws(): number {
 		return this.fullRedrawCount;
@@ -529,7 +1309,7 @@ export abstract class TuiBase extends Container implements TUI {
 		if (this.showHardwareCursor === enabled) return;
 		this.showHardwareCursor = enabled;
 		if (!enabled) {
-			this.terminal.hideCursor();
+			this.hideTerminalCursor();
 		}
 		this.requestRender();
 	}
@@ -695,7 +1475,7 @@ export abstract class TuiBase extends Container implements TUI {
 		if (!options?.nonCapturing && this.isOverlayVisible(entry)) {
 			this.setFocus(component);
 		}
-		this.terminal.hideCursor();
+		this.hideTerminalCursor();
 		this.requestRender();
 
 		// Return handle for controlling this overlay
@@ -711,7 +1491,7 @@ export abstract class TuiBase extends Container implements TUI {
 						const topVisible = this.getTopmostVisibleOverlay();
 						this.setFocus(topVisible?.component ?? entry.preFocus);
 					}
-					if (this.overlayStack.length === 0) this.terminal.hideCursor();
+					if (this.overlayStack.length === 0) this.hideTerminalCursor();
 					this.requestRender();
 				}
 			},
@@ -793,8 +1573,13 @@ export abstract class TuiBase extends Container implements TUI {
 			const topVisible = this.getTopmostVisibleOverlay();
 			this.setFocus(topVisible?.component ?? overlay.preFocus);
 		}
-		if (this.overlayStack.length === 0) this.terminal.hideCursor();
+		if (this.overlayStack.length === 0) this.hideTerminalCursor();
 		this.requestRender();
+	}
+
+	/** Hide the cursor while running. After stop(), the shell owns the cursor and it must stay visible. */
+	private hideTerminalCursor(): void {
+		if (!this.stopped) this.terminal.hideCursor();
 	}
 
 	/** Check if there are any visible overlays */
@@ -871,16 +1656,32 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	override invalidate(): void {
+		// (Also when no Markdown component is mounted to be told: what was rendered before may be taken up by a later one.)
+		invalidateRenderedMarkdown();
 		for (const root of this.getMountedRoots()) root.invalidate();
 		for (const overlay of this.overlayStack) overlay.component.invalidate();
 	}
 
 	start(): void {
 		this.stopped = false;
+		this.nextFrameUnspaced = true;
+		process.off("exit", this.exitRestoreHandler);
+		process.on("exit", this.exitRestoreHandler);
 		this.beforeTerminalStart();
 		this.terminal.start(
-			(data) => this.handleTerminalInput(data),
-			() => this.requestRender(),
+			(data) => {
+				this.handlingInput = true;
+				try {
+					this.handleTerminalInput(data);
+				} finally {
+					this.handlingInput = false;
+				}
+			},
+			() => {
+				// (A resize is drawn as soon as before, however slow frames are.)
+				this.nextFrameUnspaced = true;
+				this.requestRender();
+			},
 		);
 		this.afterTerminalStart();
 		this.terminal.hideCursor();
@@ -931,6 +1732,7 @@ export abstract class TuiBase extends Container implements TUI {
 
 	stop(options: TuiStopOptions = {}): void {
 		this.stopped = true;
+		process.off("exit", this.exitRestoreHandler);
 		this.cancelRenderTimer();
 		if (this.terminalColorSchemeNotificationsEnabled) {
 			this.terminal.write("\x1b[?2031l");
@@ -945,15 +1747,24 @@ export abstract class TuiBase extends Container implements TUI {
 		if (force) this.resetRenderState();
 		this.renderRequested = false;
 		this.cancelRenderTimer();
-		this.lastRenderAt = performance.now();
-		this.doRender();
+		this.lastRenderAt = renderClock();
+		this.renderFrame();
 	}
 
 	requestRender(force = false): void {
 		if (force) {
 			this.resetRenderState();
+			this.nextFrameUnspaced = true;
 			this.requestImmediateRender();
 			return;
+		}
+		if (this.handlingInput && !this.nextFrameForInput) {
+			// A frame for input: not held by the spacing of slow frames (FRAME_SPACING_FACTOR), also when one waits already.
+			this.nextFrameForInput = true;
+			if (this.renderTimer) {
+				this.cancelRenderTimer();
+				process.nextTick(() => this.scheduleRender());
+			}
 		}
 		if (this.renderRequested) return;
 		this.renderRequested = true;
@@ -972,8 +1783,8 @@ export abstract class TuiBase extends Container implements TUI {
 			// callback runs. User input must preempt that throttled frame.
 			this.cancelRenderTimer();
 			this.renderRequested = false;
-			this.lastRenderAt = performance.now();
-			this.doRender();
+			this.lastRenderAt = renderClock();
+			this.renderFrame();
 		});
 	}
 
@@ -987,24 +1798,29 @@ export abstract class TuiBase extends Container implements TUI {
 		if (this.stopped || this.renderTimer || !this.renderRequested) {
 			return;
 		}
-		const elapsed = performance.now() - this.lastRenderAt;
-		const delay = Math.max(0, TuiBase.MIN_RENDER_INTERVAL_MS - elapsed);
-		this.renderTimer = setTimeout(() => {
-			this.renderTimer = undefined;
-			if (this.stopped || !this.renderRequested) {
-				return;
-			}
-			this.renderRequested = false;
-			this.lastRenderAt = performance.now();
-			this.doRender();
-			if (this.renderRequested) {
-				this.scheduleRender();
-			}
-		}, delay);
+		const elapsed = renderClock() - this.lastRenderAt;
+		const spacing =
+			this.nextFrameUnspaced || this.nextFrameForInput ? 0 : FRAME_SPACING_FACTOR * this.lastFrameDuration;
+		const delay = Math.max(0, Math.max(TuiBase.MIN_RENDER_INTERVAL_MS, spacing) - elapsed);
+		this.renderTimer = setTimeout(() => this.renderTimedFrame(), delay);
+	}
+
+	/** A frame from the timer of scheduleRender(), and the next one scheduled if more was requested meanwhile. */
+	private renderTimedFrame(): void {
+		this.renderTimer = undefined;
+		if (this.stopped || !this.renderRequested) {
+			return;
+		}
+		this.renderRequested = false;
+		this.lastRenderAt = renderClock();
+		this.renderFrame();
+		if (this.renderRequested) {
+			this.scheduleRender();
+		}
 	}
 
 	private handleTerminalInput(data: string): void {
-		if (this.consumeOsc11BackgroundResponse(data)) {
+		if (this.consumeTerminalColorResponse(data)) {
 			return;
 		}
 		if (this.consumeTerminalColorSchemeReport(data)) {
@@ -1081,28 +1897,50 @@ export abstract class TuiBase extends Container implements TUI {
 		}
 	}
 
-	private consumeOsc11BackgroundResponse(data: string): boolean {
-		if (this.pendingOsc11BackgroundReplies <= 0) {
+	private consumeTerminalColorResponse(data: string): boolean {
+		const query = this.pendingTerminalColorQueries[0];
+		if (!query) {
 			return false;
 		}
-
-		if (!isOsc11BackgroundColorResponse(data)) {
-			return false;
+		if (DEVICE_ATTRIBUTES_RESPONSE_PATTERN.test(data)) {
+			this.pendingTerminalColorQueries.shift();
+			this.completeTerminalColorQuery(query);
+			return true;
 		}
 
-		const rgb = parseOsc11BackgroundColor(data);
-		this.pendingOsc11BackgroundReplies -= 1;
-		const query = this.pendingOsc11BackgroundQueries.shift();
-		if (query && !query.settled) {
-			query.settled = true;
-			if (query.timer) {
-				clearTimeout(query.timer);
-				query.timer = undefined;
-			}
-			query.resolve?.(rgb);
-			query.resolve = undefined;
+		const response = parseOscColorResponse(data);
+		if (!response) {
+			return false;
+		}
+		const { target, rgb } = response;
+		const key = String(target);
+		if (!query.deliver || query.replied.has(key)) {
+			return true;
+		}
+		query.replied.add(key);
+		if (target === "foreground") {
+			query.foreground = rgb;
+		} else if (target === "background") {
+			query.background = rgb;
+		} else if (target < TERMINAL_PALETTE_SIZE) {
+			query.palette[target] = rgb;
+		}
+		if (query.replied.size === TERMINAL_COLOR_REPLY_COUNT) {
+			this.completeTerminalColorQuery(query);
 		}
 		return true;
+	}
+
+	private terminalColorQueryResult(query: PendingTerminalColorQuery): TerminalColors {
+		const palette = query.palette.every((color) => color !== undefined) ? (query.palette as RgbColor[]) : undefined;
+		return { foreground: query.foreground, background: query.background, palette };
+	}
+
+	private completeTerminalColorQuery(query: PendingTerminalColorQuery): void {
+		const deliver = query.deliver;
+		query.deliver = undefined;
+		clearTimeout(query.timer);
+		deliver?.(this.terminalColorQueryResult(query));
 	}
 
 	private consumeTerminalColorSchemeReport(data: string): boolean {
@@ -1299,7 +2137,7 @@ export abstract class TuiBase extends Container implements TUI {
 			const { width, maxHeight } = this.resolveOverlayLayout(options, 0, termWidth, termHeight);
 
 			// Render component at calculated width
-			let overlayLines = component.render(width);
+			let overlayLines = this.resolveFakeCursors(component.render(width));
 
 			// Apply maxHeight if specified
 			if (maxHeight !== undefined && overlayLines.length > maxHeight) {
@@ -1400,57 +2238,47 @@ export abstract class TuiBase extends Container implements TUI {
 	}
 
 	/**
-	 * Query the terminal's default background color with OSC 11 (`ESC ] 11 ; ? BEL`).
-	 * @param timeoutMs Query timeout in milliseconds.
-	 * @returns Promise containing the parsed RGB color, or undefined if it times out or fails to parse.
+	 * Resolve fake cursor markers to reverse video. When the hardware cursor is shown, a fake cursor
+	 * directly after CURSOR_MARKER is dropped because the terminal cursor is drawn there. Fake cursors
+	 * of components without focus have no CURSOR_MARKER and stay visible.
 	 */
-	queryTerminalBackgroundColor({ timeoutMs }: { timeoutMs: number }): Promise<RgbColor | undefined> {
-		return new Promise((resolve) => {
-			const query: PendingOsc11BackgroundQuery = {
-				settled: false,
-				resolve,
-				timer: undefined,
-			};
-
-			query.timer = setTimeout(() => {
-				if (query.settled) {
-					return;
-				}
-				query.settled = true;
-				query.timer = undefined;
-				query.resolve?.(undefined);
-				query.resolve = undefined;
-			}, timeoutMs);
-			this.pendingOsc11BackgroundQueries.push(query);
-			this.pendingOsc11BackgroundReplies += 1;
-			this.terminal.write("\x1b]11;?\x07");
+	protected resolveFakeCursors(lines: string[]): string[] {
+		return lines.map((line) => {
+			if (!line.includes(FAKE_CURSOR_START)) return line;
+			const resolved = this.showHardwareCursor ? line.replace(FOCUSED_FAKE_CURSOR, "$1$2") : line;
+			return resolved.replaceAll(FAKE_CURSOR_START, "\x1b[7m").replaceAll(FAKE_CURSOR_END, "\x1b[27m");
 		});
 	}
 
 	/**
-	 * Query the terminal's color-scheme preference with DSR (`CSI ? 996 n`).
-	 * Terminals that support the color palette notification protocol reply with
-	 * `CSI ? 997 ; 1 n` for dark or `CSI ? 997 ; 2 n` for light.
+	 * Query the terminal's theme colors: the default foreground (OSC 10), the default background
+	 * (OSC 11), and ANSI colors 0-15 (OSC 4), followed by a DA1 request that marks the end of the
+	 * replies. Resolves when the DA1 reply or all color replies arrive, or when the timeout expires.
+	 * Colors the terminal did not report are undefined; the palette is only set when all 16 arrived.
+	 * @param timeoutMs Query timeout in milliseconds, for terminals that do not answer DA1 either.
+	 * @param onLateReply Receives the replies if the query completes after the timeout, e.g. over slow links.
 	 */
-	queryTerminalColorScheme({ timeoutMs }: { timeoutMs: number }): Promise<TerminalColorScheme | undefined> {
+	queryTerminalColors({
+		timeoutMs,
+		onLateReply,
+	}: {
+		timeoutMs: number;
+		onLateReply?: (colors: TerminalColors) => void;
+	}): Promise<TerminalColors> {
 		return new Promise((resolve) => {
-			let settled = false;
-			let timer: NodeJS.Timeout | undefined;
-			let unsubscribe: () => void = () => {};
-			const settle = (scheme: TerminalColorScheme | undefined) => {
-				if (settled) return;
-				settled = true;
-				if (timer) {
-					clearTimeout(timer);
-					timer = undefined;
-				}
-				unsubscribe();
-				resolve(scheme);
+			const query: PendingTerminalColorQuery = {
+				palette: Array.from({ length: TERMINAL_PALETTE_SIZE }, () => undefined),
+				replied: new Set(),
+				deliver: resolve,
+				timer: undefined,
 			};
-
-			unsubscribe = this.onTerminalColorSchemeChange(settle);
-			timer = setTimeout(() => settle(undefined), timeoutMs);
-			this.terminal.write("\x1b[?996n");
+			// Resolve with the replies so far, and keep collecting late replies for `onLateReply`.
+			query.timer = setTimeout(() => {
+				query.deliver = onLateReply;
+				resolve(this.terminalColorQueryResult(query));
+			}, timeoutMs);
+			this.pendingTerminalColorQueries.push(query);
+			this.terminal.write(TERMINAL_COLOR_QUERY);
 		});
 	}
 }

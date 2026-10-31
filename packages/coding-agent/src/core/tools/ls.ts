@@ -6,7 +6,7 @@ import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { pathExists, resolveToCwd } from "./path-utils.ts";
 import { lsRenderers } from "./renderers/ls.ts";
 import { wrapToolDefinition } from "./tool-definition-wrapper.ts";
-import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead } from "./truncate.ts";
+import { DEFAULT_MAX_BYTES, formatSize, type TruncationResult, truncateHead, truncationDetails } from "./truncate.ts";
 
 const lsSchema = Type.Object({
 	path: Type.Optional(Type.String({ description: "Directory to list (default: current directory)" })),
@@ -45,6 +45,32 @@ const defaultLsOperations: LsOperations = {
 	stat: fsStat,
 	readdir: fsReaddir,
 };
+
+/** A directory entry, and whether it is a directory when its type is known without a stat. */
+interface LsEntry {
+	name: string;
+	/** The name in lower case, the sort key, computed once instead of in every comparison. */
+	key: string;
+	/** Undefined for symbolic links (a stat follows them, and drops broken ones) and for entries of unknown type. */
+	isDirectory: boolean | undefined;
+}
+
+/**
+ * The entries of `dirPath`. On the local filesystem one readdir also gives each entry's type, so only symbolic links and
+ * entries of unknown type need a stat to tell whether they are directories: a stat per entry, awaited one after the
+ * other, took 44-79 ms for a folder of 1,161 entries.
+ */
+async function readEntries(ops: LsOperations, dirPath: string): Promise<LsEntry[]> {
+	if (ops !== defaultLsOperations) {
+		return (await ops.readdir(dirPath)).map((name) => ({ name, key: name.toLowerCase(), isDirectory: undefined }));
+	}
+	return (await fsReaddir(dirPath, { withFileTypes: true })).map((dirent) => ({
+		name: dirent.name,
+		key: dirent.name.toLowerCase(),
+		// A symbolic link's dirent is neither a file nor a directory.
+		isDirectory: dirent.isDirectory() ? true : dirent.isFile() ? false : undefined,
+	}));
+}
 
 export interface LsToolOptions {
 	/** Custom operations for directory listing. Default: local filesystem */
@@ -97,36 +123,43 @@ export function createLsToolDefinition(
 						}
 
 						// Read directory entries.
-						let entries: string[];
+						let entries: LsEntry[];
 						try {
-							entries = await ops.readdir(dirPath);
+							entries = await readEntries(ops, dirPath);
 						} catch (e: any) {
 							reject(new Error(`Cannot read directory: ${e.message}`));
 							return;
 						}
 
 						// Sort alphabetically, case-insensitive.
-						entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+						entries.sort((a, b) => a.key.localeCompare(b.key));
 
 						// Format entries with directory indicators.
 						const results: string[] = [];
 						let entryLimitReached = false;
+						// Whether a stat has confirmed that the entries' own types can be used. Until then every entry is
+						// stat-ed: in a folder that can be read but not searched, readdir works and every stat fails, and
+						// those entries are skipped.
+						let typesConfirmed = false;
 						for (const entry of entries) {
 							if (results.length >= effectiveLimit) {
 								entryLimitReached = true;
 								break;
 							}
 
-							const fullPath = nodePath.join(dirPath, entry);
-							let suffix = "";
-							try {
-								const entryStat = await ops.stat(fullPath);
-								if (entryStat.isDirectory()) suffix = "/";
-							} catch {
-								// Skip entries we cannot stat.
-								continue;
+							let isDirectory: boolean;
+							if (entry.isDirectory !== undefined && typesConfirmed) {
+								isDirectory = entry.isDirectory;
+							} else {
+								try {
+									isDirectory = (await ops.stat(nodePath.join(dirPath, entry.name))).isDirectory();
+								} catch {
+									// Skip entries we cannot stat.
+									continue;
+								}
+								if (entry.isDirectory !== undefined) typesConfirmed = true;
 							}
-							results.push(entry + suffix);
+							results.push(isDirectory ? `${entry.name}/` : entry.name);
 						}
 
 						signal?.removeEventListener("abort", onAbort);
@@ -149,7 +182,7 @@ export function createLsToolDefinition(
 						}
 						if (truncation.truncated) {
 							notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-							details.truncation = truncation;
+							details.truncation = truncationDetails(truncation);
 						}
 						if (notices.length > 0) {
 							output += `\n\n[${notices.join(". ")}]`;

@@ -1,7 +1,8 @@
-import type { Api, Model } from "./types.ts";
+import type { AnyModel } from "./types.ts";
 
 export interface ModelsStoreEntry {
-	models: readonly Model<Api>[];
+	/** Persisted models of every type. */
+	models: readonly AnyModel[];
 	/** Unix timestamp from the remote catalog's Last-Modified header. */
 	lastModified?: number;
 	/** Unix timestamp of the last completed remote check. */
@@ -19,6 +20,7 @@ export interface ModelsStoreOperationOptions {
 
 /** Persistent model catalogs keyed by provider ID. */
 export interface ModelsStore {
+	/** Returns an entry the caller owns and may modify: a copy, never the store's own object. */
 	read(providerId: string, options?: ModelsStoreOperationOptions): Promise<ModelsStoreEntry | undefined>;
 	write(providerId: string, entry: ModelsStoreEntry, options?: ModelsStoreOperationOptions): Promise<void>;
 	delete(providerId: string, options?: ModelsStoreOperationOptions): Promise<void>;

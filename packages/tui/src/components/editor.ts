@@ -6,12 +6,15 @@ import {
 	type Component,
 	CURSOR_MARKER,
 	type Focusable,
+	renderFakeCursor,
 	type TUI,
 	type TuiMouseEvent,
 	type TuiMouseEventResult,
 } from "../tui.ts";
 import { UndoStack } from "../undo-stack.ts";
 import {
+	autocompleteBoundaryRegex,
+	autocompleteSeparatorRegex,
 	cjkBreakRegex,
 	getGraphemeSegmenter,
 	getWordSegmenter,
@@ -98,6 +101,21 @@ function segmentWithMarkers(
 }
 
 /**
+ * The grapheme of `text` that contains code unit `index` (undefined outside the text), without segmenting the rest of
+ * the text. On the first code unit of a surrogate pair it asks for the second, which is always in the same grapheme:
+ * JSC's Segments.containing() returns the previous grapheme joined to the right one for the first (for "b👍" and
+ * index 1, "b👍" at 0).
+ */
+function graphemeAt(text: string, index: number): Intl.SegmentData | undefined {
+	const code = text.charCodeAt(index);
+	if (code >= 0xd800 && code <= 0xdbff) {
+		const next = text.charCodeAt(index + 1);
+		if (next >= 0xdc00 && next <= 0xdfff) return graphemeSegmenter.segment(text).containing(index + 1);
+	}
+	return graphemeSegmenter.segment(text).containing(index);
+}
+
+/**
  * Represents a chunk of text for word-wrap layout.
  * Tracks both the text content and its position in the original line.
  */
@@ -121,6 +139,13 @@ export interface TextChunk {
 export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl.SegmentData[]): TextChunk[] {
 	if (!line || maxWidth <= 0) {
 		return [{ text: "", startIndex: 0, endIndex: 0 }];
+	}
+
+	if (!preSegmented) {
+		const standaloneWidth = standaloneTextWidth(line);
+		if (canWrapStandalone(line, standaloneWidth, maxWidth)) {
+			return wordWrapStandaloneLine(line, maxWidth, standaloneWidth);
+		}
 	}
 
 	const lineWidth = visibleWidth(line);
@@ -167,9 +192,12 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 			wrapOppIndex = -1;
 		}
 
-		if (gWidth > maxWidth) {
+		if (gWidth > maxWidth && preSegmented) {
 			// Single atomic segment wider than maxWidth (e.g. paste marker
 			// in a narrow terminal). Re-wrap it at grapheme granularity.
+			// (Only a pre-segmented line has segments of several graphemes:
+			// one grapheme wider than maxWidth, such as a wide character at
+			// width 1, cannot be split and stays a chunk of its own.)
 
 			// The segment remains logically atomic for cursor
 			// movement / editing — the split is purely visual for word-wrap layout.
@@ -212,6 +240,142 @@ export function wordWrapLine(line: string, maxWidth: number, preSegmented?: Intl
 	return chunks;
 }
 
+/**
+ * The width of a UTF-16 code unit that is always a grapheme of its own, whatever is beside it, or 0 for any other:
+ *
+ * - 1: printable ASCII, Latin-1 and Latin Extended letters and signs (not the soft hyphen), typographic punctuation,
+ *   arrows and mathematical operators, box drawing, block elements and geometric shapes (the set visibleWidth()
+ *   measures without segmenting);
+ * - 2: CJK ideographs, kana, Hangul syllables, CJK punctuation and fullwidth forms.
+ *
+ * Anything that could join one of these into a larger grapheme, such as a combining mark (the kana voicing marks
+ * included), a Hangul jamo, a zero-width joiner or a variation selector, is outside the set.
+ */
+function standaloneCharWidth(code: number): number {
+	if (code < 0x3000) {
+		return (code >= 0x20 && code <= 0x7e) ||
+			(code >= 0xa0 && code <= 0x2ff && code !== 0xad) ||
+			(code >= 0x2010 && code <= 0x2027) ||
+			(code >= 0x2190 && code <= 0x22ff) ||
+			(code >= 0x2500 && code <= 0x25fc)
+			? 1
+			: 0;
+	}
+	return code <= 0x3029 ||
+		(code >= 0x3041 && code <= 0x3096) ||
+		(code >= 0x309d && code <= 0x309f) ||
+		(code >= 0x30a1 && code <= 0x30ff) ||
+		(code >= 0x3400 && code <= 0x4dbf) ||
+		(code >= 0x4e00 && code <= 0x9fff) ||
+		(code >= 0xac00 && code <= 0xd7a3) ||
+		(code >= 0xff01 && code <= 0xff60) ||
+		(code >= 0xffe0 && code <= 0xffe6)
+		? 2
+		: 0;
+}
+
+/** The width of `text` when every character of it is a grapheme of its own (standaloneCharWidth()), else -1. */
+function standaloneTextWidth(text: string): number {
+	let width = 0;
+	for (let i = 0; i < text.length; i++) {
+		const charWidth = standaloneCharWidth(text.charCodeAt(i));
+		if (charWidth === 0) return -1;
+		width += charWidth;
+	}
+	return width;
+}
+
+/**
+ * Whether wordWrapStandaloneLine() wraps `line` at `maxWidth`: its characters are graphemes of their own, and none is
+ * wider than `maxWidth` (wordWrapLine() splits such a grapheme specially).
+ */
+function canWrapStandalone(line: string, lineWidth: number, maxWidth: number): boolean {
+	return lineWidth >= 0 && (maxWidth >= 2 || lineWidth === line.length);
+}
+
+/**
+ * visibleWidth() of an editor line: for a line of standalone characters, their widths added up, without segmenting it
+ * (visibleWidth() segments any line with a character it does not measure directly, such as CJK, every time).
+ */
+function editorLineWidth(line: string): number {
+	const width = standaloneTextWidth(line);
+	return width >= 0 ? width : visibleWidth(line);
+}
+
+/** isWhitespaceChar() for a standalone character, by its code. */
+function isStandaloneWhitespace(line: string, i: number, code: number): boolean {
+	return code === 0x20 || (code > 0x7e && isWhitespaceChar(line[i]!));
+}
+
+/**
+ * wordWrapLine() for a line whose characters are graphemes of their own (canWrapStandalone()), without segmenting it:
+ * the same greedy algorithm runs on character codes, with each character's width from standaloneCharWidth(). A long
+ * prompt line is wrapped again on every keystroke, and segmenting it cost O(line) Intl.Segmenter work per key (0.24 ms
+ * at 2,000 characters).
+ */
+function wordWrapStandaloneLine(line: string, maxWidth: number, lineWidth: number): TextChunk[] {
+	const length = line.length;
+	if (length === 0 || maxWidth <= 0) {
+		return [{ text: "", startIndex: 0, endIndex: 0 }];
+	}
+	if (lineWidth <= maxWidth) {
+		return [{ text: line, startIndex: 0, endIndex: length }];
+	}
+
+	const chunks: TextChunk[] = [];
+	let currentWidth = 0;
+	let chunkStart = 0;
+	let wrapOppIndex = -1;
+	let wrapOppWidth = 0;
+	let code = line.charCodeAt(0);
+	let isWs = isStandaloneWhitespace(line, 0, code);
+
+	for (let i = 0; i < length; i++) {
+		const charWidth = code < 0x3000 ? 1 : 2;
+
+		// Overflow check before advancing.
+		if (currentWidth + charWidth > maxWidth) {
+			if (wrapOppIndex >= 0 && currentWidth - wrapOppWidth + charWidth <= maxWidth) {
+				chunks.push({ text: line.slice(chunkStart, wrapOppIndex), startIndex: chunkStart, endIndex: wrapOppIndex });
+				chunkStart = wrapOppIndex;
+				currentWidth -= wrapOppWidth;
+			} else if (chunkStart < i) {
+				chunks.push({ text: line.slice(chunkStart, i), startIndex: chunkStart, endIndex: i });
+				chunkStart = i;
+				currentWidth = 0;
+			}
+			wrapOppIndex = -1;
+		}
+
+		currentWidth += charWidth;
+
+		// Wrap opportunity: after whitespace before non-whitespace, or between non-whitespace characters where
+		// either is CJK (no ASCII character is).
+		if (i + 1 < length) {
+			const nextCode = line.charCodeAt(i + 1);
+			const nextIsWs = isStandaloneWhitespace(line, i + 1, nextCode);
+			if (isWs) {
+				if (!nextIsWs) {
+					wrapOppIndex = i + 1;
+					wrapOppWidth = currentWidth;
+				}
+			} else if (
+				!nextIsWs &&
+				(code > 0x7e || nextCode > 0x7e) &&
+				(cjkBreakRegex.test(line[i]!) || cjkBreakRegex.test(line[i + 1]!))
+			) {
+				wrapOppIndex = i + 1;
+				wrapOppWidth = currentWidth;
+			}
+			code = nextCode;
+			isWs = nextIsWs;
+		}
+	}
+
+	chunks.push({ text: line.slice(chunkStart), startIndex: chunkStart, endIndex: length });
+	return chunks;
+}
+
 // Kitty CSI-u sequences for printable keys, including optional shifted/base codepoints.
 interface EditorState {
 	lines: string[];
@@ -224,6 +388,23 @@ interface EditorSnapshot {
 	state: EditorState;
 	pastes: Map<number, string>;
 	pasteCounter: number;
+}
+
+/**
+ * A snapshot that later edits do not change. The lines array and the paste registry are changed in place, so they are
+ * copied; the strings in them are immutable and are shared. (A deep clone would copy every paste, megabytes for a pasted
+ * log, for each word typed and each character deleted, and keep every copy until the prompt is submitted.)
+ */
+function cloneEditorSnapshot(snapshot: EditorSnapshot): EditorSnapshot {
+	return {
+		state: {
+			lines: [...snapshot.state.lines],
+			cursorLine: snapshot.state.cursorLine,
+			cursorCol: snapshot.state.cursorCol,
+		},
+		pastes: new Map(snapshot.pastes),
+		pasteCounter: snapshot.pasteCounter,
+	};
 }
 
 interface LayoutLine {
@@ -249,18 +430,28 @@ const SLASH_COMMAND_SELECT_LIST_LAYOUT: SelectListLayoutOptions = {
 
 const ATTACHMENT_AUTOCOMPLETE_DEBOUNCE_MS = 20;
 const DEFAULT_AUTOCOMPLETE_TRIGGER_CHARACTERS = ["@", "#"];
+// Unquoted completions end at whitespace or CJK punctuation; quoted paths may contain either.
+const unquotedAutocompleteSuffixRegex = new RegExp(`(?:(?!${autocompleteSeparatorRegex.source}).)*`, "u");
+// Trigger tokens may be wrapped in prose, e.g. "(@src/foo" or "`@src/foo".
+const autocompleteTokenStartSource = `${autocompleteBoundaryRegex.source}[([{<\`]*`;
 
 function escapeCharacterClass(value: string): string {
 	return value.replace(/[\\^$.*+?()[\]{}|-]/g, "\\$&");
 }
 
 function buildTriggerPattern(triggerCharacters: string[]): RegExp {
-	return new RegExp(`(?:^|[\\s])[${triggerCharacters.map(escapeCharacterClass).join("")}][^\\s]*$`);
+	return new RegExp(
+		`${autocompleteTokenStartSource}(?:@"[^"]*|[${triggerCharacters.map(escapeCharacterClass).join("")}]${unquotedAutocompleteSuffixRegex.source})$`,
+		"u",
+	);
 }
 
 function buildDebouncePattern(triggerCharacters: string[]): RegExp {
 	const escapedWithoutAt = triggerCharacters.filter((character) => character !== "@").map(escapeCharacterClass);
-	return new RegExp(`(?:^|[ \\t])(?:@(?:"[^"]*|[^\\s]*)|[${escapedWithoutAt.join("")}][^\\s]*)$`);
+	return new RegExp(
+		`${autocompleteTokenStartSource}(?:@(?:"[^"]*|${unquotedAutocompleteSuffixRegex.source})|[${escapedWithoutAt.join("")}]${unquotedAutocompleteSuffixRegex.source})$`,
+		"u",
+	);
 }
 
 function createScrollBorder(direction: "↑" | "↓", hiddenLineCount: number, width: number): string {
@@ -352,7 +543,7 @@ export class Editor implements Component, Focusable {
 	private snappedFromCursorCol: number | null = null;
 
 	// Undo support
-	private undoStack = new UndoStack<EditorSnapshot>();
+	private undoStack = new UndoStack<EditorSnapshot>(cloneEditorSnapshot);
 
 	public onSubmit?: (text: string) => void;
 	public onChange?: (text: string) => void;
@@ -368,6 +559,47 @@ export class Editor implements Component, Focusable {
 		this.autocompleteMaxVisible = Number.isFinite(maxVisible) ? Math.max(3, Math.min(20, Math.floor(maxVisible))) : 5;
 	}
 
+	/**
+	 * The wrapped chunks of each logical line, by line index, for one width and one set of paste IDs (a paste marker
+	 * wraps as one unit): every frame lays out the whole text again, and all lines but the edited one are what they were.
+	 */
+	private wrapCache: {
+		width: number;
+		pasteIds: string;
+		lines: Array<{ text: string; chunks: TextChunk[] } | undefined>;
+	} = { width: -1, pasteIds: "", lines: [] };
+
+	/** The wrap cache for `width`, emptied when the width or the paste IDs changed. */
+	private wrapCacheFor(width: number): Array<{ text: string; chunks: TextChunk[] } | undefined> {
+		const pasteIds = [...this.pastes.keys()].join(",");
+		const cache = this.wrapCache;
+		if (cache.width !== width || cache.pasteIds !== pasteIds) {
+			this.wrapCache = { width, pasteIds, lines: [] };
+		} else if (cache.lines.length > this.state.lines.length) {
+			cache.lines.length = this.state.lines.length;
+		}
+		return this.wrapCache.lines;
+	}
+
+	/** wordWrapLine() for logical line `index`, from the wrap cache when the line is unchanged. */
+	private wrapLine(
+		cache: Array<{ text: string; chunks: TextChunk[] } | undefined>,
+		index: number,
+		line: string,
+		width: number,
+	): TextChunk[] {
+		const known = cache[index];
+		if (known !== undefined && known.text === line) return known.chunks;
+		// A line of standalone characters without paste markers wraps the same from its plain graphemes, which
+		// wordWrapStandaloneLine() does without segmenting it.
+		const standaloneWidth = this.hasNoPasteMarkers(line) ? standaloneTextWidth(line) : -1;
+		const chunks = canWrapStandalone(line, standaloneWidth, width)
+			? wordWrapStandaloneLine(line, width, standaloneWidth)
+			: wordWrapLine(line, width, [...this.segment(line, "grapheme")]);
+		cache[index] = { text: line, chunks };
+		return chunks;
+	}
+
 	/** Set of currently valid paste IDs, for marker-aware segmentation. */
 	private validPasteIds(): Set<number> {
 		return new Set(this.pastes.keys());
@@ -376,6 +608,38 @@ export class Editor implements Component, Focusable {
 	/** Segment text with paste-marker awareness, only merging markers with valid IDs. */
 	private segment(text: string, mode: "word" | "grapheme"): Iterable<Intl.SegmentData> {
 		return segmentWithMarkers(text, mode === "word" ? wordSegmenter : graphemeSegmenter, this.validPasteIds());
+	}
+
+	/** Whether this.segment(text, ...) is the plain Intl.Segmenter segmentation (segmentWithMarkers()'s fast path). */
+	private hasNoPasteMarkers(text: string): boolean {
+		return this.pastes.size === 0 || !text.includes("[paste #");
+	}
+
+	/**
+	 * The first grapheme of `text`, as [...this.segment(text, "grapheme")][0]. Without paste markers it is looked up
+	 * directly rather than by segmenting all of the text, which cost O(line) per keystroke on a long line.
+	 */
+	private firstGrapheme(text: string): Intl.SegmentData | undefined {
+		if (this.hasNoPasteMarkers(text)) return graphemeAt(text, 0);
+		return [...this.segment(text, "grapheme")][0];
+	}
+
+	/** The last grapheme of `text`, as [...this.segment(text, "grapheme")].at(-1) (see firstGrapheme()). */
+	private lastGrapheme(text: string): Intl.SegmentData | undefined {
+		if (this.hasNoPasteMarkers(text)) return graphemeAt(text, text.length - 1);
+		const graphemes = [...this.segment(text, "grapheme")];
+		return graphemes[graphemes.length - 1];
+	}
+
+	/** The grapheme of this.segment(text, "grapheme") that contains code unit `index`, if any (see firstGrapheme()). */
+	private graphemeContaining(text: string, index: number): Intl.SegmentData | undefined {
+		if (index < 0 || index >= text.length) return undefined;
+		if (this.hasNoPasteMarkers(text)) return graphemeAt(text, index);
+		for (const seg of this.segment(text, "grapheme")) {
+			if (seg.index > index) break;
+			if (index < seg.index + seg.segment.length) return seg;
+		}
+		return undefined;
 	}
 
 	getPaddingX(): number {
@@ -492,7 +756,7 @@ export class Editor implements Component, Focusable {
 	}
 
 	invalidate(): void {
-		// No cached state to invalidate currently
+		this.renderedText = undefined;
 	}
 
 	protected renderTopBorder(width: number, hiddenLineCount: number): string {
@@ -503,6 +767,57 @@ export class Editor implements Component, Focusable {
 	protected renderBottomBorder(width: number, hiddenLineCount: number): string {
 		const border = hiddenLineCount > 0 ? createScrollBorder("↓", hiddenLineCount, width) : "─".repeat(width);
 		return this.borderColor(border);
+	}
+
+	/**
+	 * The text lines (between the borders) render() drew last without an autocomplete list, and everything they were drawn
+	 * from: the editor's text, cursor and scroll position, width, padding, focus, the terminal's height and the paste IDs.
+	 * While a reply streams in, the editor is drawn on every frame and nothing of this changes: its lines are kept, and only
+	 * the borders, whose colors and status the editor does not own, are drawn again.
+	 */
+	private renderedText?: {
+		width: number;
+		paddingX: number;
+		terminalRows: number;
+		focused: boolean;
+		pasteIds: string;
+		lines: readonly string[];
+		cursorLine: number;
+		cursorCol: number;
+		/** The scroll position the lines were drawn at: render() adjusts it, and it is what it was set to then. */
+		scrollOffset: number;
+		visibleLineCount: number;
+		linesBelow: number;
+		textLines: readonly string[];
+		/** The lines render() returned, with the borders they were returned with. */
+		result: readonly string[];
+	};
+
+	/** Whether the text lines in `known` are what render() would draw now (renderedText). */
+	private isRenderedText(
+		known: NonNullable<Editor["renderedText"]>,
+		width: number,
+		terminalRows: number,
+		pasteIds: string,
+	): boolean {
+		const lines = this.state.lines;
+		if (
+			known.width !== width ||
+			known.paddingX !== this.paddingX ||
+			known.terminalRows !== terminalRows ||
+			known.focused !== this.focused ||
+			known.pasteIds !== pasteIds ||
+			known.cursorLine !== this.state.cursorLine ||
+			known.cursorCol !== this.state.cursorCol ||
+			known.scrollOffset !== this.scrollOffset ||
+			known.lines.length !== lines.length
+		) {
+			return false;
+		}
+		for (let i = 0; i < lines.length; i++) {
+			if (known.lines[i] !== lines[i]) return false;
+		}
+		return true;
 	}
 
 	render(width: number): string[] {
@@ -517,11 +832,31 @@ export class Editor implements Component, Focusable {
 		// Store for cursor navigation (must match wrapping width)
 		this.lastWidth = layoutWidth;
 
+		const terminalRows = this.tui.terminal.rows;
+		const showAutocomplete = Boolean(this.autocompleteState && this.autocompleteList);
+		const known = this.renderedText;
+		if (!showAutocomplete && known !== undefined) {
+			const pasteIds = this.pastes.size === 0 ? "" : [...this.pastes.keys()].join(",");
+			if (this.isRenderedText(known, width, terminalRows, pasteIds)) {
+				this.renderedVisibleLineCount = known.visibleLineCount;
+				this.renderedAutocompleteHeight = 0;
+				const top = this.renderTopBorder(width, this.scrollOffset);
+				const bottom = this.renderBottomBorder(width, known.linesBelow);
+				const result = known.result;
+				if (top === result[0] && bottom === result[result.length - 1]) {
+					return result.slice();
+				}
+				const lines = [top, ...known.textLines, bottom];
+				known.result = lines;
+				return lines.slice();
+			}
+		}
+		this.renderedText = undefined;
+
 		// Layout the text
 		const layoutLines = this.layoutText(layoutWidth);
 
 		// Calculate max visible lines: 30% of terminal height, minimum 5 lines
-		const terminalRows = this.tui.terminal.rows;
 		const maxVisibleLines = Math.max(5, Math.floor(terminalRows * 0.3));
 
 		// Find the cursor line index in layoutLines
@@ -572,15 +907,14 @@ export class Editor implements Component, Focusable {
 				if (after.length > 0) {
 					// Cursor is on a character (grapheme) - replace it with highlighted version
 					// Get the first grapheme from 'after'
-					const afterGraphemes = [...this.segment(after, "grapheme")];
-					const firstGrapheme = afterGraphemes[0]?.segment || "";
+					const firstGrapheme = this.firstGrapheme(after)?.segment || "";
 					const restAfter = after.slice(firstGrapheme.length);
-					const cursor = `\x1b[7m${firstGrapheme}\x1b[0m`;
+					const cursor = renderFakeCursor(firstGrapheme);
 					displayText = before + marker + cursor + restAfter;
 					// lineVisibleWidth stays the same - we're replacing, not adding
 				} else {
 					// Cursor is at the end - add highlighted space
-					const cursor = "\x1b[7m \x1b[0m";
+					const cursor = renderFakeCursor(" ");
 					displayText = before + marker + cursor;
 					lineVisibleWidth = lineVisibleWidth + 1;
 					// If cursor overflows content width into the padding, flag it
@@ -601,6 +935,24 @@ export class Editor implements Component, Focusable {
 		// Render bottom border (with scroll indicator if more content below)
 		const linesBelow = layoutLines.length - (this.scrollOffset + visibleLines.length);
 		result.push(this.renderBottomBorder(width, linesBelow));
+
+		if (!showAutocomplete) {
+			this.renderedText = {
+				width,
+				paddingX: this.paddingX,
+				terminalRows,
+				focused: this.focused,
+				pasteIds: this.pastes.size === 0 ? "" : [...this.pastes.keys()].join(","),
+				lines: this.state.lines.slice(),
+				cursorLine: this.state.cursorLine,
+				cursorCol: this.state.cursorCol,
+				scrollOffset: this.scrollOffset,
+				visibleLineCount: visibleLines.length,
+				linesBelow,
+				textLines: result.slice(1, -1),
+				result: result.slice(),
+			};
+		}
 
 		// Add autocomplete list if active
 		this.renderedAutocompleteHeight = 0;
@@ -996,10 +1348,11 @@ export class Editor implements Component, Focusable {
 		}
 
 		// Process each logical line
+		const wrapCache = this.wrapCacheFor(contentWidth);
 		for (let i = 0; i < this.state.lines.length; i++) {
 			const line = this.state.lines[i] || "";
 			const isCurrentLine = i === this.state.cursorLine;
-			const lineVisibleWidth = visibleWidth(line);
+			const lineVisibleWidth = editorLineWidth(line);
 
 			if (lineVisibleWidth <= contentWidth) {
 				// Line fits in one layout line
@@ -1017,7 +1370,7 @@ export class Editor implements Component, Focusable {
 				}
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, contentWidth, [...this.segment(line, "grapheme")]);
+				const chunks = this.wrapLine(wrapCache, i, line, contentWidth);
 
 				for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
 					const chunk = chunks[chunkIndex];
@@ -1222,13 +1575,12 @@ export class Editor implements Component, Focusable {
 			else if (this.autocompleteTriggerCharacters.includes(char)) {
 				const currentLine = this.state.lines[this.state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
-				const charBeforeSymbol = textBeforeCursor[textBeforeCursor.length - 2];
-				if (textBeforeCursor.length === 1 || charBeforeSymbol === " " || charBeforeSymbol === "\t") {
+				if (this.matchesAutocompleteTrigger(textBeforeCursor)) {
 					this.tryTriggerAutocomplete();
 				}
 			}
 			// Also auto-trigger when typing letters in a slash command or symbol completion context
-			else if (/[a-zA-Z0-9.\-_]/.test(char)) {
+			else if (/[a-zA-Z0-9.\-_]/.test(char) || cjkBreakRegex.test(char)) {
 				const currentLine = this.state.lines[this.state.cursorLine] || "";
 				const textBeforeCursor = currentLine.slice(0, this.state.cursorCol);
 				// Check if we're in a slash command (with or without space for arguments)
@@ -1236,7 +1588,7 @@ export class Editor implements Component, Focusable {
 					this.tryTriggerAutocomplete();
 				}
 				// Check if we're in a symbol-based completion context like @, #, or provider triggers
-				else if (this.autocompleteTriggerPattern.test(textBeforeCursor)) {
+				else if (this.matchesAutocompleteTrigger(textBeforeCursor)) {
 					this.tryTriggerAutocomplete();
 				}
 			}
@@ -1377,8 +1729,7 @@ export class Editor implements Component, Focusable {
 			const beforeCursor = line.slice(0, this.state.cursorCol);
 
 			// Find the last grapheme in the text before cursor
-			const graphemes = [...this.segment(beforeCursor, "grapheme")];
-			const lastGrapheme = graphemes[graphemes.length - 1];
+			const lastGrapheme = this.lastGrapheme(beforeCursor)!;
 			const graphemeLength = lastGrapheme ? lastGrapheme.segment.length : 1;
 			const isPastedSegmented = PASTE_MARKER_SINGLE.exec(lastGrapheme.segment);
 
@@ -1444,7 +1795,7 @@ export class Editor implements Component, Focusable {
 				this.tryTriggerAutocomplete();
 			}
 			// Symbol-based completion context like @, #, or provider triggers
-			else if (this.autocompleteTriggerPattern.test(textBeforeCursor)) {
+			else if (this.matchesAutocompleteTrigger(textBeforeCursor)) {
 				this.tryTriggerAutocomplete();
 			}
 		}
@@ -1506,40 +1857,37 @@ export class Editor implements Component, Focusable {
 		// Snap cursor to atomic segment boundary (e.g. paste markers)
 		// so the cursor never lands in the middle of a multi-grapheme unit.
 		// Single-grapheme segments don't need snapping.
-		const segments = [...this.segment(logicalLine, "grapheme")];
-		for (const seg of segments) {
-			if (seg.index > this.state.cursorCol) break;
-			if (seg.segment.length <= 1) continue;
-			if (this.state.cursorCol < seg.index + seg.segment.length) {
-				const isContinuation = seg.index < targetVL.startCol;
-				const isMovingDown = targetVisualLine > currentVisualLine;
+		// (Only the grapheme that contains the cursor column can need it.)
+		const seg = this.graphemeContaining(logicalLine, this.state.cursorCol);
+		if (seg && seg.segment.length > 1) {
+			const isContinuation = seg.index < targetVL.startCol;
+			const isMovingDown = targetVisualLine > currentVisualLine;
 
-				if (isContinuation && isMovingDown) {
-					// The segment started on a previous visual line, and we
-					// already visited it on the way down. Skip all remaining
-					// continuation VLs and land on the first VL past it.
-					const segEnd = seg.index + seg.segment.length;
-					let next = targetVisualLine + 1;
-					while (
-						next < visualLines.length &&
-						visualLines[next].logicalLine === targetVL.logicalLine &&
-						visualLines[next].startCol < segEnd
-					) {
-						next++;
-					}
-					if (next < visualLines.length) {
-						this.moveToVisualLine(visualLines, currentVisualLine, next);
-						return;
-					}
+			if (isContinuation && isMovingDown) {
+				// The segment started on a previous visual line, and we
+				// already visited it on the way down. Skip all remaining
+				// continuation VLs and land on the first VL past it.
+				const segEnd = seg.index + seg.segment.length;
+				let next = targetVisualLine + 1;
+				while (
+					next < visualLines.length &&
+					visualLines[next].logicalLine === targetVL.logicalLine &&
+					visualLines[next].startCol < segEnd
+				) {
+					next++;
 				}
-
-				// Snap to the start of the segment so it gets highlighted.
-				// Store the pre-snap position so the next vertical move can
-				// resolve it to the correct visual column.
-				this.snappedFromCursorCol = this.state.cursorCol;
-				this.state.cursorCol = seg.index;
-				return;
+				if (next < visualLines.length) {
+					this.moveToVisualLine(visualLines, currentVisualLine, next);
+					return;
+				}
 			}
+
+			// Snap to the start of the segment so it gets highlighted.
+			// Store the pre-snap position so the next vertical move can
+			// resolve it to the correct visual column.
+			this.snappedFromCursorCol = this.state.cursorCol;
+			this.state.cursorCol = seg.index;
+			return;
 		}
 
 		// No snap occurred – we moved out of the atomic segment.
@@ -1777,8 +2125,7 @@ export class Editor implements Component, Focusable {
 			const afterCursor = currentLine.slice(this.state.cursorCol);
 
 			// Find the first grapheme at cursor
-			const graphemes = [...this.segment(afterCursor, "grapheme")];
-			const firstGrapheme = graphemes[0];
+			const firstGrapheme = this.firstGrapheme(afterCursor);
 			const graphemeLength = firstGrapheme ? firstGrapheme.segment.length : 1;
 
 			const before = currentLine.slice(0, this.state.cursorCol);
@@ -1808,7 +2155,7 @@ export class Editor implements Component, Focusable {
 				this.tryTriggerAutocomplete();
 			}
 			// Symbol-based completion context like @, #, or provider triggers
-			else if (this.autocompleteTriggerPattern.test(textBeforeCursor)) {
+			else if (this.matchesAutocompleteTrigger(textBeforeCursor)) {
 				this.tryTriggerAutocomplete();
 			}
 		}
@@ -1823,10 +2170,11 @@ export class Editor implements Component, Focusable {
 	 */
 	private buildVisualLineMap(width: number): Array<{ logicalLine: number; startCol: number; length: number }> {
 		const visualLines: Array<{ logicalLine: number; startCol: number; length: number }> = [];
+		const wrapCache = this.wrapCacheFor(width);
 
 		for (let i = 0; i < this.state.lines.length; i++) {
 			const line = this.state.lines[i] || "";
-			const lineVisWidth = visibleWidth(line);
+			const lineVisWidth = editorLineWidth(line);
 			if (line.length === 0) {
 				// Empty line still takes one visual line
 				visualLines.push({ logicalLine: i, startCol: 0, length: 0 });
@@ -1834,7 +2182,7 @@ export class Editor implements Component, Focusable {
 				visualLines.push({ logicalLine: i, startCol: 0, length: line.length });
 			} else {
 				// Line needs wrapping - use word-aware wrapping
-				const chunks = wordWrapLine(line, width, [...this.segment(line, "grapheme")]);
+				const chunks = this.wrapLine(wrapCache, i, line, width);
 				for (const chunk of chunks) {
 					visualLines.push({
 						logicalLine: i,
@@ -1899,8 +2247,7 @@ export class Editor implements Component, Focusable {
 				// Moving right - move by one grapheme (handles emojis, combining characters, etc.)
 				if (this.state.cursorCol < currentLine.length) {
 					const afterCursor = currentLine.slice(this.state.cursorCol);
-					const graphemes = [...this.segment(afterCursor, "grapheme")];
-					const firstGrapheme = graphemes[0];
+					const firstGrapheme = this.firstGrapheme(afterCursor);
 					this.setCursorCol(this.state.cursorCol + (firstGrapheme ? firstGrapheme.segment.length : 1));
 				} else if (this.state.cursorLine < this.state.lines.length - 1) {
 					// Wrap to start of next logical line
@@ -1917,8 +2264,7 @@ export class Editor implements Component, Focusable {
 				// Moving left - move by one grapheme (handles emojis, combining characters, etc.)
 				if (this.state.cursorCol > 0) {
 					const beforeCursor = currentLine.slice(0, this.state.cursorCol);
-					const graphemes = [...this.segment(beforeCursor, "grapheme")];
-					const lastGrapheme = graphemes[graphemes.length - 1];
+					const lastGrapheme = this.lastGrapheme(beforeCursor);
 					this.setCursorCol(this.state.cursorCol - (lastGrapheme ? lastGrapheme.segment.length : 1));
 				} else if (this.state.cursorLine > 0) {
 					// Wrap to end of previous logical line
@@ -2185,6 +2531,19 @@ export class Editor implements Component, Focusable {
 		const currentLine = this.state.lines[this.state.cursorLine] || "";
 		const beforeCursor = currentLine.slice(0, this.state.cursorCol);
 		return beforeCursor.trim() === "" || beforeCursor.trim() === "/";
+	}
+
+	/**
+	 * autocompleteTriggerPattern.test(textBeforeCursor). Every match has a trigger character (`@"` included), so text
+	 * without one is not tested: the anchored pattern is tried at each separator of the text, O(line) per keystroke.
+	 */
+	private matchesAutocompleteTrigger(textBeforeCursor: string): boolean {
+		const triggerCharacters = this.autocompleteTriggerCharacters;
+		for (let i = 0; i < triggerCharacters.length; i++) {
+			if (textBeforeCursor.includes(triggerCharacters[i]!))
+				return this.autocompleteTriggerPattern.test(textBeforeCursor);
+		}
+		return false;
 	}
 
 	private isInSlashCommandContext(textBeforeCursor: string): boolean {

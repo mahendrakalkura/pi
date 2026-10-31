@@ -1,29 +1,33 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import {
+	type AssistantMessage,
 	getCurrentSystemMessage,
 	type ImageContent,
 	type Message,
 	type SystemMessage,
 	type TextContent,
+	type ToolResultMessage,
 	type Usage,
+	type UserMessage,
 	uuidv7,
 } from "@earendil-works/pi-ai";
 import { randomUUID } from "crypto";
 import {
 	appendFileSync,
 	closeSync,
-	createReadStream,
 	existsSync,
+	fstatSync,
 	mkdirSync,
 	openSync,
 	readdirSync,
 	readSync,
+	type Stats,
 	statSync,
 	writeFileSync,
+	writeSync,
 } from "fs";
-import { readdir, stat } from "fs/promises";
-import { join, resolve } from "path";
-import { createInterface } from "readline";
+import { open, readdir, readFile, rename, rm, stat, writeFile } from "fs/promises";
+import { basename, join, resolve } from "path";
 import { StringDecoder } from "string_decoder";
 import { APP_NAME, getAgentDir as getDefaultAgentDir, getSessionsDir } from "../config.ts";
 import { normalizePath, resolvePath } from "../utils/paths.ts";
@@ -71,6 +75,17 @@ export interface ModelChangeEntry extends SessionEntryBase {
 	type: "model_change";
 	provider: string;
 	modelId: string;
+}
+
+export interface UsageEntry extends SessionEntryBase {
+	type: "usage";
+	/** Arbitrary usage category, such as "cache_warm". */
+	kind: string;
+	provider: string;
+	model: string;
+	usage: Usage;
+	/** Optional human-readable qualifier for usage notices. */
+	note?: string;
 }
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
@@ -149,15 +164,32 @@ export interface CustomMessageEntry<T = unknown> extends SessionEntryBase {
 	display: boolean;
 }
 
+/** Content that an append-only context edit may replace without changing message metadata. */
+export type ContextEditableContent =
+	| UserMessage["content"]
+	| AssistantMessage["content"]
+	| ToolResultMessage["content"]
+	| CustomMessage["content"];
+
+/** Append-only change to one earlier entry's contribution to model context. */
+export interface ContextEditEntry extends SessionEntryBase {
+	type: "context_edit";
+	targetId: string;
+	/** Null omits the target from model context. A value replaces only its content. */
+	replacement: { content: ContextEditableContent } | null;
+}
+
 /** Session entry - has id/parentId for tree structure (returned by "read" methods in SessionManager) */
 export type SessionEntry =
 	| SessionMessageEntry
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
+	| UsageEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
 	| CustomMessageEntry
+	| ContextEditEntry
 	| LabelEntry
 	| SessionInfoEntry;
 
@@ -172,6 +204,20 @@ export interface SessionTreeNode {
 	label?: string;
 	/** Timestamp of the latest label change for this entry, if any */
 	labelTimestamp?: string;
+}
+
+export interface ProjectedSessionEntry {
+	/** Raw append-only entry that owns this projected contribution. */
+	sourceEntry: SessionEntry;
+	/** Model-visible messages after context edits. Empty for state-only entries and omissions. */
+	messages: AgentMessage[];
+}
+
+export interface SessionProjection {
+	entries: ProjectedSessionEntry[];
+	messages: AgentMessage[];
+	thinkingLevel: string;
+	model: { provider: string; modelId: string } | null;
 }
 
 export interface SessionContext {
@@ -208,6 +254,7 @@ export type ReadonlySessionManager = Pick<
 	| "getLabel"
 	| "getBranch"
 	| "buildContextEntries"
+	| "buildSessionProjection"
 	| "getHeader"
 	| "getEntries"
 	| "getTree"
@@ -369,20 +416,22 @@ function buildSessionPath(
 }
 
 function getSessionContextSettings(path: SessionEntry[]): Pick<SessionContext, "thinkingLevel" | "model"> {
-	let thinkingLevel = "off";
-	let model: { provider: string; modelId: string } | null = null;
+	const settings: Pick<SessionContext, "thinkingLevel" | "model"> = { thinkingLevel: "off", model: null };
+	for (const entry of path) applySessionContextSetting(settings, entry);
+	return settings;
+}
 
-	for (const entry of path) {
-		if (entry.type === "thinking_level_change") {
-			thinkingLevel = entry.thinkingLevel;
-		} else if (entry.type === "model_change") {
-			model = { provider: entry.provider, modelId: entry.modelId };
-		} else if (entry.type === "message" && entry.message.role === "assistant") {
-			model = { provider: entry.message.provider, modelId: entry.message.model };
-		}
+function applySessionContextSetting(
+	settings: Pick<SessionContext, "thinkingLevel" | "model">,
+	entry: SessionEntry,
+): void {
+	if (entry.type === "thinking_level_change") {
+		settings.thinkingLevel = entry.thinkingLevel;
+	} else if (entry.type === "model_change") {
+		settings.model = { provider: entry.provider, modelId: entry.modelId };
+	} else if (entry.type === "message" && entry.message.role === "assistant") {
+		settings.model = { provider: entry.message.provider, modelId: entry.message.model };
 	}
-
-	return { thinkingLevel, model };
 }
 
 /**
@@ -431,36 +480,32 @@ export function buildContextEntries(
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionEntry[] {
-	const path = buildSessionPath(entries, leafId, byId);
-	let compaction: CompactionEntry | null = null;
+	return contextEntriesOfPath(buildSessionPath(entries, leafId, byId));
+}
 
-	for (const entry of path) {
-		if (entry.type === "compaction") {
-			compaction = entry;
-		}
-	}
-
-	if (!compaction) {
-		return path;
-	}
-
-	const compactionIdx = path.findIndex((entry) => entry.id === compaction.id);
+/**
+ * The context entries of a root-to-leaf path; the path itself when it has no compaction. Scans back
+ * from the leaf, so the cost is the kept window, not the history before the latest compaction.
+ */
+function contextEntriesOfPath(path: SessionEntry[]): SessionEntry[] {
+	let compactionIdx = path.length - 1;
+	while (compactionIdx >= 0 && path[compactionIdx].type !== "compaction") compactionIdx--;
 	if (compactionIdx < 0) {
 		return path;
 	}
+	const compaction = path[compactionIdx] as CompactionEntry;
 
+	// Entries from firstKeptEntryId up to the compaction; none when it is not on the path.
+	let firstKeptIdx = compactionIdx - 1;
+	while (firstKeptIdx >= 0 && path[firstKeptIdx].id !== compaction.firstKeptEntryId) firstKeptIdx--;
 	const contextEntries: SessionEntry[] = [compaction];
-	let foundFirstKept = false;
-	for (let i = 0; i < compactionIdx; i++) {
+	for (let i = firstKeptIdx < 0 ? compactionIdx : firstKeptIdx; i < compactionIdx; i++) {
 		const entry = path[i];
-		if (entry.id === compaction.firstKeptEntryId) {
-			foundFirstKept = true;
-		}
-		if (foundFirstKept && !(entry.type === "message" && entry.message.role === "system")) {
+		if (!(entry.type === "message" && entry.message.role === "system")) {
 			contextEntries.push(entry);
 		}
 	}
-	contextEntries.push(...path.slice(compactionIdx + 1));
+	for (let i = compactionIdx + 1; i < path.length; i++) contextEntries.push(path[i]);
 	return contextEntries;
 }
 
@@ -469,14 +514,73 @@ export function buildContextEntries(
  * If leafId is provided, walks from that entry to root.
  * Handles compaction and branch summaries along the path.
  */
+function projectContextEntry(entry: SessionEntry, edit: ContextEditEntry | undefined): AgentMessage[] {
+	const messages = sessionEntryToContextMessages(entry);
+	if (!edit) return messages;
+	const replacement = edit.replacement;
+	if (replacement === null) return [];
+
+	return messages.map((message) => {
+		if (
+			message.role !== "user" &&
+			message.role !== "assistant" &&
+			message.role !== "toolResult" &&
+			message.role !== "custom"
+		) {
+			return message;
+		}
+		const content =
+			(message.role === "assistant" || message.role === "toolResult") && typeof replacement.content === "string"
+				? [{ type: "text" as const, text: replacement.content }]
+				: replacement.content;
+		return { ...message, content } as AgentMessage;
+	});
+}
+
+/** Build provenance-preserving, compaction-aware model context. */
+export function buildSessionProjection(
+	entries: SessionEntry[],
+	leafId?: string | null,
+	byId?: Map<string, SessionEntry>,
+): SessionProjection {
+	return projectSessionPath(buildSessionPath(entries, leafId, byId));
+}
+
+/** The projection of a root-to-leaf path. Does not keep or return `path`. */
+function projectSessionPath(path: SessionEntry[]): SessionProjection {
+	const { thinkingLevel, model } = getSessionContextSettings(path);
+	const contextEntries = contextEntriesOfPath(path);
+	const edits = new Map<string, ContextEditEntry>();
+	for (const entry of contextEntries) {
+		if (entry.type === "context_edit") edits.set(entry.targetId, entry);
+	}
+	const projectedEntries = contextEntries.map(
+		(sourceEntry, index): ProjectedSessionEntry => ({
+			sourceEntry,
+			// buildContextEntries() may retain an older compaction entry because its
+			// raw ID lies inside the newest retained range. Only the newest compaction
+			// at index zero contributes a checkpoint and summary.
+			messages:
+				sourceEntry.type === "compaction" && index > 0
+					? []
+					: projectContextEntry(sourceEntry, edits.get(sourceEntry.id)),
+		}),
+	);
+	return {
+		entries: projectedEntries,
+		messages: projectedEntries.flatMap((entry) => entry.messages),
+		thinkingLevel,
+		model,
+	};
+}
+
+/** Build the finalized model context from the canonical session projection. */
 export function buildSessionContext(
 	entries: SessionEntry[],
 	leafId?: string | null,
 	byId?: Map<string, SessionEntry>,
 ): SessionContext {
-	const path = buildSessionPath(entries, leafId, byId);
-	const { thinkingLevel, model } = getSessionContextSettings(path);
-	const messages = buildContextEntries(entries, leafId, byId).flatMap(sessionEntryToContextMessages);
+	const { messages, thinkingLevel, model } = buildSessionProjection(entries, leafId, byId);
 	return { messages, thinkingLevel, model };
 }
 
@@ -649,18 +753,16 @@ export function findMostRecentSession(sessionDir: string, cwd?: string): string 
 	const resolvedCwd = cwd ? resolvePath(cwd) : undefined;
 	try {
 		const files = readdirSync(resolvedSessionDir)
-			.filter((f) => f.endsWith(".jsonl"))
-			.map((f) => join(resolvedSessionDir, f))
-			.map((path) => ({ path, header: readSessionHeaderForDiscovery(path) }))
-			.filter(
-				(file): file is { path: string; header: SessionHeader } =>
-					file.header !== null &&
-					(!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(file.header), resolvedCwd)),
-			)
-			.map(({ path }) => ({ path, mtime: statSync(path).mtime }))
-			.sort((a, b) => b.mtime.getTime() - a.mtime.getTime());
+			.filter((file) => file.endsWith(".jsonl"))
+			.map((file) => join(resolvedSessionDir, file))
+			.map((path) => ({ path, mtime: statSync(path).mtimeMs }))
+			.sort((a, b) => b.mtime - a.mtime);
 
-		return files[0]?.path || null;
+		for (const { path } of files) {
+			const header = readSessionHeaderForDiscovery(path);
+			if (header && (!resolvedCwd || sessionCwdMatches(getSessionHeaderCwd(header), resolvedCwd))) return path;
+		}
+		return null;
 	} catch {
 		// Directory access and stat races make recent-session discovery unavailable.
 		return null;
@@ -696,161 +798,536 @@ function getMessageActivityTime(entry: SessionMessageEntry): number | undefined 
 	return Number.isNaN(t) ? undefined : t;
 }
 
-async function buildSessionInfo(filePath: string): Promise<SessionInfo | null> {
+/** Length of the start of a line that is enough to tell what a listing needs from it. */
+const LINE_HEAD_BYTES = 256;
+/** A message line as `JSON.stringify` writes it, up to its message's role (group 1). */
+const MESSAGE_LINE_HEAD =
+	/^\{"type":"message","id":"[^"\\]*","parentId":(?:null|"[^"\\]*"),"timestamp":"[^"\\]*","message":\{"role":"([^"\\]*)"/;
+
+/**
+ * What a line after the header gives a session listing, told from its first bytes where they are enough:
+ * - "skip": an entry of a type the listing does not use. Such a line adds nothing whether it parses or not (a line has
+ *   one "type": JSON.stringify writes no key twice).
+ * - "count": a message the listing only counts: not a user or assistant message (tool results, system prompts). These
+ *   are most of a session's bytes. The line must end like a whole entry ("}}", the end of its message and its own).
+ * - "parse": anything else, including every line whose start is not written the way `JSON.stringify` writes entries.
+ */
+function classifySessionLine(buffer: Buffer, start: number, end: number): "skip" | "count" | "parse" {
+	const head = buffer.toString("latin1", start, Math.min(end, start + LINE_HEAD_BYTES));
+	if (!head.startsWith('{"type":"')) return "parse";
+	const typeEnd = head.indexOf('"', 9);
+	if (typeEnd === -1) return "parse";
+	const type = head.slice(9, typeEnd);
+	if (type === "session_info" || type.includes("\\")) return "parse";
+	if (type !== "message") return "skip";
+	const role = MESSAGE_LINE_HEAD.exec(head)?.[1];
+	if (role === undefined || role === "user" || role === "assistant") return "parse";
+	return end - start >= 2 && buffer[end - 1] === 0x7d && buffer[end - 2] === 0x7d ? "count" : "parse";
+}
+
+/**
+ * Calls `onLine` with each line of a file as a byte range of `buffer`, split like readline splits them (at "\n", "\r\n"
+ * and a lone "\r"), until it returns false. Lines are not decoded: a listing decodes only the lines it parses. A "\n" or
+ * "\r" byte is never part of a multi-byte UTF-8 sequence, so decoding each line on its own gives the text that decoding
+ * the whole file and splitting it gives. Returns the number of bytes read.
+ */
+async function forEachLineOfFile(
+	filePath: string,
+	signal: AbortSignal | undefined,
+	onLine: (buffer: Buffer, start: number, end: number) => boolean,
+): Promise<number> {
+	const file = await open(filePath, "r");
 	try {
-		const stats = await stat(filePath);
-		let header: SessionHeader | null = null;
-		let messageCount = 0;
-		let firstMessage = "";
-		const allMessages: string[] = [];
-		let name: string | undefined;
-		let lastActivityTime: number | undefined;
-
-		const rl = createInterface({
-			input: createReadStream(filePath, { encoding: "utf8" }),
-			crlfDelay: Infinity,
-		});
-
-		for await (const line of rl) {
-			const entry = parseSessionEntryLine(line);
-			if (!entry) continue;
-
-			if (!header) {
-				if (entry.type !== "session") return null;
-				header = entry;
-				continue;
+		const chunk = Buffer.allocUnsafe(SESSION_READ_BUFFER_SIZE);
+		// The start of a line that continues in the next chunk, copied out of the reused chunk buffer.
+		let carry: Buffer[] = [];
+		// The previous chunk ended with "\r": a "\n" that starts this chunk belongs to the same line break.
+		let skipLineFeed = false;
+		let bytesReadTotal = 0;
+		const emit = (buffer: Buffer, start: number, end: number): boolean => {
+			if (carry.length === 0) return onLine(buffer, start, end);
+			const line = Buffer.concat([...carry, buffer.subarray(start, end)]);
+			carry = [];
+			return onLine(line, 0, line.length);
+		};
+		while (true) {
+			signal?.throwIfAborted();
+			const { bytesRead } = await file.read(chunk, 0, chunk.length, null);
+			if (bytesRead === 0) break;
+			bytesReadTotal += bytesRead;
+			const buffer = chunk.subarray(0, bytesRead);
+			let pos = 0;
+			if (skipLineFeed) {
+				skipLineFeed = false;
+				if (buffer[0] === 0x0a) pos = 1;
 			}
-
-			// Extract session name (use latest, including explicit clears)
-			if (entry.type === "session_info") {
-				name = entry.name?.trim() || undefined;
+			let nextLineFeed = buffer.indexOf(0x0a, pos);
+			let nextCarriageReturn = buffer.indexOf(0x0d, pos);
+			while (true) {
+				if (nextLineFeed !== -1 && nextLineFeed < pos) nextLineFeed = buffer.indexOf(0x0a, pos);
+				if (nextCarriageReturn !== -1 && nextCarriageReturn < pos) {
+					nextCarriageReturn = buffer.indexOf(0x0d, pos);
+				}
+				const lineEnd =
+					nextCarriageReturn === -1
+						? nextLineFeed
+						: nextLineFeed === -1
+							? nextCarriageReturn
+							: Math.min(nextLineFeed, nextCarriageReturn);
+				if (lineEnd === -1) break;
+				if (!emit(buffer, pos, lineEnd)) return bytesReadTotal;
+				pos = lineEnd + 1;
+				if (lineEnd === nextCarriageReturn) {
+					if (pos === bytesRead) skipLineFeed = true;
+					else if (buffer[pos] === 0x0a) pos++;
+				}
 			}
+			if (pos < bytesRead) carry.push(Buffer.from(buffer.subarray(pos)));
+		}
+		if (carry.length > 0) {
+			const line = Buffer.concat(carry);
+			carry = [];
+			onLine(line, 0, line.length);
+		}
+		return bytesReadTotal;
+	} finally {
+		await file.close();
+	}
+}
 
-			if (entry.type !== "message") continue;
-			messageCount++;
+/**
+ * Reads a session file for a listing. `cacheable` is false when the file changed while it was read: its result may then
+ * not match its stats.
+ */
+async function scanSessionInfo(
+	filePath: string,
+	stats: Stats,
+	signal?: AbortSignal,
+): Promise<{ info: SessionInfo | null; cacheable: boolean }> {
+	let header: SessionHeader | null = null;
+	let notASession = false;
+	let messageCount = 0;
+	let firstMessage = "";
+	const allMessages: string[] = [];
+	let name: string | undefined;
+	let lastActivityTime: number | undefined;
 
-			const activityTime = getMessageActivityTime(entry);
-			if (typeof activityTime === "number") {
-				lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
-			}
-
-			const message = entry.message;
-			if (!isMessageWithContent(message)) continue;
-			if (message.role !== "user" && message.role !== "assistant") continue;
-
-			const textContent = extractTextContent(message);
-			if (!textContent) continue;
-
-			allMessages.push(textContent);
-			if (!firstMessage && message.role === "user") {
-				firstMessage = textContent;
+	const bytesRead = await forEachLineOfFile(filePath, signal, (buffer, start, end) => {
+		if (header) {
+			const kind = classifySessionLine(buffer, start, end);
+			if (kind === "skip") return true;
+			if (kind === "count") {
+				messageCount++;
+				return true;
 			}
 		}
+		const entry = parseSessionEntryLine(buffer.toString("utf8", start, end));
+		if (!entry) return true;
 
-		if (!header) return null;
+		if (!header) {
+			if (entry.type !== "session") {
+				notASession = true;
+				return false;
+			}
+			header = entry;
+			return true;
+		}
 
-		const cwd = typeof header.cwd === "string" ? header.cwd : "";
-		const parentSessionPath = header.parentSession;
-		const headerTime = typeof header.timestamp === "string" ? new Date(header.timestamp).getTime() : NaN;
-		const modified =
-			typeof lastActivityTime === "number" && lastActivityTime > 0
-				? new Date(lastActivityTime)
-				: !Number.isNaN(headerTime)
-					? new Date(headerTime)
-					: stats.mtime;
+		// Extract session name (use latest, including explicit clears)
+		if (entry.type === "session_info") {
+			name = entry.name?.trim() || undefined;
+		}
 
-		return {
+		if (entry.type !== "message") return true;
+		messageCount++;
+
+		const activityTime = getMessageActivityTime(entry);
+		if (typeof activityTime === "number") {
+			lastActivityTime = Math.max(lastActivityTime ?? 0, activityTime);
+		}
+
+		const message = entry.message;
+		if (!isMessageWithContent(message)) return true;
+		if (message.role !== "user" && message.role !== "assistant") return true;
+
+		const textContent = extractTextContent(message);
+		if (!textContent) return true;
+
+		allMessages.push(textContent);
+		if (!firstMessage && message.role === "user") {
+			firstMessage = textContent;
+		}
+		return true;
+	});
+	const cacheable = notASession || bytesRead === stats.size;
+
+	// TypeScript does not see the assignment in the callback.
+	const sessionHeader = header as SessionHeader | null;
+	if (!sessionHeader) return { info: null, cacheable };
+
+	const cwd = typeof sessionHeader.cwd === "string" ? sessionHeader.cwd : "";
+	const parentSessionPath = sessionHeader.parentSession;
+	const headerTime = typeof sessionHeader.timestamp === "string" ? new Date(sessionHeader.timestamp).getTime() : NaN;
+	const modified =
+		typeof lastActivityTime === "number" && lastActivityTime > 0
+			? new Date(lastActivityTime)
+			: !Number.isNaN(headerTime)
+				? new Date(headerTime)
+				: stats.mtime;
+
+	return {
+		info: {
 			path: filePath,
-			id: header.id,
+			id: sessionHeader.id,
 			cwd,
 			name,
 			parentSessionPath,
-			created: new Date(header.timestamp),
+			created: new Date(sessionHeader.timestamp),
 			modified,
 			messageCount,
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.join(" "),
-		};
+		},
+		cacheable,
+	};
+}
+
+async function buildSessionInfo(
+	filePath: string,
+	signal?: AbortSignal,
+	fileStats?: Stats,
+	index?: SessionInfoIndex,
+): Promise<SessionInfo | null> {
+	try {
+		const stats = fileStats ?? (await stat(filePath));
+		const cached = index?.get(filePath, stats);
+		if (cached !== undefined) return cached;
+		const { info, cacheable } = await scanSessionInfo(filePath, stats, signal);
+		if (cacheable) index?.set(filePath, stats, info);
+		return info;
 	} catch {
+		signal?.throwIfAborted();
 		return null;
 	}
 }
 
-export type SessionListProgress = (loaded: number, total: number) => void;
+/** Name of the file, in a listed session folder, that keeps the listing's results for the next listing. */
+const SESSION_INDEX_FILE = ".session-index.json";
+const SESSION_INDEX_VERSION = 1;
 
-const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
+/** A SessionInfo without its path (the key), with dates as times (null for an invalid date), as the index keeps it. */
+interface IndexedSessionInfo {
+	id: string;
+	cwd: string;
+	name?: string;
+	parentSessionPath?: string;
+	created: number | null;
+	modified: number | null;
+	messageCount: number;
+	firstMessage: string;
+	allMessagesText: string;
+}
 
-async function buildSessionInfosWithConcurrency(
-	files: string[],
-	onLoaded: () => void,
-): Promise<(SessionInfo | null)[]> {
-	const results: (SessionInfo | null)[] = new Array(files.length).fill(null);
-	const inFlight = new Set<Promise<void>>();
-	let nextIndex = 0;
+/** A session file's revision when it was read, and what it gave (null: not a session). */
+interface SessionIndexEntry {
+	revision: string;
+	info: IndexedSessionInfo | null;
+}
 
-	const startNext = (): void => {
-		const index = nextIndex++;
-		const file = files[index];
-		if (!file) return;
+/** What changes when a file is appended to, rewritten or replaced: its device, inode, size and times. */
+function sessionFileRevision(stats: Stats): string {
+	return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`;
+}
 
-		let task: Promise<void>;
-		task = buildSessionInfo(file)
-			.then((info) => {
-				results[index] = info;
-			})
-			.catch(() => {
-				results[index] = null;
-			})
-			.finally(() => {
-				inFlight.delete(task);
-				onLoaded();
-			});
-		inFlight.add(task);
-	};
+function isIndexedSessionInfo(value: unknown): value is IndexedSessionInfo {
+	if (typeof value !== "object" || value === null) return false;
+	const info = value as Record<string, unknown>;
+	return (
+		typeof info.cwd === "string" &&
+		(info.name === undefined || typeof info.name === "string") &&
+		(info.created === null || typeof info.created === "number") &&
+		(info.modified === null || typeof info.modified === "number") &&
+		typeof info.messageCount === "number" &&
+		typeof info.firstMessage === "string" &&
+		typeof info.allMessagesText === "string"
+	);
+}
 
-	while (nextIndex < files.length || inFlight.size > 0) {
-		while (nextIndex < files.length && inFlight.size < MAX_CONCURRENT_SESSION_INFO_LOADS) {
-			startNext();
-		}
-		if (inFlight.size > 0) {
-			await Promise.race(inFlight);
-		}
+function isSessionIndexEntry(value: unknown): value is SessionIndexEntry {
+	if (typeof value !== "object" || value === null) return false;
+	const entry = value as Record<string, unknown>;
+	return typeof entry.revision === "string" && (entry.info === null || isIndexedSessionInfo(entry.info));
+}
+
+/**
+ * What the last listing of a session folder read from each session file, kept in a file in that folder: listing reads
+ * every line of every session, which took 0.5 s for 395 sessions (59 MB), and most sessions do not change between
+ * listings.
+ *
+ * An entry is used only while the file's device, inode, size and modification and change times are those it had before
+ * it was read: an append, a rewrite or a replacement changes them. A file that changed while it was read is not kept.
+ * The index is written to a temporary file and renamed over the old one, so a listing never sees a partly written index;
+ * listings running at once each write a whole index, and the last one wins. An index that cannot be read or parsed, or
+ * an entry of the wrong shape, counts as missing: the sessions are read again.
+ */
+class SessionInfoIndex {
+	private readonly path: string;
+	private readonly previous: Map<string, SessionIndexEntry>;
+	private readonly next = new Map<string, SessionIndexEntry>();
+	private changed = false;
+
+	private constructor(path: string, previous: Map<string, SessionIndexEntry>) {
+		this.path = path;
+		this.previous = previous;
 	}
 
+	static async load(dir: string): Promise<SessionInfoIndex> {
+		const path = join(dir, SESSION_INDEX_FILE);
+		const previous = new Map<string, SessionIndexEntry>();
+		try {
+			const parsed = JSON.parse(await readFile(path, "utf8")) as { version?: unknown; sessions?: unknown };
+			if (parsed.version === SESSION_INDEX_VERSION && typeof parsed.sessions === "object" && parsed.sessions) {
+				for (const [file, entry] of Object.entries(parsed.sessions)) {
+					if (isSessionIndexEntry(entry)) previous.set(file, entry);
+				}
+			}
+		} catch {
+			// No index yet, or one that cannot be used: every session is read.
+		}
+		return new SessionInfoIndex(path, previous);
+	}
+
+	/** The SessionInfo of `filePath` from the index, null for a file that is not a session, undefined when not known. */
+	get(filePath: string, stats: Stats): SessionInfo | null | undefined {
+		const entry = this.previous.get(filePath);
+		if (!entry || entry.revision !== sessionFileRevision(stats)) return undefined;
+		this.next.set(filePath, entry);
+		const info = entry.info;
+		if (!info) return null;
+		return {
+			path: filePath,
+			id: info.id,
+			cwd: info.cwd,
+			name: info.name,
+			parentSessionPath: info.parentSessionPath,
+			created: new Date(info.created ?? NaN),
+			modified: new Date(info.modified ?? NaN),
+			messageCount: info.messageCount,
+			firstMessage: info.firstMessage,
+			allMessagesText: info.allMessagesText,
+		};
+	}
+
+	set(filePath: string, stats: Stats, info: SessionInfo | null): void {
+		const created = info?.created.getTime();
+		const modified = info?.modified.getTime();
+		this.next.set(filePath, {
+			revision: sessionFileRevision(stats),
+			info: info && {
+				id: info.id,
+				cwd: info.cwd,
+				name: info.name,
+				parentSessionPath: info.parentSessionPath,
+				created: Number.isNaN(created) ? null : created!,
+				modified: Number.isNaN(modified) ? null : modified!,
+				messageCount: info.messageCount,
+				firstMessage: info.firstMessage,
+				allMessagesText: info.allMessagesText,
+			},
+		});
+		this.changed = true;
+	}
+
+	/** Writes the entries used or added by this listing, when they differ from the index that was read. */
+	async save(): Promise<void> {
+		if (!this.changed && this.next.size === this.previous.size) return;
+		const sessions: Record<string, SessionIndexEntry> = {};
+		for (const [file, entry] of this.next) sessions[file] = entry;
+		const tempPath = `${this.path}.${process.pid}.${randomUUID()}.tmp`;
+		try {
+			await writeFile(tempPath, JSON.stringify({ version: SESSION_INDEX_VERSION, sessions }));
+			await rename(tempPath, this.path);
+		} catch {
+			// The index only saves work. A folder that cannot be written is listed by reading every session.
+			await rm(tempPath, { force: true }).catch(() => {});
+		}
+	}
+}
+
+export type SessionListProgress = (
+	loaded: number,
+	total: number,
+	/** Sessions loaded so far, sorted by activity. Present on periodic updates. */
+	partialSessions?: readonly SessionInfo[],
+) => void;
+
+const MAX_CONCURRENT_SESSION_INFO_LOADS = 10;
+const MAX_CONCURRENT_SESSION_DISCOVERY_LOADS = 64;
+const CURRENT_SESSION_LIST_PUBLISH_INTERVAL = 10;
+const ALL_SESSION_LIST_PUBLISH_INTERVAL = 100;
+
+interface SessionFileCandidate {
+	path: string;
+	stats?: Stats;
+}
+
+async function mapWithConcurrency<T, R>(
+	items: T[],
+	limit: number,
+	map: (item: T, index: number) => Promise<R>,
+	signal?: AbortSignal,
+): Promise<R[]> {
+	const results = new Array<R>(items.length);
+	let nextIndex = 0;
+	const worker = async (): Promise<void> => {
+		while (nextIndex < items.length) {
+			signal?.throwIfAborted();
+			const index = nextIndex++;
+			results[index] = await map(items[index]!, index);
+		}
+	};
+	await Promise.all(Array.from({ length: Math.min(limit, items.length) }, () => worker()));
+	return results;
+}
+
+function sortSessionInfos(sessions: SessionInfo[]): SessionInfo[] {
+	return sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
+}
+
+async function buildSessionInfosWithConcurrency(
+	indexDir: string,
+	files: SessionFileCandidate[],
+	onLoaded: (info: SessionInfo | null, index: number) => void,
+	signal?: AbortSignal,
+): Promise<(SessionInfo | null)[]> {
+	const sessionIndex = await SessionInfoIndex.load(indexDir);
+	const results = await mapWithConcurrency(
+		files,
+		MAX_CONCURRENT_SESSION_INFO_LOADS,
+		async (file, index) => {
+			const info = await buildSessionInfo(file.path, signal, file.stats, sessionIndex);
+			onLoaded(info, index);
+			return info;
+		},
+		signal,
+	);
+	// A listing cancelled while its last reads finished is cancelled all the same.
+	signal?.throwIfAborted();
+	await sessionIndex.save();
 	return results;
 }
 
 async function listSessionsFromDir(
 	dir: string,
 	onProgress?: SessionListProgress,
-	progressOffset = 0,
-	progressTotal?: number,
+	signal?: AbortSignal,
 ): Promise<SessionInfo[]> {
-	const sessions: SessionInfo[] = [];
-	if (!existsSync(dir)) {
-		return sessions;
-	}
+	signal?.throwIfAborted();
+	if (!existsSync(dir)) return [];
 
 	try {
 		const dirEntries = await readdir(dir);
-		const files = dirEntries.filter((f) => f.endsWith(".jsonl")).map((f) => join(dir, f));
-		const total = progressTotal ?? files.length;
-
+		const files = dirEntries
+			.filter((file) => file.endsWith(".jsonl"))
+			.sort((a, b) => b.localeCompare(a))
+			.map((file) => ({ path: join(dir, file) }));
+		const total = files.length;
+		const partialSessions: SessionInfo[] = [];
 		let loaded = 0;
-		const results = await buildSessionInfosWithConcurrency(files, () => {
-			loaded++;
-			onProgress?.(progressOffset + loaded, total);
-		});
-		for (const info of results) {
-			if (info) {
-				sessions.push(info);
-			}
-		}
+		const results = await buildSessionInfosWithConcurrency(
+			dir,
+			files,
+			(info) => {
+				loaded++;
+				if (info) partialSessions.push(info);
+				const publishPartial =
+					loaded === 1 || loaded % CURRENT_SESSION_LIST_PUBLISH_INTERVAL === 0 || loaded === files.length;
+				onProgress?.(loaded, total, publishPartial ? sortSessionInfos([...partialSessions]) : undefined);
+			},
+			signal,
+		);
+		return results.filter((info): info is SessionInfo => info !== null);
 	} catch {
-		// Return empty list on error
+		signal?.throwIfAborted();
+		return [];
+	}
+}
+
+/** How long a session file stays open for appends after the last one. */
+const APPEND_FILE_IDLE_MS = 1000;
+
+/**
+ * A session file kept open for appends while they come in quick succession: opening and closing the file for every
+ * entry cost 50-65 µs on macOS (APFS), a write on an open file 6 µs, and a turn appends an entry per message and tool
+ * result. Each append still writes its whole line with write() before it returns, as before, so a crash loses no more.
+ *
+ * The file is checked by path before each append (a stat, 3-4 µs): when the path no longer names the open file (deleted,
+ * renamed, replaced), the open file is closed and the path is opened again, so the line goes where appending by path
+ * puts it. The file is closed after APPEND_FILE_IDLE_MS without appends, and when the session changes.
+ */
+class SessionAppendFile {
+	private readonly path: string;
+	private readonly fd: number;
+	private readonly dev: number;
+	private readonly ino: number;
+	private lastAppend = 0;
+	private timer: ReturnType<typeof setTimeout> | undefined;
+	private closed = false;
+
+	constructor(path: string) {
+		this.path = path;
+		this.fd = openSync(path, "a");
+		try {
+			const stats = fstatSync(this.fd);
+			this.dev = stats.dev;
+			this.ino = stats.ino;
+		} catch (error) {
+			closeSync(this.fd);
+			throw error;
+		}
 	}
 
-	return sessions;
+	/** Whether `path` still names this open file. */
+	isFor(path: string): boolean {
+		if (this.closed || path !== this.path) return false;
+		const stats = statSync(path, { throwIfNoEntry: false });
+		return stats !== undefined && stats.ino === this.ino && stats.dev === this.dev;
+	}
+
+	append(line: string): void {
+		const written = writeSync(this.fd, line);
+		if (written !== Buffer.byteLength(line)) {
+			// A short write (a full disk): write the rest like appendFileSync would.
+			const bytes = Buffer.from(line);
+			for (let offset = written; offset < bytes.length; ) {
+				offset += writeSync(this.fd, bytes, offset, bytes.length - offset);
+			}
+		}
+		this.lastAppend = performance.now();
+		if (!this.timer) this.scheduleClose(APPEND_FILE_IDLE_MS);
+	}
+
+	close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		if (this.timer) clearTimeout(this.timer);
+		this.timer = undefined;
+		try {
+			closeSync(this.fd);
+		} catch {
+			// Nothing is buffered: every append was written before it returned.
+		}
+	}
+
+	private scheduleClose(delay: number): void {
+		this.timer = setTimeout(() => {
+			this.timer = undefined;
+			const idle = performance.now() - this.lastAppend;
+			if (idle >= APPEND_FILE_IDLE_MS) this.close();
+			else this.scheduleClose(APPEND_FILE_IDLE_MS - idle);
+		}, delay);
+		this.timer.unref();
+	}
 }
 
 /**
@@ -876,6 +1353,23 @@ export class SessionManager {
 	private labelsById: Map<string, string> = new Map();
 	private labelTimestampsById: Map<string, string> = new Map();
 	private leafId: string | null = null;
+	/**
+	 * The root-to-leaf path of `leafId`, kept between calls: an append extends it by one entry, so
+	 * the per-request projection does not walk the whole history. Never handed out; callers get copies.
+	 */
+	private leafPath: { leafId: string; path: SessionEntry[] } | undefined;
+	/**
+	 * The projection of `leafId`'s path, kept between calls like `leafPath`: the agent, the compaction check and the
+	 * footer each ask for it several times per turn, and an append only adds one entry's messages. Rebuilt when the
+	 * leaf moves elsewhere, the session is replaced, or an appended entry changes earlier projected entries (compaction,
+	 * context edit). Never handed out: callers get copies of its arrays.
+	 */
+	private projection: { leafId: string | null; projection: SessionProjection; revision: number } | undefined;
+	private projectionRevision = 0;
+	/** The latest session_info entry in file order (what getSessionName() reports). */
+	private latestSessionInfo: SessionInfoEntry | undefined;
+	/** The session file, kept open between appends that come in quick succession. Not used on Windows. */
+	private appendFile: SessionAppendFile | undefined;
 
 	private constructor(
 		cwd: string,
@@ -907,6 +1401,7 @@ export class SessionManager {
 	}
 
 	private _setSessionFile(sessionFile: string, preloadedFileEntries?: FileEntry[]): void {
+		this._closeAppendFile();
 		this.sessionFile = resolvePath(sessionFile);
 		if (existsSync(this.sessionFile)) {
 			const entries = preloadedFileEntries ?? loadEntriesFromFile(this.sessionFile);
@@ -948,7 +1443,11 @@ export class SessionManager {
 			cwd: this.cwd,
 			parentSession: options?.parentSession,
 		};
+		this._closeAppendFile();
 		this.fileEntries = [header];
+		this.leafPath = undefined;
+		this.projection = undefined;
+		this.latestSessionInfo = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -981,6 +1480,9 @@ export class SessionManager {
 	}
 
 	private _buildIndex(): void {
+		this.leafPath = undefined;
+		this.projection = undefined;
+		this.latestSessionInfo = undefined;
 		this.byId.clear();
 		this.labelsById.clear();
 		this.labelTimestampsById.clear();
@@ -989,6 +1491,7 @@ export class SessionManager {
 			if (entry.type === "session") continue;
 			this.byId.set(entry.id, entry);
 			this.leafId = entry.id;
+			if (entry.type === "session_info") this.latestSessionInfo = entry;
 			if (entry.type === "label") {
 				if (entry.label) {
 					this.labelsById.set(entry.targetId, entry.label);
@@ -1037,21 +1540,23 @@ export class SessionManager {
 		return this.sessionFile;
 	}
 
+	/**
+	 * A new session file is created only once the session contains a user or assistant message.
+	 * Setup entries alone (model, thinking level, system prompt) stay in memory so opening and
+	 * closing pi without chatting leaves no file behind. Starting at the user message (not the
+	 * first assistant reply) keeps the prompt on disk if the first turn never completes (#10000).
+	 */
+	private _hasConversation(): boolean {
+		return this.fileEntries.some(
+			(e) => e.type === "message" && (e.message.role === "user" || e.message.role === "assistant"),
+		);
+	}
+
 	_persist(entry: SessionEntry): void {
 		if (!this.persist || !this.sessionFile) return;
 
-		const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-		if (!hasAssistant) {
-			if (this.flushed) {
-				appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
-			} else {
-				// Mark as not flushed so when assistant arrives, all entries get written
-				this.flushed = false;
-			}
-			return;
-		}
-
 		if (!this.flushed) {
+			if (!this._hasConversation()) return;
 			const fd = openSync(this.sessionFile, "wx");
 			try {
 				for (const e of this.fileEntries) {
@@ -1062,14 +1567,38 @@ export class SessionManager {
 			}
 			this.flushed = true;
 		} else {
-			appendFileSync(this.sessionFile, `${JSON.stringify(entry)}\n`);
+			this._appendLine(this.sessionFile, `${JSON.stringify(entry)}\n`);
 		}
+	}
+
+	private _appendLine(path: string, line: string): void {
+		// An open file can keep others from deleting or renaming it on Windows.
+		if (process.platform === "win32") {
+			appendFileSync(path, line);
+			return;
+		}
+		if (!this.appendFile?.isFor(path)) {
+			this._closeAppendFile();
+			this.appendFile = new SessionAppendFile(path);
+		}
+		try {
+			this.appendFile.append(line);
+		} catch (error) {
+			this._closeAppendFile();
+			throw error;
+		}
+	}
+
+	private _closeAppendFile(): void {
+		this.appendFile?.close();
+		this.appendFile = undefined;
 	}
 
 	private _appendEntry(entry: SessionEntry): void {
 		this.fileEntries.push(entry);
 		this.byId.set(entry.id, entry);
 		this.leafId = entry.id;
+		if (entry.type === "session_info") this.latestSessionInfo = entry;
 		this._persist(entry);
 	}
 
@@ -1118,24 +1647,42 @@ export class SessionManager {
 		return entry.id;
 	}
 
+	/** Append model-attributed usage that does not participate in LLM context. Returns the appended entry. */
+	appendUsage(kind: string, provider: string, model: string, usage: Usage, note?: string): UsageEntry {
+		const entry: UsageEntry = {
+			type: "usage",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			kind,
+			provider,
+			model,
+			usage,
+			...(note ? { note } : {}),
+		};
+		this._appendEntry(entry);
+		return entry;
+	}
+
 	/** Append a compaction summary as child of current leaf, then advance leaf. Returns entry id. */
 	appendCompaction<T = unknown>(
 		summary: string,
-		firstKeptEntryId: string,
+		firstKeptEntryId: string | null,
 		tokensBefore: number,
 		details?: T,
 		fromHook?: boolean,
 		usage?: Usage,
 	): string {
 		const timestamp = new Date().toISOString();
-		const systemMessage = getCurrentSystemMessage(this.buildSessionContext().messages);
+		const systemMessage = getCurrentSystemMessage(this.buildSessionProjection().messages);
+		const id = generateId(this.byId);
 		const entry: CompactionEntry<T> = {
 			type: "compaction",
-			id: generateId(this.byId),
+			id,
 			parentId: this.leafId,
 			timestamp,
 			summary,
-			firstKeptEntryId,
+			firstKeptEntryId: firstKeptEntryId ?? id,
 			tokensBefore,
 			details,
 			usage,
@@ -1176,16 +1723,9 @@ export class SessionManager {
 
 	/** Get the current session name from the latest session_info entry, if any. */
 	getSessionName(): string | undefined {
-		// Walk entries in reverse to find the latest session_info entry.
+		// The latest session_info entry, kept up to date as entries are added: the footer calls this on every frame.
 		// Empty names explicitly clear the session title.
-		const entries = this.getEntries();
-		for (let i = entries.length - 1; i >= 0; i--) {
-			const entry = entries[i];
-			if (entry.type === "session_info") {
-				return entry.name?.trim() || undefined;
-			}
-		}
-		return undefined;
+		return this.latestSessionInfo?.name?.trim() || undefined;
 	}
 
 	/**
@@ -1211,6 +1751,47 @@ export class SessionManager {
 			id: generateId(this.byId),
 			parentId: this.leafId,
 			timestamp: new Date().toISOString(),
+		};
+		this._appendEntry(entry);
+		return entry.id;
+	}
+
+	/** Append a branch-local edit to an earlier model-visible entry. */
+	appendContextEdit(targetId: string, replacement: ContextEditEntry["replacement"]): string {
+		if (
+			replacement !== null &&
+			(typeof replacement !== "object" ||
+				!("content" in replacement) ||
+				(typeof replacement.content !== "string" && !Array.isArray(replacement.content)))
+		) {
+			throw new Error("Context edit replacement must be null or contain string/array content");
+		}
+		const target = this.byId.get(targetId);
+		if (!target) throw new Error(`Entry ${targetId} not found`);
+		if (!this.getBranch().some((entry) => entry.id === targetId)) {
+			throw new Error(`Entry ${targetId} is not on the active branch`);
+		}
+		const editable =
+			target.type === "custom_message" ||
+			(target.type === "message" &&
+				(target.message.role === "user" ||
+					target.message.role === "assistant" ||
+					target.message.role === "toolResult"));
+		if (!editable) throw new Error(`Entry ${targetId} does not contribute editable model content`);
+		const targetRole = target.type === "message" ? target.message.role : "custom";
+		const normalizedReplacement =
+			replacement !== null &&
+			(targetRole === "assistant" || targetRole === "toolResult") &&
+			typeof replacement.content === "string"
+				? { content: [{ type: "text" as const, text: replacement.content }] }
+				: replacement;
+		const entry: ContextEditEntry = {
+			type: "context_edit",
+			id: generateId(this.byId),
+			parentId: this.leafId,
+			timestamp: new Date().toISOString(),
+			targetId,
+			replacement: normalizedReplacement,
 		};
 		this._appendEntry(entry);
 		return entry.id;
@@ -1286,8 +1867,12 @@ export class SessionManager {
 	 * Use buildSessionContext() to get the resolved messages for the LLM.
 	 */
 	getBranch(fromId?: string): SessionEntry[] {
+		if (fromId === undefined || fromId === this.leafId) return this._leafPath().slice();
+		return this._walkBranch(fromId);
+	}
+
+	private _walkBranch(startId: string | null): SessionEntry[] {
 		const path: SessionEntry[] = [];
-		const startId = fromId ?? this.leafId;
 		let current = startId ? this.byId.get(startId) : undefined;
 		while (current) {
 			path.push(current);
@@ -1297,20 +1882,104 @@ export class SessionManager {
 		return path;
 	}
 
+	/** The cached path to the current leaf. Must not be modified or returned to callers. */
+	private _leafPath(): SessionEntry[] {
+		const leafId = this.leafId;
+		if (leafId === null) return [];
+		const cached = this.leafPath;
+		if (cached?.leafId === leafId) return cached.path;
+		const appended = cached && this._appendedSince(cached.leafId, leafId);
+		let path: SessionEntry[];
+		if (cached && appended) {
+			// Appended under the cached leaf: extend the cached path in place.
+			path = cached.path;
+			for (const entry of appended) path.push(entry);
+		} else {
+			path = this._walkBranch(leafId);
+		}
+		this.leafPath = { leafId, path };
+		return path;
+	}
+
+	/**
+	 * The entries from `fromId` (exclusive) down to `leafId`, root first, when `leafId` descends from `fromId` by at
+	 * most a few appends; otherwise undefined.
+	 */
+	private _appendedSince(fromId: string, leafId: string): SessionEntry[] | undefined {
+		const appended: SessionEntry[] = [];
+		let current = this.byId.get(leafId);
+		while (current && appended.length < 64) {
+			appended.push(current);
+			if (current.parentId === fromId) return appended.reverse();
+			current = current.parentId ? this.byId.get(current.parentId) : undefined;
+		}
+		return undefined;
+	}
+
+	/** The cached projection of the current leaf path. Must not be modified or returned to callers. */
+	private _projection(): { projection: SessionProjection; revision: number } {
+		const leafId = this.leafId;
+		const cached = this.projection;
+		if (cached && cached.leafId === leafId) return cached;
+		const appended =
+			leafId !== null && cached?.leafId != null ? this._appendedSince(cached.leafId, leafId) : undefined;
+		let projection: SessionProjection;
+		if (cached && appended?.every((entry) => entry.type !== "compaction" && entry.type !== "context_edit")) {
+			// Entries after the path's latest compaction are all in context, and no earlier projected entry changes:
+			// a context edit or a compaction would change what came before, so those rebuild.
+			projection = cached.projection;
+			for (const entry of appended) {
+				applySessionContextSetting(projection, entry);
+				const messages = sessionEntryToContextMessages(entry);
+				projection.entries.push({ sourceEntry: entry, messages });
+				for (const message of messages) projection.messages.push(message);
+			}
+		} else {
+			projection = projectSessionPath(this._leafPath());
+		}
+		this.projection = { leafId, projection, revision: ++this.projectionRevision };
+		return this.projection;
+	}
+
 	/**
 	 * Build the active, compaction-aware entry list for context/rendering.
 	 * Uses tree traversal from current leaf.
 	 */
 	buildContextEntries(): SessionEntry[] {
-		return buildContextEntries(this.getEntries(), this.leafId, this.byId);
+		const path = this._leafPath();
+		const entries = contextEntriesOfPath(path);
+		return entries === path ? path.slice() : entries;
 	}
 
 	/**
 	 * Build the session context (what gets sent to the LLM).
 	 * Uses tree traversal from current leaf.
 	 */
+	buildSessionProjection(): SessionProjection {
+		const { entries, messages, thinkingLevel, model } = this._projection().projection;
+		return { entries: entries.slice(), messages: messages.slice(), thinkingLevel, model: model && { ...model } };
+	}
+
+	/**
+	 * A number that changes whenever buildSessionProjection() (and the leaf path, getBranch()) may return something
+	 * else: what is derived from them can be kept until it changes.
+	 */
+	getProjectionRevision(): number {
+		return this._projection().revision;
+	}
+
+	/**
+	 * buildSessionProjection() without the copies, for reading only: callers must not modify it or keep it past the next
+	 * change to the session (it is the cached projection itself).
+	 * @internal
+	 */
+	peekSessionProjection(): SessionProjection {
+		return this._projection().projection;
+	}
+
 	buildSessionContext(): SessionContext {
-		return buildSessionContext(this.getEntries(), this.leafId, this.byId);
+		const { messages, thinkingLevel, model } = this.buildSessionProjection();
+		return { messages, thinkingLevel, model };
 	}
 
 	/**
@@ -1319,6 +1988,11 @@ export class SessionManager {
 	getHeader(): SessionHeader | null {
 		const h = this.fileEntries.find((e) => e.type === "session");
 		return h ? (h as SessionHeader) : null;
+	}
+
+	/** Number of session entries (excludes header), without copying them like `getEntries()`. */
+	getEntryCount(): number {
+		return this.byId.size;
 	}
 
 	/**
@@ -1466,7 +2140,10 @@ export class SessionManager {
 					? {
 							...entry,
 							parentId: pathParentId,
-							firstKeptEntryId: replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId,
+							firstKeptEntryId:
+								entry.firstKeptEntryId === entry.id
+									? entry.id
+									: (replacementByLabelId.get(entry.firstKeptEntryId) ?? entry.firstKeptEntryId),
 						}
 					: { ...entry, parentId: pathParentId },
 			);
@@ -1520,13 +2197,9 @@ export class SessionManager {
 			this.sessionFile = newSessionFile;
 			this._buildIndex();
 
-			// Only write the file now if it contains an assistant message.
-			// Otherwise defer to _persist(), which creates the file on the
-			// first assistant response, matching the newSession() contract
-			// and avoiding the duplicate-header bug when _persist()'s
-			// no-assistant guard later resets flushed to false.
-			const hasAssistant = this.fileEntries.some((e) => e.type === "message" && e.message.role === "assistant");
-			if (hasAssistant) {
+			// Use the same rule as _persist(): write now if the branched path already
+			// has a conversation, otherwise let _persist() create the file later.
+			if (this._hasConversation()) {
 				this._rewriteFile();
 				this.flushed = true;
 			} else {
@@ -1663,13 +2336,18 @@ export class SessionManager {
 			cwd: resolvedTargetCwd,
 			parentSession: resolvedSourcePath,
 		};
-		writeFileSync(newSessionFile, `${JSON.stringify(newHeader)}\n`, { flag: "wx" });
-
-		// Copy all non-header entries from source
-		for (const entry of sourceEntries) {
-			if (entry.type !== "session") {
-				appendFileSync(newSessionFile, `${JSON.stringify(entry)}\n`);
+		// Write the header and all non-header entries through one fd. Reopening the file per entry
+		// is slow where open/close is expensive (e.g. filesystem security monitors).
+		const fd = openSync(newSessionFile, "wx");
+		try {
+			writeFileSync(fd, `${JSON.stringify(newHeader)}\n`);
+			for (const entry of sourceEntries) {
+				if (entry.type !== "session") {
+					writeFileSync(fd, `${JSON.stringify(entry)}\n`);
+				}
 			}
+		} finally {
+			closeSync(fd);
 		}
 
 		return new SessionManager(resolvedTargetCwd, dir, newSessionFile, true);
@@ -1707,79 +2385,117 @@ export class SessionManager {
 	 * @param sessionDir Optional session directory. If omitted, uses default (~/.pi/agent/sessions/<encoded-cwd>/).
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async list(cwd: string, sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]> {
+	static async list(
+		cwd: string,
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		signal?: AbortSignal,
+	): Promise<SessionInfo[]> {
 		const dir = sessionDir ? normalizePath(sessionDir) : getDefaultSessionDir(cwd);
 		const filterCwd = sessionDir !== undefined && dir !== getDefaultSessionDirPath(cwd);
 		const resolvedCwd = resolvePath(cwd);
-		const sessions = (await listSessionsFromDir(dir, onProgress)).filter(
-			(session) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd),
-		);
-		sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-		return sessions;
+		const includeSession = (session: SessionInfo) => !filterCwd || sessionCwdMatches(session.cwd, resolvedCwd);
+		const progress: SessionListProgress | undefined = onProgress
+			? (loaded, total, partialSessions) => onProgress(loaded, total, partialSessions?.filter(includeSession))
+			: undefined;
+		const sessions = (await listSessionsFromDir(dir, progress, signal)).filter(includeSession);
+		return sortSessionInfos(sessions);
 	}
 
 	/**
 	 * List all sessions across all project directories.
 	 * @param onProgress Optional callback for progress updates (loaded, total)
 	 */
-	static async listAll(onProgress?: SessionListProgress): Promise<SessionInfo[]>;
-	static async listAll(sessionDir?: string, onProgress?: SessionListProgress): Promise<SessionInfo[]>;
+	static async listAll(onProgress?: SessionListProgress, signal?: AbortSignal): Promise<SessionInfo[]>;
+	static async listAll(
+		sessionDir?: string,
+		onProgress?: SessionListProgress,
+		signal?: AbortSignal,
+	): Promise<SessionInfo[]>;
 	static async listAll(
 		sessionDirOrOnProgress?: string | SessionListProgress,
-		onProgress?: SessionListProgress,
+		onProgressOrSignal?: SessionListProgress | AbortSignal,
+		signal?: AbortSignal,
 	): Promise<SessionInfo[]> {
 		const customSessionDir =
 			typeof sessionDirOrOnProgress === "string" ? normalizePath(sessionDirOrOnProgress) : undefined;
-		const progress = typeof sessionDirOrOnProgress === "function" ? sessionDirOrOnProgress : onProgress;
+		const progress =
+			typeof sessionDirOrOnProgress === "function"
+				? sessionDirOrOnProgress
+				: typeof onProgressOrSignal === "function"
+					? onProgressOrSignal
+					: undefined;
+		const abortSignal =
+			typeof sessionDirOrOnProgress === "string" || typeof onProgressOrSignal === "function"
+				? signal
+				: (onProgressOrSignal ?? signal);
+		abortSignal?.throwIfAborted();
 		if (customSessionDir) {
-			const sessions = await listSessionsFromDir(customSessionDir, progress);
-			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-			return sessions;
+			return sortSessionInfos(await listSessionsFromDir(customSessionDir, progress, abortSignal));
 		}
 
 		const sessionsDir = getSessionsDir();
 
 		try {
-			if (!existsSync(sessionsDir)) {
-				return [];
-			}
+			if (!existsSync(sessionsDir)) return [];
 			const entries = await readdir(sessionsDir, { withFileTypes: true });
 			const dirs = entries
 				.filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
 				.map((entry) => join(sessionsDir, entry.name));
 
-			// Count total files first for accurate progress
-			let totalFiles = 0;
-			const dirFiles: string[][] = [];
-			for (const dir of dirs) {
-				try {
-					const files = (await readdir(dir)).filter((f) => f.endsWith(".jsonl"));
-					dirFiles.push(files.map((f) => join(dir, f)));
-					totalFiles += files.length;
-				} catch {
-					dirFiles.push([]);
-				}
-			}
-
-			// Process all files with progress tracking
-			let loaded = 0;
-			const sessions: SessionInfo[] = [];
+			const dirFiles = await mapWithConcurrency(
+				dirs,
+				MAX_CONCURRENT_SESSION_DISCOVERY_LOADS,
+				async (dir) => {
+					try {
+						return (await readdir(dir)).filter((file) => file.endsWith(".jsonl")).map((file) => join(dir, file));
+					} catch {
+						return [];
+					}
+				},
+				abortSignal,
+			);
 			const allFiles = dirFiles.flat();
+			const candidates = await mapWithConcurrency(
+				allFiles,
+				MAX_CONCURRENT_SESSION_DISCOVERY_LOADS,
+				async (path): Promise<SessionFileCandidate> => {
+					try {
+						return { path, stats: await stat(path) };
+					} catch {
+						return { path };
+					}
+				},
+				abortSignal,
+			);
+			candidates.sort(
+				(a, b) =>
+					(b.stats?.mtimeMs ?? Number.NEGATIVE_INFINITY) - (a.stats?.mtimeMs ?? Number.NEGATIVE_INFINITY) ||
+					basename(b.path).localeCompare(basename(a.path)),
+			);
 
-			const results = await buildSessionInfosWithConcurrency(allFiles, () => {
-				loaded++;
-				progress?.(loaded, totalFiles);
-			});
+			const totalFiles = candidates.length;
+			let loaded = 0;
+			let firstCandidateLoaded = false;
+			const partialSessions: SessionInfo[] = [];
+			const results = await buildSessionInfosWithConcurrency(
+				sessionsDir,
+				candidates,
+				(info, index) => {
+					loaded++;
+					if (index === 0) firstCandidateLoaded = true;
+					if (info) partialSessions.push(info);
+					const publishPartial =
+						firstCandidateLoaded &&
+						(index === 0 || loaded % ALL_SESSION_LIST_PUBLISH_INTERVAL === 0 || loaded === totalFiles);
+					progress?.(loaded, totalFiles, publishPartial ? sortSessionInfos([...partialSessions]) : undefined);
+				},
+				abortSignal,
+			);
 
-			for (const info of results) {
-				if (info) {
-					sessions.push(info);
-				}
-			}
-
-			sessions.sort((a, b) => b.modified.getTime() - a.modified.getTime());
-			return sessions;
+			return sortSessionInfos(results.filter((info): info is SessionInfo => info !== null));
 		} catch {
+			abortSignal?.throwIfAborted();
 			return [];
 		}
 	}

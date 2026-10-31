@@ -8,6 +8,7 @@ import go from "highlight.js/lib/languages/go.js";
 import groovy from "highlight.js/lib/languages/groovy.js";
 import java from "highlight.js/lib/languages/java.js";
 import javascript from "highlight.js/lib/languages/javascript.js";
+import json from "highlight.js/lib/languages/json.js";
 import kotlin from "highlight.js/lib/languages/kotlin.js";
 import lua from "highlight.js/lib/languages/lua.js";
 import nix from "highlight.js/lib/languages/nix.js";
@@ -26,6 +27,7 @@ const eagerLanguages = {
 	java,
 	go,
 	javascript,
+	json,
 	cpp,
 	typescript,
 	php,
@@ -44,20 +46,34 @@ const eagerLanguages = {
 	lua,
 };
 
-for (const [name, language] of Object.entries(eagerLanguages)) {
-	hljs.registerLanguage(name, language);
+let eagerLanguagesRegistered = false;
+
+/** The eager set registers on first use, not at every start: running its grammar definitions costs about 1 ms. */
+function registerEagerLanguages(): void {
+	if (eagerLanguagesRegistered) return;
+	eagerLanguagesRegistered = true;
+	for (const [name, language] of Object.entries(eagerLanguages)) {
+		hljs.registerLanguage(name, language);
+	}
 }
 
 let allLanguagesPromise: Promise<void> | undefined;
+/** Every grammar is registered (or loading them failed: there is nothing more to wait for). */
+let allLanguagesLoaded = false;
 
 export function loadAllHighlightLanguages(): Promise<void> {
+	registerEagerLanguages();
 	if (!allLanguagesPromise) {
 		allLanguagesPromise = new Promise((resolve) => {
 			setImmediate(() => {
 				void import("highlight.js/lib/index.js").then(
-					() => resolve(),
+					() => {
+						allLanguagesLoaded = true;
+						resolve();
+					},
 					() => {
 						// Eager languages and plaintext fallback remain available.
+						allLanguagesLoaded = true;
 						resolve();
 					},
 				);
@@ -153,7 +169,12 @@ export function renderHighlightedHtml(html: string, theme: HighlightTheme = {}):
 			return;
 		}
 		const formatter = getActiveFormatter(scopes, theme);
-		output += formatter ? formatter(textBuffer) : textBuffer;
+		output += formatter
+			? textBuffer
+					.split("\n")
+					.map((line) => (line ? formatter(line) : line))
+					.join("\n")
+			: textBuffer;
 		textBuffer = "";
 	};
 
@@ -198,6 +219,7 @@ export function renderHighlightedHtml(html: string, theme: HighlightTheme = {}):
 }
 
 export function highlight(code: string, options: HighlightOptions = {}): string {
+	registerEagerLanguages();
 	const html = options.language
 		? hljs.highlight(code, {
 				language: options.language,
@@ -207,6 +229,45 @@ export function highlight(code: string, options: HighlightOptions = {}): string 
 	return renderHighlightedHtml(html, options.theme);
 }
 
+let onDemandLoaded: ((languages: ReadonlySet<string>) => void) | undefined;
+// A language outside the eager set was asked for before loadAllHighlightLanguagesOnDemand() (a resumed session's messages are
+// drawn before it): they load as soon as it is called.
+let askedBeforeOnDemand = false;
+/** Names asked for that were not there (lowercase): what was drawn for them may be drawn differently once all load. */
+const missedLanguages = new Set<string>();
+
+function loadOnDemand(): void {
+	void loadAllHighlightLanguages().then(() => {
+		// Only names that are languages now: a name that is still none (`console`, `output`) is drawn as it was.
+		const languages = new Set([...missedLanguages].filter((name) => hljs.getLanguage(name) !== undefined));
+		missedLanguages.clear();
+		if (languages.size > 0) onDemandLoaded?.(languages);
+	});
+}
+
+/**
+ * Has the grammars outside the eager set load when a language among them is first asked for, instead of at every start
+ * (190 grammar definitions run, about 1.4 ms and 1 MB). `onLoaded` runs once they are there, with the names asked for
+ * before that are languages now (lowercase): what was drawn with those names without highlighting can then be drawn
+ * again. It does not run when none of them is.
+ */
+export function loadAllHighlightLanguagesOnDemand(onLoaded: (languages: ReadonlySet<string>) => void): void {
+	onDemandLoaded = onLoaded;
+	if (askedBeforeOnDemand && !allLanguagesPromise) {
+		loadOnDemand();
+	}
+}
+
 export function supportsLanguage(name: string): boolean {
-	return hljs.getLanguage(name) !== undefined;
+	registerEagerLanguages();
+	if (hljs.getLanguage(name) !== undefined) {
+		return true;
+	}
+	if (!allLanguagesLoaded) missedLanguages.add(name.toLowerCase());
+	if (!onDemandLoaded) {
+		askedBeforeOnDemand = true;
+	} else if (!allLanguagesPromise) {
+		loadOnDemand();
+	}
+	return false;
 }

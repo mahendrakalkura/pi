@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { deleteKittyImage, isImageLine } from "./terminal-image.ts";
-import { type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
+import { type LiveLines, renderLiveLines, renderSharedLines, type TUI, TuiBase, type TuiStopOptions } from "./tui.ts";
 import { visibleWidth } from "./utils.ts";
 
 const KITTY_SEQUENCE_PREFIX = "\x1b_G";
@@ -145,6 +145,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	restoreRenderState(state: TuiMainScreenRenderState): void {
+		this.frameLive = undefined;
 		this.previousLines = state.previousLines.map((line) => (isImageLine(line) ? "" : line));
 		this.previousKittyImageIds = new Set();
 		this.previousWidth = state.previousWidth;
@@ -156,6 +157,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	protected override resetRenderState(): void {
+		this.frameLive = undefined;
 		this.previousLines = [];
 		this.previousWidth = -1;
 		this.previousHeight = -1;
@@ -173,6 +175,80 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		if (lineDiff > 0) this.terminal.write(`\x1b[${lineDiff}B`);
 		else if (lineDiff < 0) this.terminal.write(`\x1b[${-lineDiff}A`);
 		this.terminal.write("\r\n");
+	}
+
+	/** The lines of the last frame before and after resolveFakeCursors(), and whether the hardware cursor was shown. */
+	private unresolvedLines: string[] = [];
+	private resolvedLines: string[] = [];
+	private resolvedWithHardwareCursor = false;
+
+	/**
+	 * resolveFakeCursors() for a frame, taking each line that is the same string as the frame before from the frame
+	 * before: resolving looks for a cursor in every line of the transcript, each frame (0.5 ms at 27,500 lines). Returns
+	 * a new array, which the frame may change (extractCursorPosition() does).
+	 */
+	private resolveFrameFakeCursors(lines: string[], unchanged: number): string[] {
+		const showHardwareCursor = this.getShowHardwareCursor();
+		const previous = showHardwareCursor === this.resolvedWithHardwareCursor ? this.unresolvedLines : [];
+		const previousResolved = this.resolvedLines;
+		// (The first `unchanged` lines are those of the frame before: taken as they were resolved, without reading them.)
+		const from = previous.length === 0 ? 0 : Math.min(unchanged, previous.length, lines.length);
+		const resolved: string[] = from > 0 ? previousResolved.slice(0, from) : [];
+		resolved.length = lines.length;
+		const single = [""];
+		for (let i = from; i < lines.length; i++) {
+			const line = lines[i]!;
+			if (i < previous.length && line === previous[i]) {
+				resolved[i] = previousResolved[i]!;
+			} else {
+				single[0] = line;
+				resolved[i] = this.resolveFakeCursors(single)[0]!;
+			}
+		}
+		this.unresolvedLines = lines;
+		this.resolvedLines = resolved;
+		this.resolvedWithHardwareCursor = showHardwareCursor;
+		return resolved.slice();
+	}
+
+	/** The lines of the last frame before and after applyLineResets(): finishLines(). */
+	private rawLines: string[] = [];
+	private finishedLines: string[] = [];
+	/** The rows of finishedLines that are images (applyLineResets() leaves them as they are), in order. */
+	private finishedImageRows: number[] = [];
+	/** The root's live lines and the revision the last frame was rendered from (renderLiveLines()). */
+	private frameLive?: { live: LiveLines; revision: number; width: number; lines: string[] };
+
+	/**
+	 * applyLineResets() for a frame, taking each line that is the same string as the frame before from the frame before:
+	 * most lines of a long transcript are. Unchanged lines are then the same strings as the lines shown, so the diff
+	 * below compares them by identity. Also counts image lines: applyLineResets() leaves only those as they are.
+	 */
+	private finishLines(raw: string[], unchanged: number): { lines: string[]; imageLines: number } {
+		const previousRaw = this.rawLines;
+		const previousFinished = this.finishedLines;
+		// (The first `unchanged` lines are those of the frame before: taken as they were finished, without reading them.)
+		const from = Math.min(unchanged, previousRaw.length, raw.length);
+		const lines: string[] = from > 0 ? previousFinished.slice(0, from) : [];
+		lines.length = raw.length;
+		const imageRows = this.finishedImageRows.filter((row) => row < from);
+		const single = [""];
+		for (let i = from; i < raw.length; i++) {
+			const line = raw[i]!;
+			let finished: string;
+			if (i < previousRaw.length && line === previousRaw[i]) {
+				finished = previousFinished[i]!;
+			} else {
+				single[0] = line;
+				finished = this.applyLineResets(single)[0]!;
+			}
+			if (finished === line) imageRows.push(i);
+			lines[i] = finished;
+		}
+		this.rawLines = raw;
+		this.finishedLines = lines;
+		this.finishedImageRows = imageRows;
+		return { lines, imageLines: imageRows.length };
 	}
 
 	private collectKittyImageIds(lines: string[]): Set<number> {
@@ -231,7 +307,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 	}
 
 	private deleteChangedKittyImages(firstChanged: number, lastChanged: number): string {
-		if (firstChanged < 0 || lastChanged < firstChanged) return "";
+		if (firstChanged < 0 || lastChanged < firstChanged || this.previousKittyImageIds.size === 0) return "";
 
 		const ids = new Set<number>();
 		const maxLine = Math.min(lastChanged, this.previousLines.length - 1);
@@ -261,7 +337,39 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		};
 
 		// Render all components to get new lines
-		let newLines = this.render(width);
+		// Resolve fake cursors before compositing so overlays and line slicing see plain SGR codes
+		// The leading lines that are what they were the frame before: the root's lines up to the first one changed
+		// (renderLiveLines()), above the rows the cursor and overlays are drawn in, this frame and the one before. Those are
+		// not read again: a frame costs time in proportion to what changed, not to the length of the transcript.
+		const live = renderLiveLines(this, width);
+		const before = this.frameLive;
+		// (A copy of the live lines, which change at the next render: made again only when they changed.)
+		const root =
+			live === undefined
+				? renderSharedLines(this, width)
+				: before?.live === live && before.width === width && before.revision === live.revision
+					? before.lines
+					: live.lines.slice();
+		let unchanged = 0;
+		if (
+			live !== undefined &&
+			before?.live === live &&
+			before.width === width &&
+			this.previousWidth === width &&
+			this.previousHeight === height &&
+			this.getShowHardwareCursor() === this.resolvedWithHardwareCursor &&
+			!this.hasOverlayEntries
+		) {
+			unchanged = Math.min(
+				live.changedSince(before.revision),
+				before.lines.length,
+				root.length - height,
+				this.previousLines.length - height,
+			);
+		}
+		unchanged = Math.max(0, unchanged);
+		this.frameLive = live === undefined ? undefined : { live, revision: live.revision, width, lines: root };
+		let newLines = this.resolveFrameFakeCursors(root, unchanged);
 
 		// Composite overlays into the rendered lines (before differential compare)
 		if (this.hasOverlayEntries) {
@@ -271,7 +379,12 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		// Extract cursor position before applying line resets (marker must be found first)
 		const cursorPos = this.extractCursorPosition(newLines, height);
 
-		newLines = this.applyLineResets(newLines);
+		const finished = this.finishLines(newLines, unchanged);
+		newLines = finished.lines;
+		// Kitty image bookkeeping scans every line: only needed while an image is shown or was shown the frame before.
+		const imagesShown = finished.imageLines > 0 || this.previousKittyImageIds.size > 0;
+		const collectKittyImageIds = (lines: string[]): Set<number> =>
+			imagesShown ? this.collectKittyImageIds(lines) : new Set();
 
 		// Helper to clear scrollback and viewport and render all new lines
 		const fullRender = (clear: boolean): void => {
@@ -313,7 +426,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			this.previousViewportTop = Math.max(0, bufferLength - height);
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousKittyImageIds = collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
 		};
@@ -363,7 +476,8 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		let firstChanged = -1;
 		let lastChanged = -1;
 		const maxLines = Math.max(newLines.length, this.previousLines.length);
-		for (let i = 0; i < maxLines; i++) {
+		// (The first `unchanged` lines are the lines shown.)
+		for (let i = Math.min(unchanged, this.previousLines.length); i < maxLines; i++) {
 			const oldLine = i < this.previousLines.length ? this.previousLines[i] : "";
 			const newLine = i < newLines.length ? newLines[i] : "";
 
@@ -381,7 +495,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			lastChanged = newLines.length - 1;
 		}
-		if (firstChanged !== -1) {
+		if (firstChanged !== -1 && imagesShown) {
 			const expandedRange = this.expandChangedRangeForKittyImages(firstChanged, lastChanged, newLines);
 			firstChanged = expandedRange.firstChanged;
 			lastChanged = expandedRange.lastChanged;
@@ -439,7 +553,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 			}
 			this.positionHardwareCursor(cursorPos, newLines.length);
 			this.previousLines = newLines;
-			this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+			this.previousKittyImageIds = collectKittyImageIds(newLines);
 			this.previousWidth = width;
 			this.previousHeight = height;
 			this.previousViewportTop = prevViewportTop;
@@ -610,7 +724,7 @@ export class TuiMainScreen extends TuiBase implements TUI {
 		this.positionHardwareCursor(cursorPos, newLines.length);
 
 		this.previousLines = newLines;
-		this.previousKittyImageIds = this.collectKittyImageIds(newLines);
+		this.previousKittyImageIds = collectKittyImageIds(newLines);
 		this.previousWidth = width;
 		this.previousHeight = height;
 	}

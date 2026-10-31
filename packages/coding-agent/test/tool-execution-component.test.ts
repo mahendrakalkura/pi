@@ -1,7 +1,8 @@
 import { join, resolve } from "node:path";
-import { Text, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { resetCapabilitiesCache, setCapabilities, Text, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { afterEach, beforeAll, describe, expect, test, vi } from "vitest";
+
 import { getReadmePath } from "../src/config.ts";
 import type { ToolDefinition } from "../src/core/extensions/types.ts";
 import { type BashOperations, createBashToolDefinition } from "../src/core/tools/bash.ts";
@@ -25,6 +26,10 @@ function createBaseToolDefinition(name = "custom_tool"): ToolDefinition {
 	};
 }
 
+// Small 2x2 blue JPEG image
+const TINY_JPEG =
+	"/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/2wBDAQMEBAUEBQkFBQkUDQsNFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBT/wAARCAACAAIDAREAAhEBAxEB/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/xAAVAQEBAAAAAAAAAAAAAAAAAAAGCf/EABQRAQAAAAAAAAAAAAAAAAAAAAD/2gAMAwEAAhEDEQA/AD3VTB3/2Q==";
+
 function createFakeTui(): TUI {
 	return {
 		requestRender: () => {},
@@ -35,9 +40,29 @@ describe("ToolExecutionComponent parity", () => {
 	beforeAll(() => {
 		initTheme("dark");
 	});
-
 	afterEach(() => {
+		resetCapabilitiesCache();
 		vi.useRealTimers();
+	});
+
+	// Issue #10292: the component loads the PNG transcoder itself, so this works in any TUI host.
+	// Issue #8577: a replaced partial image must not resurface.
+	test("converts non-PNG tool images once the transcoder loads", async () => {
+		setCapabilities({ images: "kitty", trueColor: true, hyperlinks: true });
+		const component = new ToolExecutionComponent("tool", "id", {}, {}, undefined, createFakeTui(), process.cwd());
+		component.updateResult(
+			{ content: [{ type: "image", data: "cGFydGlhbA==", mimeType: "image/jpeg" }], isError: false },
+			true,
+		);
+		component.updateResult({ content: [{ type: "image", data: TINY_JPEG, mimeType: "image/jpeg" }], isError: false });
+
+		await vi.waitFor(() => expect(component.render(120).join("\n")).toContain(";iVBORw0KGgo"));
+		const rendered = component.render(120).join("\n");
+		expect(rendered).not.toContain("cGFydGlhbA==");
+
+		// Invalidation reuses the converted Image, so the Kitty image ID stays the same.
+		component.invalidate();
+		expect(component.render(120).join("\n")).toBe(rendered);
 	});
 
 	test("stacks custom call and result renderers like the old implementation", () => {
@@ -196,6 +221,37 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).not.toContain("[Showing lines 2001-4000 of 4000. Full output:");
 	});
 
+	test("bash results draw the same without structuredContent, which the TUI does not keep", async () => {
+		const operations: BashOperations = {
+			exec: async (_command, _cwd, { onData }) => {
+				for (let i = 1; i <= 4000; i++) onData(Buffer.from(`line-${i} ${"x".repeat(200)}\n`));
+				return { exitCode: 3 };
+			},
+		};
+		const tool = createBashToolDefinition(process.cwd(), { operations, exposeSessionEnvironment: false });
+		const result = await tool.execute("tool-bash-sc", { command: "big" }, undefined, undefined, {} as never);
+		expect(JSON.stringify(result.structuredContent).length).toBeGreaterThan(500_000);
+		const render = (shown: Parameters<ToolExecutionComponent["updateResult"]>[0]) => {
+			const component = new ToolExecutionComponent(
+				"bash",
+				"tool-bash-sc",
+				{ command: "big" },
+				{},
+				tool,
+				createFakeTui(),
+				process.cwd(),
+			);
+			component.updateResult(shown, false);
+			const collapsed = component.render(120).join("\n");
+			component.setExpanded(true);
+			return [collapsed, component.render(120).join("\n")];
+		};
+		const full = render({ ...result, isError: true, durationMs: 1234 });
+		const kept = render({ content: result.content, details: result.details, isError: true, durationMs: 1234 });
+		expect(kept).toEqual(full);
+		expect(stripAnsi(full[1]!)).toContain("line-4000");
+	});
+
 	// Issue #9628: keep short durations precise and make long shell durations readable.
 	test.each([
 		{ ms: 0, formatted: "0.0s" },
@@ -237,6 +293,33 @@ describe("ToolExecutionComponent parity", () => {
 		expect(completed).toContain(`Took ${formatted}`);
 	});
 
+	// #10549
+	test("bash renderer shows a result's recorded duration, also for a result restored without a live start", () => {
+		const render = (live: boolean): string => {
+			vi.useFakeTimers();
+			vi.setSystemTime(0);
+			const component = new ToolExecutionComponent(
+				"bash",
+				"tool-bash-recorded",
+				{ command: "sleep 4" },
+				{},
+				createBashToolDefinition(process.cwd(), { exposeSessionEnvironment: false }),
+				createFakeTui(),
+				process.cwd(),
+			);
+			if (live) {
+				component.markExecutionStarted();
+				component.updateResult({ content: [], isError: false }, true);
+				// The wall clock jumps; the recorded duration does not.
+				vi.advanceTimersByTime(3_600_000);
+			}
+			component.updateResult({ content: [], isError: false, durationMs: 4_200 }, false);
+			return stripAnsi(component.render(120).join("\n"));
+		};
+		expect(render(true)).toContain("Took 4.2s");
+		expect(render(false)).toContain("Took 4.2s");
+	});
+
 	test("does not duplicate built-in headers when passed the active built-in definition", () => {
 		const component = new ToolExecutionComponent(
 			"read",
@@ -250,6 +333,22 @@ describe("ToolExecutionComponent parity", () => {
 		component.updateResult({ content: [{ type: "text", text: "hello" }], details: undefined, isError: false }, false);
 		const rendered = stripAnsi(component.render(120).join("\n"));
 		expect(rendered.match(/\bread\b/g)?.length ?? 0).toBe(1);
+	});
+
+	// Issue #9996: strict tool schemas make models send null for omitted optional fields.
+	test("renders read calls with null offset and limit as full-file reads", () => {
+		const component = new ToolExecutionComponent(
+			"read",
+			"tool-read-null-range",
+			{ path: "src/example.ts", offset: null, limit: null },
+			{},
+			createReadToolDefinition(process.cwd()),
+			createFakeTui(),
+			process.cwd(),
+		);
+		const rendered = stripAnsi(component.render(120).join("\n"));
+		expect(rendered).toContain("read src/example.ts");
+		expect(rendered).not.toContain("src/example.ts:");
 	});
 
 	test("inherits missing built-in result renderer slot from the built-in tool", () => {
@@ -390,6 +489,33 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("arg:bar");
 	});
 
+	test("shows arguments in the fallback call header", () => {
+		const longValue = "x".repeat(200);
+		const component = new ToolExecutionComponent(
+			"custom_tool",
+			"tool-args",
+			{ query: "pi", long: longValue, text: "line one\nline two" },
+			{},
+			createBaseToolDefinition(),
+			createFakeTui(),
+			process.cwd(),
+		);
+
+		const collapsed = stripAnsi(component.render(300).join("\n"));
+		expect(collapsed).toContain('custom_tool query="pi" long="xxx');
+		expect(collapsed).toContain("...");
+		expect(collapsed).not.toContain(longValue);
+
+		component.setExpanded(true);
+		const expanded = stripAnsi(component.render(300).join("\n"));
+		expect(expanded).toContain("  query: pi");
+		expect(expanded).toContain(longValue);
+		const expandedLines = expanded.split("\n").map((line) => line.trimEnd());
+		const textLine = expandedLines.findIndex((line) => line.endsWith("  text: line one"));
+		expect(textLine).toBeGreaterThan(-1);
+		expect(expandedLines[textLine + 1]).toMatch(/^\s+ {4}line two$/);
+	});
+
 	test("collapses fallback results until expanded", () => {
 		const toolDefinition: ToolDefinition = {
 			...createBaseToolDefinition(),
@@ -434,6 +560,59 @@ describe("ToolExecutionComponent parity", () => {
 		expect(rendered).toContain("one");
 		expect(rendered).toContain("two");
 		expect(rendered).not.toContain("two\n\n");
+	});
+
+	// #9265: every argument delta re-ran the call renderer; a streamed `write` re-highlighted its whole content each time.
+	test("renders streamed partial arguments once per frame, with the latest arguments", () => {
+		const write = createWriteToolDefinition(process.cwd());
+		let renderCalls = 0;
+		const counted: typeof write = {
+			...write,
+			renderCall: (...args) => {
+				renderCalls++;
+				return write.renderCall!(...args);
+			},
+		};
+		let renderRequests = 0;
+		const tui = { requestRender: () => renderRequests++ } as unknown as TUI;
+		const component = new ToolExecutionComponent("write", "tool-9", {}, {}, counted, tui, ".");
+		const lines = Array.from({ length: 200 }, (_, index) => `const line${index} = ${index};`);
+		const callsBefore = renderCalls;
+		let content = "";
+		for (const line of lines) {
+			content += `${line}\n`;
+			component.updateArgs({ path: "src/file.ts", content });
+		}
+		expect(renderCalls).toBe(callsBefore);
+		expect(renderRequests).toBeGreaterThan(0);
+
+		const streamed = stripAnsi(component.render(120).join("\n"));
+		expect(renderCalls - callsBefore).toBe(1);
+		// The same preview as rendering the final arguments directly.
+		const direct = new ToolExecutionComponent(
+			"write",
+			"tool-10",
+			{ path: "src/file.ts", content },
+			{},
+			write,
+			tui,
+			".",
+		);
+		expect(streamed).toBe(stripAnsi(direct.render(120).join("\n")));
+
+		// More deltas before the next frame: one more renderer run, which shows them all.
+		component.updateArgs({ path: "src/file.ts", content: `${content}const tail = 1;\n` });
+		const final = { path: "src/file.ts", content: `${content}const tail = 2;\n` };
+		component.updateArgs(final);
+		const next = stripAnsi(component.render(120).join("\n"));
+		expect(renderCalls - callsBefore).toBe(2);
+		expect(next).toContain("201 total");
+		expect(next).toBe(
+			stripAnsi(new ToolExecutionComponent("write", "t", final, {}, write, tui, ".").render(120).join("\n")),
+		);
+		// Rendering again without new arguments does not run the renderer.
+		component.render(120);
+		expect(renderCalls - callsBefore).toBe(2);
 	});
 
 	test("trims trailing blank display lines from read results", () => {

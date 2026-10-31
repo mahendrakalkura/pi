@@ -24,6 +24,13 @@ const DEFAULT_SEQUENCE_TIMEOUT_MS = 50;
 const DEFAULT_ESCAPE_TIMEOUT_MS = 10;
 const BRACKETED_PASTE_START = "\x1b[200~";
 const BRACKETED_PASTE_END = "\x1b[201~";
+// Color and program-status OSC replies, XTVersion, and Kitty graphics replies.
+// Until their header is complete, the input may be batched legacy Alt keystrokes.
+const TERMINAL_REPLY_HEADER_PATTERN = /^\x1b(?:\](?:1[01];|4;\d{1,3};|7501;\?)|P>\||_G(?:[a-z]=\d+,)*[a-z]=\d+;)/;
+
+function isControlString(data: string): boolean {
+	return data.startsWith(`${ESC}]`) || data.startsWith(`${ESC}P`) || data.startsWith(`${ESC}_`);
+}
 
 /**
  * Check if a string is a complete escape sequence or needs more data
@@ -200,9 +207,24 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 
 		// Try to extract a sequence starting at this position
 		if (remaining.startsWith(ESC)) {
+			const terminalReply = isControlString(remaining) && TERMINAL_REPLY_HEADER_PATTERN.test(remaining);
 			// Find the end of this escape sequence
 			let seqEnd = 1;
 			while (seqEnd <= remaining.length) {
+				if (terminalReply && seqEnd > 2) {
+					const char = remaining[seqEnd - 1];
+					if (char === "\x18" || char === "\x1a") {
+						// CAN and SUB cancel the string, not subsequent keyboard input.
+						pos += seqEnd;
+						break;
+					}
+					if (char === ESC && seqEnd < remaining.length && remaining[seqEnd] !== "\\") {
+						// A new escape sequence aborts an unterminated reply. Keep a
+						// trailing ESC buffered until we can distinguish it from ST.
+						pos += seqEnd - 1;
+						break;
+					}
+				}
 				const candidate = remaining.slice(0, seqEnd);
 				const status = isCompleteSequence(candidate);
 
@@ -258,8 +280,10 @@ function extractCompleteSequences(buffer: string): { sequences: string[]; remain
 
 export type StdinBufferOptions = {
 	/**
-	 * Maximum time to wait for an incomplete sequence such as CSI or mouse
-	 * (default: 50ms).
+	 * Maximum time to wait for an incomplete keyboard or mouse sequence
+	 * (default: 50ms). Strings with a recognized terminal reply header wait for
+	 * their terminator instead, so delayed replies cannot become keypresses.
+	 * Ambiguous legacy Alt-key input still uses this timeout.
 	 */
 	timeout?: number;
 	/**
@@ -284,7 +308,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 	private readonly timeoutMs: number;
 	private readonly escapeTimeoutMs: number;
 	private pasteMode: boolean = false;
-	private pasteBuffer: string = "";
+	/**
+	 * The paste so far, as it came in, and its last characters, which the end sequence may begin in. A paste comes in
+	 * chunks of a few kilobytes: joining it and searching all of it for the end with each chunk took seconds for a paste
+	 * of megabytes.
+	 */
+	private pasteChunks: string[] = [];
+	private pasteTail: string = "";
 	private pendingKittyPrintableCodepoint: number | undefined;
 
 	constructor(options: StdinBufferOptions = {}) {
@@ -322,24 +352,9 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.buffer += str;
 
 		if (this.pasteMode) {
-			this.pasteBuffer += this.buffer;
+			const chunk = this.buffer;
 			this.buffer = "";
-
-			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
-			if (endIndex !== -1) {
-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
-				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
-
-				this.pasteMode = false;
-				this.pasteBuffer = "";
-				this.pendingKittyPrintableCodepoint = undefined;
-
-				this.emit("paste", pastedContent);
-
-				if (remaining.length > 0) {
-					this.process(remaining);
-				}
-			}
+			this.continuePaste(chunk);
 			return;
 		}
 
@@ -354,26 +369,10 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 			}
 
 			this.pendingKittyPrintableCodepoint = undefined;
-			this.buffer = this.buffer.slice(startIndex + BRACKETED_PASTE_START.length);
+			const chunk = this.buffer.slice(startIndex + BRACKETED_PASTE_START.length);
 			this.pasteMode = true;
-			this.pasteBuffer = this.buffer;
 			this.buffer = "";
-
-			const endIndex = this.pasteBuffer.indexOf(BRACKETED_PASTE_END);
-			if (endIndex !== -1) {
-				const pastedContent = this.pasteBuffer.slice(0, endIndex);
-				const remaining = this.pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
-
-				this.pasteMode = false;
-				this.pasteBuffer = "";
-				this.pendingKittyPrintableCodepoint = undefined;
-
-				this.emit("paste", pastedContent);
-
-				if (remaining.length > 0) {
-					this.process(remaining);
-				}
-			}
+			this.continuePaste(chunk);
 			return;
 		}
 
@@ -385,14 +384,51 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 
 		if (this.buffer.length > 0) {
+			// Only a recognizable reply header establishes a delimited string.
+			// Flushing it would turn a delayed tail into text and an OSC's BEL
+			// terminator into Ctrl+G (the external editor shortcut). Other input,
+			// including Alt+] followed by text, must retain bounded recovery.
+			if (TERMINAL_REPLY_HEADER_PATTERN.test(this.buffer)) return;
 			const timeoutMs = this.buffer === ESC ? this.escapeTimeoutMs : this.timeoutMs;
 			this.timeout = setTimeout(() => {
 				const flushed = this.flush();
 
 				for (const sequence of flushed) {
-					this.emitDataSequence(sequence);
+					if (sequence.length > 2 && isControlString(sequence)) {
+						// Recover the Alt key and reparse its tail so batched text,
+						// Enter, and control keys are not swallowed as one event.
+						this.emitDataSequence(sequence.slice(0, 2));
+						this.process(sequence.slice(2));
+					} else {
+						this.emitDataSequence(sequence);
+					}
 				}
 			}, timeoutMs);
+		}
+	}
+
+	/** Add a chunk to the paste, and emit the paste once its end sequence has come. */
+	private continuePaste(chunk: string): void {
+		const window = this.pasteTail + chunk;
+		if (!window.includes(BRACKETED_PASTE_END)) {
+			this.pasteChunks.push(chunk);
+			this.pasteTail = window.slice(-(BRACKETED_PASTE_END.length - 1));
+			return;
+		}
+		const pasteBuffer = this.pasteChunks.join("") + chunk;
+		this.pasteChunks = [];
+		this.pasteTail = "";
+		const endIndex = pasteBuffer.indexOf(BRACKETED_PASTE_END);
+		const pastedContent = pasteBuffer.slice(0, endIndex);
+		const remaining = pasteBuffer.slice(endIndex + BRACKETED_PASTE_END.length);
+
+		this.pasteMode = false;
+		this.pendingKittyPrintableCodepoint = undefined;
+
+		this.emit("paste", pastedContent);
+
+		if (remaining.length > 0) {
+			this.process(remaining);
 		}
 	}
 
@@ -430,7 +466,8 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		}
 		this.buffer = "";
 		this.pasteMode = false;
-		this.pasteBuffer = "";
+		this.pasteChunks = [];
+		this.pasteTail = "";
 		this.pendingKittyPrintableCodepoint = undefined;
 	}
 

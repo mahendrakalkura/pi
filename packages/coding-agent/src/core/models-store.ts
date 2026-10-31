@@ -2,7 +2,7 @@ import { join } from "node:path";
 import type { ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions } from "@earendil-works/pi-ai";
 import { getAgentDir } from "../config.ts";
 import { raceWithAbortSignal } from "../utils/abort.ts";
-import { getFileRevision, normalizePath } from "../utils/paths.ts";
+import { getFileRevision, getFileRevisionThisTurn, normalizePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { type AuthStorageBackend, FileAuthStorageBackend } from "./auth-storage.ts";
 
@@ -19,6 +19,12 @@ type ModelsFileReadState = {
 	revision?: string;
 	reload?: ModelsFileReload;
 };
+
+/** The file's new content, or undefined when it would be what the file holds: a refresh that changes nothing writes nothing. */
+function changedContent(content: string | undefined, data: StoredModels): string | undefined {
+	const next = JSON.stringify(data, null, 2);
+	return next === content ? undefined : next;
+}
 
 // Optimize the common path without retaining an unbounded set of custom paths.
 let sharedModelsFileReadState: { path: string; readState: ModelsFileReadState } | undefined;
@@ -84,7 +90,7 @@ export class FileModelsStore implements ModelsStore {
 		options?: ModelsStoreOperationOptions,
 	): Promise<StoredModels> {
 		options?.signal?.throwIfAborted();
-		const revision = getFileRevision(this.path);
+		const revision = getFileRevisionThisTurn(this.path);
 		if (revision !== undefined && revision === readState.revision) return readState.data;
 		if (!readState.reload) {
 			const controller = new AbortController();
@@ -129,7 +135,7 @@ export class FileModelsStore implements ModelsStore {
 			const current = this.parse(content);
 			current[providerId] = structuredClone(entry);
 			latest = current;
-			return { result: undefined, next: JSON.stringify(current, null, 2) };
+			return { result: undefined, next: changedContent(content, current) };
 		}, options);
 		if (latest) this.updateReadState(this.readState, latest);
 	}
@@ -140,7 +146,7 @@ export class FileModelsStore implements ModelsStore {
 			const current = this.parse(content);
 			delete current[providerId];
 			latest = current;
-			return { result: undefined, next: JSON.stringify(current, null, 2) };
+			return { result: undefined, next: changedContent(content, current) };
 		}, options);
 		if (latest) this.updateReadState(this.readState, latest);
 	}

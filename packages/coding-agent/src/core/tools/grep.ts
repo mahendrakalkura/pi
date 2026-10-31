@@ -4,6 +4,7 @@ import type { AgentTool } from "@earendil-works/pi-agent-core";
 import { spawn } from "child_process";
 import path from "path";
 import { type Static, Type } from "typebox";
+import { detachString } from "../../utils/text.ts";
 import { ensureTool } from "../../utils/tools-manager.ts";
 import type { ExtensionContext, ToolDefinition } from "../extensions/types.ts";
 import { resolveToCwd } from "./path-utils.ts";
@@ -16,6 +17,7 @@ import {
 	type TruncationResult,
 	truncateHead,
 	truncateLine,
+	truncationDetails,
 } from "./truncate.ts";
 
 const grepSchema = Type.Object({
@@ -39,6 +41,10 @@ export const grepToolSystemPromptContribution = {
 
 export type GrepToolInput = Static<typeof grepSchema>;
 const DEFAULT_LIMIT = 100;
+/** Characters of a match line kept for the output, well past GREP_MAX_LINE_LENGTH so cutting there still marks the line truncated. */
+const MATCH_TEXT_KEEP_CHARS = GREP_MAX_LINE_LENGTH * 8;
+/** Characters of rg's error output kept for an error message. */
+const MAX_STDERR_CHARS = 16 * 1024;
 
 export interface GrepToolDetails {
 	truncation?: TruncationResult;
@@ -159,7 +165,17 @@ export function createGrepToolDefinition(
 							return lines;
 						};
 
-						const args: string[] = ["--json", "--line-number", "--color=never", "--hidden"];
+						// --no-config: the tool contract (literal, glob, limit, ...) must not depend on
+						// ambient user config like RIPGREP_CONFIG_PATH. Users can customize via bash or extensions.
+						// --one-file-system: a search rooted above a mount point never walks into other drives.
+						const args: string[] = [
+							"--no-config",
+							"--json",
+							"--line-number",
+							"--color=never",
+							"--hidden",
+							"--one-file-system",
+						];
 						if (ignoreCase) args.push("--ignore-case");
 						if (literal) args.push("--fixed-strings");
 						if (glob) args.push("--glob", glob);
@@ -191,7 +207,8 @@ export function createGrepToolDefinition(
 						};
 						signal?.addEventListener("abort", onAbort, { once: true });
 						child.stderr?.on("data", (chunk) => {
-							stderr += chunk.toString();
+							// rg prints an error per unreadable file and keeps going; the message only needs the first ones.
+							if (stderr.length < MAX_STDERR_CHARS) stderr += chunk.toString();
 						});
 
 						const formatBlock = async (filePath: string, lineNumber: number): Promise<string[]> => {
@@ -228,7 +245,14 @@ export function createGrepToolDefinition(
 								matchCount++;
 								const filePath = event.data?.path?.text;
 								const lineNumber = event.data?.line_number;
-								const lineText = event.data?.lines?.text;
+								const text = event.data?.lines?.text;
+								// Keep only the start of long lines: a match in a minified file can be a line of megabytes,
+								// and every match is held until rg exits but shown cut to GREP_MAX_LINE_LENGTH. A plain slice
+								// would keep the whole line in memory.
+								const lineText =
+									typeof text === "string" && text.length > MATCH_TEXT_KEEP_CHARS
+										? detachString(text.slice(0, MATCH_TEXT_KEEP_CHARS))
+										: text;
 								if (filePath && typeof lineNumber === "number")
 									matches.push({ filePath, lineNumber, lineText });
 								if (matchCount >= effectiveLimit) {
@@ -292,7 +316,7 @@ export function createGrepToolDefinition(
 							}
 							if (truncation.truncated) {
 								notices.push(`${formatSize(DEFAULT_MAX_BYTES)} limit reached`);
-								details.truncation = truncation;
+								details.truncation = truncationDetails(truncation);
 							}
 							if (linesTruncated) {
 								notices.push(

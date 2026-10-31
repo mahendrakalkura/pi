@@ -1,5 +1,5 @@
-import type { Component } from "../tui.ts";
-import { applyBackgroundToLine, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
+import { type Component, markReportsChanges, markStableRender, reportRenderChange } from "../tui.ts";
+import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 /**
  * Text component - displays multi-line text with word wrapping
@@ -15,7 +15,7 @@ export class Text implements Component {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	constructor(text: string = "", paddingX: number = 1, paddingY: number = 1, customBgFn?: (text: string) => string) {
+	constructor(text: string = "", paddingX: number = 0, paddingY: number = 1, customBgFn?: (text: string) => string) {
 		this.text = text;
 		this.paddingX = paddingX;
 		this.paddingY = paddingY;
@@ -27,6 +27,7 @@ export class Text implements Component {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
 	}
 
 	setCustomBgFn(customBgFn?: (text: string) => string): void {
@@ -34,12 +35,19 @@ export class Text implements Component {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
+	}
+
+	setPaddingX(paddingX: number): void {
+		this.paddingX = paddingX;
+		this.invalidate();
 	}
 
 	invalidate(): void {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
 	}
 
 	render(width: number): string[] {
@@ -96,6 +104,7 @@ export class Text implements Component {
 		}
 
 		const result = [...emptyLines, ...contentLines, ...emptyLines];
+		flattenLines(result);
 
 		// Update cache
 		this.cachedText = this.text;
@@ -105,3 +114,6 @@ export class Text implements Component {
 		return result.length > 0 ? result : [""];
 	}
 }
+
+markStableRender(Text);
+markReportsChanges(Text);

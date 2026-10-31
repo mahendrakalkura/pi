@@ -34,18 +34,45 @@ export function canonicalizePath(path: string): string {
 }
 
 export function getFileRevision(path: string): string | undefined {
+	let revision: string | undefined;
 	try {
 		const stats = statSync(path, { bigint: true });
-		return `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+		revision = `${stats.dev}:${stats.ino}:${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
 	} catch {
-		return undefined;
+		revision = undefined;
 	}
+	if (revisionsThisTurn.has(path)) revisionsThisTurn.set(path, revision);
+	return revision;
+}
+
+// Revisions looked up in this turn of the event loop (until its microtasks run), by path.
+const revisionsThisTurn = new Map<string, string | undefined>();
+let revisionsThisTurnCleared = true;
+
+/**
+ * getFileRevision(), looked up once in a turn of the event loop. For "has the file changed since it was read?", which a
+ * burst of reads asks again and again: Pi asks it of auth.json for each provider's credentials when it refreshes its models,
+ * hundreds of times in one go. Whatever this process writes, it writes in a later turn (or reads the revision again with
+ * getFileRevision(), which this follows).
+ */
+export function getFileRevisionThisTurn(path: string): string | undefined {
+	if (revisionsThisTurn.has(path)) return revisionsThisTurn.get(path);
+	const revision = getFileRevision(path);
+	revisionsThisTurn.set(path, revision);
+	if (revisionsThisTurnCleared) {
+		revisionsThisTurnCleared = false;
+		queueMicrotask(() => {
+			revisionsThisTurn.clear();
+			revisionsThisTurnCleared = true;
+		});
+	}
+	return revision;
 }
 
 /**
- * Returns true if the value is NOT a package source (npm:, git:, etc.)
- * or a remote URL protocol. Bare names, relative paths, and file: URLs
- * are considered local.
+ * Returns true if the value is NOT a package source (npm:, git:, etc.),
+ * a built-in extension (builtin:), or a remote URL protocol. Bare names,
+ * relative paths, and file: URLs are considered local.
  */
 export function isLocalPath(value: string): boolean {
 	const trimmed = value.trim();
@@ -56,7 +83,8 @@ export function isLocalPath(value: string): boolean {
 		trimmed.startsWith("github:") ||
 		trimmed.startsWith("http:") ||
 		trimmed.startsWith("https:") ||
-		trimmed.startsWith("ssh:")
+		trimmed.startsWith("ssh:") ||
+		trimmed.startsWith("builtin:")
 	) {
 		return false;
 	}

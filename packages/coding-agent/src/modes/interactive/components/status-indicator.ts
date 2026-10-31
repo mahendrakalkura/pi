@@ -8,6 +8,12 @@ export type StatusIndicatorKind = "working" | "retry" | "compaction" | "branchSu
 
 export class StatusIndicator extends Loader {
 	readonly kind: StatusIndicatorKind;
+	/**
+	 * renderInBorder() at `borderWidth`, by the loader's text. The editor draws its border on every frame, and the text
+	 * cycles through the spinner's frames: each frame's line is wrapped and truncated once, not on every tick.
+	 */
+	private borderTexts = new Map<string, string>();
+	private borderWidth = -1;
 
 	constructor(
 		kind: StatusIndicatorKind,
@@ -22,8 +28,31 @@ export class StatusIndicator extends Loader {
 	}
 
 	renderInBorder(width: number): string {
-		const line = super.render(width + 2)[1] ?? "";
-		return truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
+		if (width !== this.borderWidth) {
+			this.borderTexts.clear();
+			this.borderWidth = width;
+		}
+		const key = this.getDisplayText();
+		let text = this.borderTexts.get(key);
+		if (text === undefined) {
+			const line = super.render(width + 2)[1] ?? "";
+			text = truncateToWidth(line.startsWith(" ") ? line.slice(1).trimEnd() : line.trimEnd(), width, "");
+			// (A message that changes, such as a retry's countdown, adds a text a second.)
+			if (this.borderTexts.size >= 64) this.borderTexts.clear();
+			this.borderTexts.set(key, text);
+		}
+		return text;
+	}
+
+	override invalidate(): void {
+		this.borderTexts.clear();
+		super.invalidate();
+	}
+
+	// (setPaddingX() invalidates.)
+	override setCustomBgFn(customBgFn?: (text: string) => string): void {
+		this.borderTexts.clear();
+		super.setCustomBgFn(customBgFn);
 	}
 
 	renderSpinnerInBorder(width: number): string {
@@ -83,7 +112,7 @@ export class RetryStatusIndicator extends StatusIndicator {
 export type CompactionStatusReason = "manual" | "threshold" | "overflow";
 
 export class CompactionStatusIndicator extends StatusIndicator {
-	constructor(ui: TUI, reason: CompactionStatusReason) {
+	constructor(ui: TUI, reason: CompactionStatusReason, colorFn?: (text: string) => string) {
 		const cancelHint = `(${keyText("app.interrupt")} to cancel)`;
 		const label =
 			reason === "manual"
@@ -92,8 +121,8 @@ export class CompactionStatusIndicator extends StatusIndicator {
 		super(
 			"compaction",
 			ui,
-			(spinner) => theme.fg("accent", spinner),
-			(text) => theme.fg("muted", text),
+			colorFn ?? ((spinner) => theme.fg("accent", spinner)),
+			colorFn ?? ((text) => theme.fg("muted", text)),
 			label,
 		);
 	}

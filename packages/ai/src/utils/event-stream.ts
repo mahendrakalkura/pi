@@ -26,7 +26,8 @@ class FifoQueue<T> {
 export class EventStream<T, R = T> implements AsyncIterable<T> {
 	private queue = new FifoQueue<T>();
 	private waiting = new FifoQueue<(value: IteratorResult<T>) => void>();
-	private done = false;
+	private sink: ((event: T) => void) | undefined;
+	protected done = false;
 	private finalResultPromise: Promise<R>;
 	private resolveFinalResult!: (result: R) => void;
 	private isComplete: (event: T) => boolean;
@@ -46,6 +47,11 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		if (this.isComplete(event)) {
 			this.done = true;
 			this.resolveFinalResult(this.extractResult(event));
+		}
+
+		if (this.sink) {
+			this.sink(event);
+			return;
 		}
 
 		// Deliver to waiting consumer or queue it
@@ -86,9 +92,28 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	result(): Promise<R> {
 		return this.finalResultPromise;
 	}
+
+	/**
+	 * Hands every event to `sink` instead of to an iterator: the queued ones at once, in order, then each one as it is
+	 * pushed. For a stream that has no consumer but the one forwarding it (lazyStream()): an iterator's `for await` takes
+	 * several promise reactions per event, which a chain of forwarding streams paid for every event of a response.
+	 */
+	forwardTo(sink: (event: T) => void): void {
+		while (this.queue.length > 0) sink(this.queue.dequeue()!);
+		this.sink = sink;
+	}
 }
 
+/**
+ * Event stream of one assistant response. It also times the response: the final message (`done` or `error` event, or
+ * the result passed to `end()`) gets `durationMs`, measured with a monotonic clock from the stream's creation, unless
+ * the message already has one or its `timestamp` predates the stream. A stream that forwards a response which started
+ * elsewhere, such as a deferred result fetched later, therefore leaves it untimed.
+ */
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
+	readonly #startedAt = Date.now();
+	readonly #startedAtMonotonic = performance.now();
+
 	constructor() {
 		super(
 			(event) => event.type === "done" || event.type === "error",
@@ -101,6 +126,22 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				throw new Error("Unexpected event type for final result");
 			},
 		);
+	}
+
+	override push(event: AssistantMessageEvent): void {
+		if (event.type === "done") this.#time(event.message);
+		else if (event.type === "error") this.#time(event.error);
+		super.push(event);
+	}
+
+	override end(result?: AssistantMessage): void {
+		if (result !== undefined) this.#time(result);
+		super.end(result);
+	}
+
+	#time(message: AssistantMessage): void {
+		if (this.done || message.durationMs !== undefined || message.timestamp < this.#startedAt) return;
+		message.durationMs = Math.max(0, Math.round(performance.now() - this.#startedAtMonotonic));
 	}
 }
 
