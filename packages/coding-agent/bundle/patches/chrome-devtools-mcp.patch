@@ -1,0 +1,13 @@
+diff -ruN a/build/src/McpResponse.js b/build/src/McpResponse.js
+--- a/build/src/McpResponse.js
++++ b/build/src/McpResponse.js
+@@ -1240,7 +1240,8 @@
+     const url = mcpPage.url();
+     const pageLabel = title ? `${truncateTitle(title)} (${url})` : url;
+     return {
+-        text: `${mcpPage.id}: ${pageLabel}`,
++        // Pi patch: name the CDP target, so Pi's browser guard can tell which window holds the page.
++        text: `${mcpPage.id}: ${pageLabel} [target ${mcpPage.targetId}]`,
+         structured: createStructuredPage(mcpPage, context, title),
+     };
+ }
