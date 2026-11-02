@@ -211,6 +211,8 @@ interface LexedMarkdown {
 	tokens: TokensList;
 	/** Whether lexing can go on from these tokens when text is added to the source. */
 	resumable: boolean;
+	/** Whether the tokens were lexed from those of a shorter source (lexAddedMarkdown()), not from all of this one. */
+	pieced: boolean;
 }
 
 /** The sources lexed last, most recent last: a message that is streaming in is lexed again each time it grows. */
@@ -282,8 +284,11 @@ function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | un
 /**
  * Lexes Markdown, reusing what was lexed before when `source` is a source lexed earlier or one with text added at its end
  * (a message streaming in), so that the cost of a new chunk does not grow with the length of the message.
+ * A `complete` source (one that will not grow any more) is lexed in full instead of from a shorter one's tokens: lexing in
+ * pieces can split a block that a full lex keeps whole ("2. Install" after a paragraph line, or `$$` math across blank
+ * lines), and the tokens kept for a source are what it renders to from then on.
  */
-function lexMarkdown(source: string): TokensList {
+function lexMarkdown(source: string, complete = false): TokensList {
 	if (!markdownCaching) {
 		const tokens = markdownParser.lexer(source);
 		trimPartialClosingFences(tokens);
@@ -294,10 +299,14 @@ function lexMarkdown(source: string): TokensList {
 		const entry = lexedMarkdown[i];
 		if (entry.source === source) {
 			lexedMarkdown.splice(i, 1);
+			if (complete && entry.pieced) {
+				break;
+			}
 			lexedMarkdown.push(entry);
 			return entry.tokens;
 		}
 		if (
+			!complete &&
 			entry.resumable &&
 			source.length > entry.source.length &&
 			(previous < 0 || entry.source.length > lexedMarkdown[previous].source.length) &&
@@ -308,7 +317,8 @@ function lexMarkdown(source: string): TokensList {
 	}
 
 	let tokens = previous >= 0 ? lexAddedMarkdown(lexedMarkdown[previous], source) : undefined;
-	let resumable = tokens !== undefined;
+	const pieced = tokens !== undefined;
+	let resumable = pieced;
 	if (!tokens) {
 		tokens = markdownParser.lexer(source);
 		let length = 0;
@@ -324,7 +334,7 @@ function lexMarkdown(source: string): TokensList {
 		// The shorter source is not coming back.
 		lexedMarkdown.splice(previous, 1);
 	}
-	lexedMarkdown.push({ source, tokens: tokens as TokensList, resumable });
+	lexedMarkdown.push({ source, tokens: tokens as TokensList, resumable, pieced });
 	if (lexedMarkdown.length > LEXED_MARKDOWN_KEPT) {
 		lexedMarkdown.shift();
 	}
@@ -332,8 +342,8 @@ function lexMarkdown(source: string): TokensList {
 }
 
 /** For tests: lexes as render() does. */
-export function lexMarkdownForTest(source: string): TokensList {
-	return lexMarkdown(source);
+export function lexMarkdownForTest(source: string, complete = false): TokensList {
+	return lexMarkdown(source, complete);
 }
 
 /**
@@ -389,6 +399,11 @@ export interface MarkdownOptions {
 	transform?: (markdown: string, availableWidth: number) => string;
 	/** Render supported LaTeX math expressions as Unicode text (default: true). */
 	renderLatex?: boolean;
+	/**
+	 * The text will not grow any more (a message that has finished streaming): it is lexed in full, not from the tokens of
+	 * the shorter text it was streamed as.
+	 */
+	complete?: boolean;
 }
 
 interface InlineStyleContext {
@@ -527,7 +542,7 @@ export class Markdown implements Component {
 		const cached = this.cachedTokens?.deref();
 		let tokens = cached?.source === normalizedText ? cached.tokens : undefined;
 		if (!tokens) {
-			tokens = lexMarkdown(normalizedText);
+			tokens = lexMarkdown(normalizedText, this.options.complete);
 			this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
 		}
 
