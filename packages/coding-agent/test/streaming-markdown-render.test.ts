@@ -1,7 +1,7 @@
 import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { type Component, Container, Text } from "@earendil-works/pi-tui";
 import { afterEach, beforeAll, describe, expect, test } from "vitest";
-import { setMarkdownCachingForTest } from "../../tui/src/components/markdown.ts";
+import { setMarkdownCachingForTest, setMarkdownFastPathsForTest } from "../../tui/src/components/markdown.ts";
 import { AssistantMessageComponent } from "../src/modes/interactive/components/assistant-message.ts";
 import { UserMessageComponent } from "../src/modes/interactive/components/user-message.ts";
 import { initTheme } from "../src/modes/interactive/theme/theme.ts";
@@ -201,6 +201,7 @@ describe("a streaming reply renders as it does from nothing", () => {
 	});
 	afterEach(() => {
 		setMarkdownCachingForTest(true);
+		setMarkdownFastPathsForTest(true);
 	});
 
 	for (const [name, text] of Object.entries(DOCUMENTS)) {
@@ -249,4 +250,109 @@ describe("a streaming reply renders as it does from nothing", () => {
 			() => 160,
 		);
 	});
+});
+
+// Pieces of Markdown that end blocks, continue them or change what the block before them is (a "2" that becomes an item of
+// the list before it, a setext underline, a table's delimiter row, lazy lines, unclosed fences), put together at random.
+const PIECES = [
+	"- item {w}\n",
+	"  - nested {w}\n",
+	"    1. deeper {w}\n",
+	"1. one {w}\n",
+	"2",
+	"2. two\n",
+	"3)\n",
+	"   lazy {w}\n",
+	"lazy {w}\n",
+	"Text {w} with **bold**, *it*, `code` and [a link](https://example.com/{w}).\n",
+	"A long line of text {w} that has to be wrapped at the narrower widths this test renders the reply at.\n",
+	"\n",
+	"\n\n",
+	"```ts\nconst {w} = 1;\nlet b = `x`;\n```\n",
+	"```\nunclosed {w}\n",
+	"``",
+	"~~~\ntilde {w}\n~~~\n",
+	"> quote {w}\n",
+	"> > deep {w}\n",
+	"| a | b |\n",
+	"|---|:-:|\n",
+	"| {w} | 2 |\n",
+	"# Heading {w}\n",
+	"### Small {w}\n",
+	"Setext {w}\n",
+	"===\n",
+	"---\n",
+	"***\n",
+	"    indented code {w}\n",
+	"<div>\nhtml {w}\n</div>\n",
+	"<!-- note {w} -->\n",
+	"$$\nx^{w}\n$$\n",
+	"\\[ y_{w} \\]\n",
+	"- [ ] task {w}\n",
+	"\t- tab {w}\n",
+	"1. a\n   ```\n   code {w}\n   ```\n",
+	"Term with trailing spaces  \n",
+	"[ref {w}]\n",
+	"  ---  \n",
+	"   =\n",
+	"\u00a0\n",
+	"  \t \n",
+	"under {w}\r\n--\r\n",
+	"a\u2028b {w}\n",
+];
+
+/** Streams `text` into a reply component in chunks of `sizes` characters and returns what it renders to after each. */
+function streamedRenders(text: string, sizes: number[], width: number): string[] {
+	// Nothing lexed for an earlier render is taken up: the sources kept (lexMarkdown()) are pushed out by others.
+	for (let i = 0; i < 16; i++)
+		new AssistantMessageComponent(assistantMessage(`flush ${i} ${Math.random()}`)).render(width);
+	const reply = new AssistantMessageComponent();
+	const renders: string[] = [];
+	let step = 0;
+	for (let length = 1; ; length = Math.min(text.length, length + sizes[step++ % sizes.length]!)) {
+		reply.updateContent(assistantMessage(text.slice(0, length)), true);
+		renders.push(JSON.stringify(reply.render(width)));
+		if (length >= text.length) break;
+	}
+	reply.updateContent(assistantMessage(text), false);
+	renders.push(JSON.stringify(reply.render(width)));
+	return renders;
+}
+
+describe("keeping the settled blocks of a streaming reply renders what lexing its last two blocks again renders", () => {
+	beforeAll(() => {
+		initTheme("dark");
+	});
+	afterEach(() => {
+		setMarkdownFastPathsForTest(true);
+	});
+
+	for (let seed = 1; seed <= 40; seed++) {
+		test(`random document ${seed}`, () => {
+			const next = random(seed * 7919);
+			for (let documentIndex = 0; documentIndex < 10; documentIndex++) {
+				let text = "";
+				const pieces = 8 + Math.floor(next() * 24);
+				for (let i = 0; i < pieces; i++) {
+					text += PIECES[Math.floor(next() * PIECES.length)]!.replaceAll("{w}", String(Math.floor(next() * 1000)));
+				}
+				const sizes = Array.from({ length: 64 }, () =>
+					next() < 0.3 ? 1 : 1 + Math.floor(next() * (next() < 0.5 ? 8 : 40)),
+				);
+				const width = [20, 47, 160][Math.floor(next() * 3)]!;
+				setMarkdownFastPathsForTest(false);
+				const before = streamedRenders(text, sizes, width);
+				setMarkdownFastPathsForTest(true);
+				const after = streamedRenders(text, sizes, width);
+				for (let i = 0; i < before.length; i++) {
+					if (after[i] !== before[i]) {
+						expect(JSON.parse(after[i]!), `${JSON.stringify(text)}, step ${i}, width ${width}`).toEqual(
+							JSON.parse(before[i]!),
+						);
+					}
+				}
+				expect(after.length).toBe(before.length);
+			}
+		});
+	}
 });
