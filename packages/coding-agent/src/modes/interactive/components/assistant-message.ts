@@ -35,15 +35,6 @@ export function mentionsAny(text: string, names: ReadonlySet<string>): boolean {
 	return false;
 }
 
-/** A Markdown component of an assistant message, with what it was made from (AssistantMessageComponent.markdownFor()). */
-interface MarkdownBlock {
-	kind: "text" | "thinking";
-	text: string;
-	isStreaming: boolean;
-	outputPad: number;
-	component: Markdown;
-}
-
 /**
  * Component that renders a complete assistant message
  */
@@ -60,6 +51,8 @@ export class AssistantMessageComponent extends Container {
 	private messageId?: string;
 	private timestamp?: string;
 	private contentIsStale = false;
+	private markedFrom?: string[];
+	private markedLines: string[] = [];
 	private thinkingVisibilityOverrides = new Map<number, boolean>();
 	private markdownSlots: MarkdownSlot[] = [];
 
@@ -166,29 +159,8 @@ export class AssistantMessageComponent extends Container {
 		this.buildContent(message);
 	}
 
-	/** A Markdown component for `text`: the one built for it before when nothing it was made with has changed. */
-	private markdownFor(
-		kind: MarkdownBlock["kind"],
-		text: string,
-		previous: MarkdownBlock[],
-		create: () => Markdown,
-	): Markdown {
-		const index = previous.findIndex(
-			(block) =>
-				block.kind === kind &&
-				block.text === text &&
-				block.isStreaming === this.isStreaming &&
-				block.outputPad === this.outputPad,
-		);
-		const component = index === -1 ? create() : previous.splice(index, 1)[0]!.component;
-		this.markdownBlocks.push({ kind, text, isStreaming: this.isStreaming, outputPad: this.outputPad, component });
-		return component;
-	}
-
 	private buildContent(message: AssistantMessage): void {
 		this.contentIsStale = false;
-		const previousBlocks = this.markdownBlocks;
-		this.markdownBlocks = [];
 		// Clear content container
 		this.contentContainer.clear();
 		const previousSlots = this.markdownSlots;
