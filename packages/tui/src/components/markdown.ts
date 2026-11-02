@@ -292,9 +292,10 @@ function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | un
 	if (last <= 0) {
 		return undefined;
 	}
-	let offset = 0;
-	for (let i = 0; i < last; i++) {
-		offset += previous.tokens[i].raw.length;
+	// (The tokens of a resumable source add up to it: where the kept ones end is counted from the end, over the last few.)
+	let offset = previous.source.length;
+	for (let i = last; i < previous.tokens.length; i++) {
+		offset -= previous.tokens[i].raw.length;
 	}
 	// The text of a token is a part of the string that was lexed, and keeps all of that string in memory. Lexing the end
 	// of `source` as a part of it would leave every block of a long message holding the whole message as it was when
