@@ -86,6 +86,7 @@ Final paragraph.
 `,
 	crlf: "one\r\ntwo\r\n\r\n- a\r\n- b\r\n\r\n```\r\ncode\r\n```\r\nend",
 	lonecr: "one\rtwo\r\rthree",
+	tabs: "a\tb\t\n\n-\tx\ty\n\n```\n\tcode\twith\ttabs\n\t\n```\n\n\ttab-indented\n\n|\ta\t|\tb\t|\n|---|---|\n|\t1\t|\t2\t|\n\nend\t",
 	references: `A [ref][one] before its definition, and [another].
 
 Some text in between.
