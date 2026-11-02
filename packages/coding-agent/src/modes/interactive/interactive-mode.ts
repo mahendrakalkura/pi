@@ -144,6 +144,7 @@ import { ensurePngTranscoderOnFirstUse } from "../../utils/image-convert.ts";
 import { getCwdRelativePath, pathsEqual, resolvePath, shortenHomePath } from "../../utils/paths.ts";
 import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { loadAllHighlightLanguagesOnDemand } from "../../utils/syntax-highlight.ts";
+import { stripBom } from "../../utils/text.ts";
 import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
 import { reportBug } from "./bug-report.ts";
@@ -1014,7 +1015,9 @@ export class InteractiveMode {
 				const condensedText = `Updated to v${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
 				this.chatContainer.addChild(new Text(condensedText, this.outputPad, 0));
 			} else {
-				this.chatContainer.addChild(new ThemedText(() => theme.bold(theme.fg("accent", "What's New")), this.outputPad, 0));
+				this.chatContainer.addChild(
+					new ThemedText(() => theme.bold(theme.fg("accent", "What's New")), this.outputPad, 0),
+				);
 				this.chatContainer.addChild(new Spacer(1));
 				this.chatContainer.addChild(this.createChangelogMarkdown(this.changelogMarkdown.trim(), this.outputPad, 0));
 				this.chatContainer.addChild(new Spacer(1));
