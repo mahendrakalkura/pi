@@ -6,9 +6,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import {
 	canonicalizePath,
 	getCwdRelativePath,
-	getPathComparisonKey,
 	getFileRevision,
 	getFileRevisionThisTurn,
+	getPathComparisonKey,
 	isLocalPath,
 	isPathWithin,
 	normalizePath,
