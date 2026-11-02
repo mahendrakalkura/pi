@@ -277,5 +277,6 @@ export function supportsLanguage(name: string): boolean {
  * code that embeds another language, such as HTML in a JavaScript template literal.
  */
 export function getHighlightLanguageCount(): number {
+	registerEagerLanguages();
 	return hljs.listLanguages().length;
 }
