@@ -5,8 +5,12 @@ import {
 	getCapabilities,
 	Image,
 	MouseRegion,
-	renderSharedLines,
+	markReportsChanges,
+	renderChildLines,
+	reportRenderChange,
+	reportsChanges,
 	Spacer,
+	setSubtreeReportsChanges,
 	Text,
 	type TUI,
 	type TuiMouseEvent,
@@ -96,6 +100,8 @@ export class ToolExecutionComponent extends Container {
 		// selfRenderContainer is used when the tool renders its own framing.
 		// contentText is reserved for generic fallback rendering when no tool definition exists.
 		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		// (Its backgrounds read the theme, and every theme change invalidates the transcript.)
+		this.contentBox.setBackgroundReported(true);
 		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
 		this.contentTextRegion = this.createResultRegion(this.contentText);
 		this.selfRenderContainer = new Container();
@@ -189,6 +195,8 @@ export class ToolExecutionComponent extends Container {
 		if (args === this.args) return false;
 		this.args = args;
 		this.argsPending = true;
+		// The containers this is in keep its lines until told of a change: without this they would draw the old arguments.
+		reportRenderChange(this);
 		this.ui.requestRender();
 		return true;
 	}
@@ -253,19 +261,26 @@ export class ToolExecutionComponent extends Container {
 	override renderShared(width: number): string[] {
 		if (this.argsPending) this.updateDisplay();
 		if (this.hideComponent) {
+			this.noteRendered();
 			return this.emptyLines;
 		}
 
 		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
+			this.noteRendered();
 			// The parts' lines: all from components that keep their lines (renderSharedLines()), so the same arrays are the
 			// same lines, and the joined lines are kept with them.
-			const parts = [renderSharedLines(this.selfRenderContainer, width)];
+			const parts = [renderChildLines(this, this.selfRenderContainer, width)];
+			let reports = reportsChanges(this.selfRenderContainer);
 			for (let i = 0; i < this.imageComponents.length; i++) {
 				const spacer = this.imageSpacers[i];
-				if (spacer) parts.push(renderSharedLines(spacer, width));
+				if (spacer) parts.push(renderChildLines(this, spacer, width));
 				const imageComponent = this.imageComponents[i];
-				if (imageComponent) parts.push(renderSharedLines(imageComponent, width));
+				if (imageComponent) {
+					parts.push(renderChildLines(this, imageComponent, width));
+					if (!reportsChanges(imageComponent)) reports = false;
+				}
 			}
+			setSubtreeReportsChanges(this, reports);
 			const previous = this.selfRenderParts;
 			if (previous?.length === parts.length && previous.every((part, i) => part === parts[i])) {
 				return this.selfRenderLines;
@@ -420,6 +435,7 @@ export class ToolExecutionComponent extends Container {
 		if (this.hasRendererDefinition() && !hasContent && this.imageComponents.length === 0) {
 			this.hideComponent = true;
 		}
+		reportRenderChange(this);
 	}
 
 	private getTextOutput(): string {
@@ -439,3 +455,5 @@ export class ToolExecutionComponent extends Container {
 		return text;
 	}
 }
+
+markReportsChanges(ToolExecutionComponent);
