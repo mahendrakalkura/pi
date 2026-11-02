@@ -1,4 +1,5 @@
-import { execSync } from "node:child_process";
+import { execFile } from "node:child_process";
+import type { Socket } from "node:net";
 import { homedir } from "node:os";
 import { isAbsolute } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -33,7 +34,10 @@ export interface ImageRenderOptions {
 }
 
 let cachedCapabilities: TerminalCapabilities | null = null;
+/** Whether `cachedCapabilities` took `hyperlinks: false` from a tmux probe that has not answered yet. */
+let cachedBeforeTmuxAnswer = false;
 let capabilityOverrides: Partial<TerminalCapabilities> = {};
+const capabilityChangeListeners = new Set<() => void>();
 
 // Default cell dimensions - updated by TUI when terminal responds to query
 let cellDimensions: CellDimensions = { widthPx: 9, heightPx: 18 };
@@ -46,25 +50,71 @@ export function setCellDimensions(dims: CellDimensions): void {
 	cellDimensions = dims;
 }
 
+/** The tmux probe's answer; undefined until it has answered. */
+let tmuxHyperlinks: boolean | undefined;
+let tmuxProbeStarted = false;
+
 /**
  * Checks whether the attached tmux client forwards OSC 8 hyperlinks to the
  * outer terminal. tmux only re-emits them when its `client_termfeatures` lists
  * `hyperlinks`, and strips them otherwise. On any error fallbacks `false`.
+ *
+ * The check runs `tmux` in the background, so starting Pi does not wait for it (10-40 ms): until it answers this
+ * returns `false`. An answer of `true` drops the cached capabilities and notifies onCapabilitiesChange() listeners once.
  */
 function probeTmuxHyperlinks(): boolean {
-	try {
-		const termfeatures = execSync("tmux display-message -p '#{client_termfeatures}'", {
-			encoding: "utf8",
-			timeout: 250,
-			stdio: ["ignore", "pipe", "ignore"],
-		});
-		return termfeatures
-			.split(",")
-			.map((feature) => feature.trim())
-			.includes("hyperlinks");
-	} catch {
-		return false;
+	if (tmuxHyperlinks !== undefined) return tmuxHyperlinks;
+	if (!tmuxProbeStarted) {
+		tmuxProbeStarted = true;
+		startTmuxProbe();
 	}
+	return false;
+}
+
+function startTmuxProbe(): void {
+	const answer = (forwards: boolean) => {
+		tmuxHyperlinks = forwards;
+		if (!forwards || !cachedBeforeTmuxAnswer) return;
+		cachedCapabilities = null;
+		cachedBeforeTmuxAnswer = false;
+		for (const listener of capabilityChangeListeners) listener();
+	};
+	try {
+		const child = execFile(
+			"tmux",
+			["display-message", "-p", "#{client_termfeatures}"],
+			{ encoding: "utf8" },
+			(error, stdout) => {
+				clearTimeout(timeout);
+				answer(
+					!error &&
+						stdout
+							.split(",")
+							.map((feature) => feature.trim())
+							.includes("hyperlinks"),
+				);
+			},
+		);
+		// Neither the probe nor its time limit may keep a short-lived Pi (e.g. `pi -p`) running.
+		const timeout = setTimeout(() => child.kill(), 250);
+		timeout.unref();
+		child.unref();
+		child.stdin?.end();
+		// The pipes are sockets, which can be unreferenced too.
+		(child.stdout as Socket | null)?.unref();
+		(child.stderr as Socket | null)?.unref();
+	} catch {
+		answer(false);
+	}
+}
+
+/**
+ * Calls `listener` when the detected capabilities change after they were first read (the tmux hyperlink probe
+ * answered): what was drawn with the old ones should be drawn again. Returns a function that removes the listener.
+ */
+export function onCapabilitiesChange(listener: () => void): () => void {
+	capabilityChangeListeners.add(listener);
+	return () => capabilityChangeListeners.delete(listener);
 }
 
 function detectCapabilitiesFromEnvironment(tmuxForwardsHyperlink: () => boolean): TerminalCapabilities {
@@ -178,10 +228,20 @@ export function detectCapabilities(tmuxForwardsHyperlink: () => boolean = probeT
 export function getCapabilities(): TerminalCapabilities {
 	if (!cachedCapabilities) {
 		const hyperlinks = capabilityOverrides.hyperlinks;
+		let probePending = false;
 		cachedCapabilities = {
-			...detectCapabilities(hyperlinks === undefined ? undefined : () => hyperlinks),
+			...detectCapabilities(
+				hyperlinks === undefined
+					? () => {
+							const forwards = probeTmuxHyperlinks();
+							probePending = tmuxHyperlinks === undefined;
+							return forwards;
+						}
+					: () => hyperlinks,
+			),
 			...capabilityOverrides,
 		};
+		cachedBeforeTmuxAnswer = probePending;
 	}
 	return cachedCapabilities;
 }
@@ -192,6 +252,9 @@ export function getTerminalColorMode(capabilities: TerminalCapabilities = getCap
 
 export function resetCapabilitiesCache(): void {
 	cachedCapabilities = null;
+	cachedBeforeTmuxAnswer = false;
+	tmuxHyperlinks = undefined;
+	tmuxProbeStarted = false;
 }
 
 /** Override selected auto-detected capabilities. */
@@ -205,11 +268,13 @@ export function setCapabilityOverrides(overrides: Partial<TerminalCapabilities>)
 	}
 	capabilityOverrides = { ...overrides };
 	cachedCapabilities = null;
+	cachedBeforeTmuxAnswer = false;
 }
 
 /** Override the cached capabilities. Useful in tests to exercise both code paths. */
 export function setCapabilities(caps: TerminalCapabilities): void {
 	cachedCapabilities = caps;
+	cachedBeforeTmuxAnswer = false;
 }
 
 const KITTY_PREFIX = "\x1b_G";
@@ -376,13 +441,26 @@ export function getMaxKittyImageRows(): number {
 	return maxKittyImageRows;
 }
 
+/**
+ * The first Kitty graphics command of a line with its controls (between "\x1b_G" and the next ";"), as
+ * `/\x1b_G([^;]*);/.exec(line)` finds it: `index` where it starts, `controls`, and `length` up to and with the ";". Found with
+ * two searches, so a line of many "\x1b_G" with no ";" after them costs one scan.
+ */
+function findKittyControls(line: string): { index: number; controls: string; length: number } | undefined {
+	const index = line.indexOf("\x1b_G");
+	if (index === -1) return undefined;
+	const end = line.indexOf(";", index + 3);
+	if (end === -1) return undefined;
+	return { index, controls: line.slice(index + 3, end), length: end + 1 - index };
+}
+
 function getRegisteredKittyImageMetadataFromControls(controls: string): RegisteredKittyImageMetadata | undefined {
 	const imageId = /(?:^|,)i=(\d+)(?:,|$)/.exec(controls)?.[1];
 	return imageId === undefined ? undefined : kittyImageMetadata.get(Number.parseInt(imageId, 10));
 }
 
 function getRegisteredKittyImageMetadata(line: string): RegisteredKittyImageMetadata | undefined {
-	const controls = /\x1b_G([^;]*);/.exec(line)?.[1];
+	const controls = findKittyControls(line)?.controls;
 	return controls === undefined ? undefined : getRegisteredKittyImageMetadataFromControls(controls);
 }
 
@@ -431,7 +509,7 @@ const KITTY_PLACEMENT_CONTROL_KEYS = new Set([
 
 /** Read the number of rows covered by an image placement without scanning its payload. */
 export function getKittyImagePlacementRows(line: string): number | undefined {
-	const controls = /\x1b_G([^;]*);/.exec(line)?.[1];
+	const controls = findKittyControls(line)?.controls;
 	if (controls === undefined) return undefined;
 	const explicitRows = getExplicitKittyImageRows(controls);
 	if (explicitRows !== undefined) return explicitRows;
@@ -440,13 +518,13 @@ export function getKittyImagePlacementRows(line: string): number | undefined {
 
 /** Build a placement-only command for an image line emitted by {@link renderImage}. */
 export function getKittyImagePlacement(line: string): KittyImagePlacement | undefined {
-	const match = /\x1b_G([^;]*);/.exec(line);
+	const match = findKittyControls(line);
 	if (!match) return undefined;
-	const metadata = getRegisteredKittyImageMetadataFromControls(match[1]);
+	const metadata = getRegisteredKittyImageMetadataFromControls(match.controls);
 	if (!metadata) return undefined;
 
 	let commandStart = match.index;
-	let commandControls = match[1];
+	let commandControls = match.controls;
 	let transmissionEnd: number;
 	while (true) {
 		const terminator = line.indexOf("\x1b\\", commandStart + KITTY_PREFIX.length);
@@ -460,7 +538,7 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 		commandControls = line.slice(commandStart + KITTY_PREFIX.length, controlsEnd);
 	}
 
-	const controls = match[1]
+	const controls = match.controls
 		.split(",")
 		.filter((control) => KITTY_PLACEMENT_CONTROL_KEYS.has(control.split("=", 1)[0] ?? ""));
 	const sequence = `\x1b_Ga=p,q=2,${controls.join(",")}\x1b\\`;
@@ -469,7 +547,7 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 		transmissionGeneration: metadata.transmissionGeneration,
 		transmissionBytes: transmissionEnd - match.index,
 		estimatedDecodedBytes: metadata.widthPx * metadata.heightPx * 4,
-		rows: getKittyImageRowsFromControls(match[1], metadata.rows),
+		rows: getKittyImageRowsFromControls(match.controls, metadata.rows),
 		sequence,
 		replacementLine: `${line.slice(0, match.index)}${sequence}${line.slice(transmissionEnd)}`,
 	};
@@ -477,16 +555,16 @@ export function getKittyImagePlacement(line: string): KittyImagePlacement | unde
 
 export function cropKittyImageLine(line: string, hiddenRows: number, visibleRows: number): string {
 	const metadata = getKittyImageMetadata(line);
-	const match = /\x1b_G([^;]*);/.exec(line);
+	const match = findKittyControls(line);
 	if (!metadata || !match || hiddenRows < 0 || hiddenRows >= metadata.rows || visibleRows <= 0) return line;
 	const croppedRows = Math.min(visibleRows, metadata.rows - hiddenRows);
 	if (hiddenRows === 0 && croppedRows === metadata.rows) return line;
 	const sourceY = Math.floor((metadata.heightPx * hiddenRows) / metadata.rows);
 	const sourceEnd = Math.ceil((metadata.heightPx * (hiddenRows + croppedRows)) / metadata.rows);
 	const sourceHeight = Math.max(1, Math.min(metadata.heightPx, sourceEnd) - sourceY);
-	const controls = match[1].split(",").filter((control) => !/^[yhr]=/.test(control));
+	const controls = match.controls.split(",").filter((control) => !/^[yhr]=/.test(control));
 	controls.push(`y=${sourceY}`, `h=${sourceHeight}`, `r=${croppedRows}`);
-	return `${line.slice(0, match.index)}\x1b_G${controls.join(",")};${line.slice(match.index + match[0].length)}`;
+	return `${line.slice(0, match.index)}\x1b_G${controls.join(",")};${line.slice(match.index + match.length)}`;
 }
 
 function chooseLessDistortedCellCount(upperCount: number, idealCount: number): number {

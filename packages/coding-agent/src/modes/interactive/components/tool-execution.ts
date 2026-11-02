@@ -5,7 +5,12 @@ import {
 	getCapabilities,
 	Image,
 	MouseRegion,
+	markReportsChanges,
+	renderChildLines,
+	reportRenderChange,
+	reportsChanges,
 	Spacer,
+	setSubtreeReportsChanges,
 	Text,
 	type TUI,
 	type TuiMouseEvent,
@@ -16,6 +21,7 @@ import type { ToolDefinition, ToolRenderContext, ToolRenderers } from "../../../
 export type { ToolRenderers };
 
 import { formatToolCallWithArgs, getTextOutput as getRenderedTextOutput } from "../../../core/tools/render-utils.ts";
+import { renderersMayHighlight } from "../../../core/tools/renderers/highlighting.ts";
 import { ensurePngTranscoder } from "../../../utils/image-convert.ts";
 import { theme } from "../theme/theme.ts";
 import { keyHint, keyText } from "./keybinding-hints.ts";
@@ -34,6 +40,10 @@ export class ToolExecutionComponent extends Container {
 	private contentTextRegion: MouseRegion;
 	private selfRenderContainer: Container;
 	private selfRenderHeight = 0;
+	/** What the self-rendered shell was joined from, and the joined lines (renderShared()). */
+	private selfRenderParts?: string[][];
+	private selfRenderLines: string[] = [];
+	private readonly emptyLines: string[] = [];
 	private callRendererComponent?: Component;
 	private resultRendererComponent?: Component;
 	private rendererState: any = {};
@@ -90,6 +100,8 @@ export class ToolExecutionComponent extends Container {
 		// selfRenderContainer is used when the tool renders its own framing.
 		// contentText is reserved for generic fallback rendering when no tool definition exists.
 		this.contentBox = new Box(1, 1, (text: string) => theme.bg("toolPendingBg", text));
+		// (Its backgrounds read the theme, and every theme change invalidates the transcript.)
+		this.contentBox.setBackgroundReported(true);
 		this.contentText = new Text("", 1, 1, (text: string) => theme.bg("toolPendingBg", text));
 		this.contentTextRegion = this.createResultRegion(this.contentText);
 		this.selfRenderContainer = new Container();
@@ -173,12 +185,20 @@ export class ToolExecutionComponent extends Container {
 
 	/**
 	 * Show new partial arguments. Applied at the next render, so a call streaming many argument deltas between two
-	 * frames runs its renderer once per frame, not once per delta (#9265).
+	 * frames runs its renderer once per frame, not once per delta (#9265). Returns whether `args` are new arguments,
+	 * which may change what this draws.
 	 */
-	updateArgs(args: any): void {
+	updateArgs(args: any): boolean {
+		// Every message_update hands every tool call of the message its arguments again, and ToolCallArgumentsStream
+		// returns the same object until they change: the same object is the same arguments, and drawing them again is
+		// wasted work that grows with their size (the write and edit renderers go over the whole file content).
+		if (args === this.args) return false;
 		this.args = args;
 		this.argsPending = true;
+		// The containers this is in keep its lines until told of a change: without this they would draw the old arguments.
+		reportRenderChange(this);
 		this.ui.requestRender();
+		return true;
 	}
 
 	markExecutionStarted(): void {
@@ -233,38 +253,55 @@ export class ToolExecutionComponent extends Container {
 		this.updateDisplay();
 	}
 
-	override render(width: number): string[] {
+	/** Whether this row may show code highlighted in one of `languages` (lowercase names). */
+	mayHighlight(languages: ReadonlySet<string>): boolean {
+		return renderersMayHighlight(this.toolDefinition, this.args, languages);
+	}
+
+	override renderShared(width: number): string[] {
 		if (this.argsPending) this.updateDisplay();
 		if (this.hideComponent) {
-			return [];
+			this.noteRendered();
+			return this.emptyLines;
 		}
 
 		if (this.hasRendererDefinition() && this.getRenderShell() === "self") {
-			const contentLines = this.selfRenderContainer.render(width);
-			this.selfRenderHeight = contentLines.length;
-			if (contentLines.length === 0 && this.imageComponents.length === 0) {
-				return [];
+			this.noteRendered();
+			// The parts' lines: all from components that keep their lines (renderSharedLines()), so the same arrays are the
+			// same lines, and the joined lines are kept with them.
+			const parts = [renderChildLines(this, this.selfRenderContainer, width)];
+			let reports = reportsChanges(this.selfRenderContainer);
+			for (let i = 0; i < this.imageComponents.length; i++) {
+				const spacer = this.imageSpacers[i];
+				if (spacer) parts.push(renderChildLines(this, spacer, width));
+				const imageComponent = this.imageComponents[i];
+				if (imageComponent) {
+					parts.push(renderChildLines(this, imageComponent, width));
+					if (!reportsChanges(imageComponent)) reports = false;
+				}
 			}
-
+			setSubtreeReportsChanges(this, reports);
+			const previous = this.selfRenderParts;
+			if (previous?.length === parts.length && previous.every((part, i) => part === parts[i])) {
+				return this.selfRenderLines;
+			}
+			const contentLines = parts[0]!;
+			this.selfRenderHeight = contentLines.length;
 			const lines: string[] = [];
 			if (contentLines.length > 0) {
 				lines.push("");
 				lines.push(...contentLines);
 			}
-			for (let i = 0; i < this.imageComponents.length; i++) {
-				const spacer = this.imageSpacers[i];
-				if (spacer) {
-					lines.push(...spacer.render(width));
-				}
-				const imageComponent = this.imageComponents[i];
-				if (imageComponent) {
-					lines.push(...imageComponent.render(width));
-				}
+			for (let i = 1; i < parts.length; i++) {
+				lines.push(...parts[i]!);
 			}
-			return lines;
+			this.selfRenderParts = parts;
+			this.selfRenderLines =
+				contentLines.length === 0 && this.imageComponents.length === 0 ? this.emptyLines : lines;
+			return this.selfRenderLines;
 		}
 
-		return super.render(width);
+		return super.renderShared(width);
 	}
 
 	override handleMouse(event: TuiMouseEvent): ReturnType<Container["handleMouse"]> {
@@ -398,6 +435,7 @@ export class ToolExecutionComponent extends Container {
 		if (this.hasRendererDefinition() && !hasContent && this.imageComponents.length === 0) {
 			this.hideComponent = true;
 		}
+		reportRenderChange(this);
 	}
 
 	private getTextOutput(): string {
@@ -417,3 +455,5 @@ export class ToolExecutionComponent extends Container {
 		return text;
 	}
 }
+
+markReportsChanges(ToolExecutionComponent);

@@ -29,10 +29,39 @@ function isSupportedModelType(model: { type?: unknown }): boolean {
 	);
 }
 
-function mergeModels<TModel extends AnyModel>(baseline: readonly TModel[], dynamic: readonly TModel[]): TModel[] {
+function mergeModels<TModel extends AnyModel>(
+	baseline: readonly TModel[],
+	dynamic: readonly TModel[],
+): readonly TModel[] {
+	// Nothing to merge in (no catalog newer than the built-in one): the provider's models as they are.
+	if (dynamic.length === 0) return baseline;
 	const merged = new Map<string, TModel>();
 	for (const model of [...baseline, ...dynamic]) merged.set(`${getModelType(model)}\0${model.id}`, model);
 	return [...merged.values()];
+}
+
+function sameModels(a: readonly AnyModel[], b: readonly AnyModel[]): boolean {
+	if (a.length !== b.length) return false;
+	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+	return true;
+}
+
+/**
+ * mergeModels(), done again only when what it merges has changed: Pi asks every provider for its models hundreds of times as
+ * it starts. The provider's models are compared one by one (they come in an array of their own each time); the dynamic ones
+ * change only by being replaced. Each caller gets an array of its own.
+ */
+function memoizedMerge<TModel extends AnyModel>(): (
+	baseline: readonly TModel[],
+	dynamic: readonly AnyModel[],
+) => TModel[] {
+	let last: { baseline: readonly TModel[]; dynamic: readonly AnyModel[]; merged: readonly TModel[] } | undefined;
+	return (baseline, dynamic) => {
+		if (!last || last.dynamic !== dynamic || !sameModels(last.baseline, baseline)) {
+			last = { baseline, dynamic, merged: mergeModels(baseline, dynamic as readonly TModel[]) };
+		}
+		return [...last.merged];
+	};
 }
 
 function parseCatalog(providerId: string, value: unknown): AnyModel[] {
@@ -107,15 +136,21 @@ export function withRemoteCatalog(
 	localGeneratedAt?: number,
 ): Provider {
 	let dynamicModels: readonly AnyModel[] = [];
+	// (The chat models of the dynamic ones, kept as long as they are.)
+	let dynamicChat: { of: readonly AnyModel[]; models: readonly AnyModel[] } | undefined;
+	const dynamicChatModels = () => {
+		if (dynamicChat?.of !== dynamicModels) {
+			dynamicChat = { of: dynamicModels, models: dynamicModels.filter((model) => isModelType(model, "chat")) };
+		}
+		return dynamicChat.models;
+	};
+	const mergeChat = memoizedMerge<ReturnType<Provider["getModels"]>[number]>();
+	const mergeAll = memoizedMerge<AnyModel>();
 
 	return {
 		...provider,
-		getModels: () =>
-			mergeModels(
-				provider.getModels(),
-				dynamicModels.filter((model) => isModelType(model, "chat")),
-			),
-		getAllModels: () => mergeModels(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
+		getModels: () => mergeChat(provider.getModels(), dynamicChatModels()),
+		getAllModels: () => mergeAll(provider.getAllModels?.() ?? provider.getModels(), dynamicModels),
 		refreshModels: async (context) => {
 			const stored = context.stored;
 			const restored = remoteModels(stored, localGeneratedAt).filter((model) => model.provider === provider.id);

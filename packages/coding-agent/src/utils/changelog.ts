@@ -176,6 +176,18 @@ export function compareVersions(v1: ChangelogEntry, v2: ChangelogEntry): number 
 	return v1.patch - v2.patch;
 }
 
+function parseVersion(version: string): ChangelogEntry {
+	const parts = version.split(".").map(Number);
+	return { major: parts[0] || 0, minor: parts[1] || 0, patch: parts[2] || 0, content: "" };
+}
+
+/**
+ * Whether `version` is `other` or newer (major.minor.patch, as getNewEntries compares them).
+ */
+export function isVersionAtLeast(version: string, other: string): boolean {
+	return compareVersions(parseVersion(version), parseVersion(other)) >= 0;
+}
+
 /**
  * Get entries newer than lastVersion
  */

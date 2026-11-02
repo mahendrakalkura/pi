@@ -10,6 +10,14 @@ function createFakeTui(): TUI {
 	return { requestRender: () => {} } as unknown as TUI;
 }
 
+// A box-table data row splits into cells around "│"; drop the two empty ends.
+function rowCells(line: string): string[] {
+	return line
+		.split("│")
+		.slice(1, -1)
+		.map((cell) => cell.trim());
+}
+
 describe("model selector", () => {
 	let harness: Harness | undefined;
 
@@ -34,51 +42,98 @@ describe("model selector", () => {
 			],
 		});
 		const currentModel = harness.getModel("current-model")!;
+		const browsedModel = harness.getModel("browsed-model")!;
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
 			currentModel,
 			harness.session.modelRuntime,
-			[],
+			[{ model: currentModel }, { model: browsedModel }],
 			() => {},
 			() => {},
 		);
 
-		const getModelRow = (id: string): string | undefined =>
-			stripAnsi(selector.render(120).join("\n"))
+		// The marker cell is the first cell of the box-table row.
+		const getModelRow = (id: string): string | undefined => {
+			const line = stripAnsi(selector.render(120).join("\n"))
 				.split("\n")
-				.find((line) => line.includes(`${id} [`))
-				?.trimEnd();
+				.find((candidate) => candidate.includes(` ${id} `));
+			return line ? rowCells(line)[0] : undefined;
+		};
 
-		expect(getModelRow("current-model")).toBe(`→ ✓ current-model [${currentModel.provider}]`);
-		selector.handleInput("\x1b[B");
-		expect(getModelRow("current-model")).toBe(`  ✓ current-model [${currentModel.provider}]`);
-		expect(getModelRow("browsed-model")).toBe(`→   browsed-model [${currentModel.provider}]`);
+		expect(getModelRow("current-model")).toBe("→ ✓");
+		selector.handleInput("\x1b[A");
+		expect(getModelRow("current-model")).toBe("✓");
+		expect(getModelRow("browsed-model")).toBe("→");
 		selector.dispose();
 	});
 
-	// #5916
-	it("shows model names that differ from the ID", async () => {
+	it("stops at the list ends instead of wrapping", async () => {
 		harness = await createHarness({
 			models: [
-				{ id: "minimax/minimax-m3", name: "MiniMax M3 [parasail]" },
-				{ id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" },
+				{ id: "current-model", name: "Current Model", reasoning: true },
+				{ id: "browsed-model", name: "Browsed Model", reasoning: true },
 			],
 		});
-		const provider = harness.getModel("minimax/minimax-m3")!.provider;
+		const currentModel = harness.getModel("current-model")!;
+		const browsedModel = harness.getModel("browsed-model")!;
 		const selector = new ModelSelectorComponent(
 			createFakeTui(),
-			undefined,
+			currentModel,
 			harness.session.modelRuntime,
-			[],
+			[{ model: currentModel }, { model: browsedModel }],
 			() => {},
 			() => {},
 		);
 
-		const rows = stripAnsi(selector.render(120).join("\n"))
-			.split("\n")
-			.map((line) => line.slice(4).trimEnd());
-		expect(rows).toContain(`minimax/minimax-m3 (MiniMax M3 [parasail]) [${provider}]`);
-		expect(rows).toContain(`claude-sonnet-4-5 [${provider}]`);
+		const getModelRow = (id: string): string | undefined => {
+			const line = stripAnsi(selector.render(120).join("\n"))
+				.split("\n")
+				.find((candidate) => candidate.includes(` ${id} `));
+			return line ? rowCells(line)[0] : undefined;
+		};
+
+		// Sorted list is [browsed-model, current-model]; selection starts on current-model (bottom).
+		// Down at the bottom stays at the bottom.
+		selector.handleInput("\x1b[B");
+		expect(getModelRow("current-model")).toBe("→ ✓");
+		// Up moves to the top; up again at the top stays at the top.
+		selector.handleInput("\x1b[A");
+		expect(getModelRow("browsed-model")).toBe("→");
+		selector.handleInput("\x1b[A");
+		expect(getModelRow("browsed-model")).toBe("→");
+		selector.dispose();
+	});
+
+	it("renders every scoped model without scope controls or status lines", async () => {
+		const models = Array.from({ length: 12 }, (_, index) => ({
+			id: `model-${String(index).padStart(2, "0")}`,
+			name: `Model ${index}`,
+			reasoning: true,
+		}));
+		harness = await createHarness({
+			models: [...models, { id: "catalog-only", name: "Catalog Only", reasoning: true }],
+		});
+		const scopedModels = models.map(({ id }) => ({ model: harness!.getModel(id)! }));
+		const selector = new ModelSelectorComponent(
+			createFakeTui(),
+			scopedModels[0].model,
+			harness.session.modelRuntime,
+			scopedModels,
+			() => {},
+			() => {},
+		);
+
+		selector.handleInput("\t");
+		const rendered = stripAnsi(selector.render(160).join("\n"));
+		for (const { id } of models) expect(rendered).toContain(id);
+		expect(rendered).not.toContain("catalog-only");
+		expect(rendered).toContain("Model");
+		expect(rendered).toContain("Provider");
+		expect(rendered).toContain("Default");
+		expect(rendered).not.toContain("Scope:");
+		expect(rendered).not.toContain("(1/12)");
+		expect(rendered).not.toContain("Model Name:");
+		expect(rendered).not.toContain("Model catalogs refreshed.");
 		selector.dispose();
 	});
 

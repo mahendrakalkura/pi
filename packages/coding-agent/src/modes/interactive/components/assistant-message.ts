@@ -2,9 +2,14 @@ import type { AssistantMessage } from "@earendil-works/pi-ai";
 import {
 	type Component,
 	Container,
+	LiveLineArray,
+	type LiveLines,
 	Markdown,
 	type MarkdownTheme,
 	MouseRegion,
+	markLiveRender,
+	markReportsChanges,
+	reportRenderChange,
 	Spacer,
 	Text,
 } from "@earendil-works/pi-tui";
@@ -25,6 +30,16 @@ interface MarkdownSlot {
 	markdown: Markdown;
 }
 
+/** Whether `text` contains one of `names` (lowercase), ignoring case. */
+export function mentionsAny(text: string, names: ReadonlySet<string>): boolean {
+	if (names.size === 0 || text === "") return false;
+	const lower = text.toLowerCase();
+	for (const name of names) {
+		if (lower.includes(name)) return true;
+	}
+	return false;
+}
+
 /**
  * Component that renders a complete assistant message
  */
@@ -40,6 +55,11 @@ export class AssistantMessageComponent extends Container {
 	private isStreaming = false;
 	private messageId?: string;
 	private timestamp?: string;
+	private contentIsStale = false;
+	private markedFrom?: string[];
+	private markedLines: string[] = [];
+	/** renderLive()'s lines: the children's live lines with the prompt markers added, and what they were made from. */
+	private markedLive?: { from: LiveLines; revision: number; length: number; lines: LiveLineArray };
 	private thinkingVisibilityOverrides = new Map<number, boolean>();
 	private markdownSlots: MarkdownSlot[] = [];
 
@@ -79,6 +99,19 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
+	/**
+	 * Whether this message may show code highlighted in one of `languages` (lowercase names): whether its text names one
+	 * of them anywhere, which every code block in that language does. Markdown transformers (extensions) may add any.
+	 */
+	mayHighlight(languages: ReadonlySet<string>): boolean {
+		if (this.markdownTransformers.length > 0) return true;
+		const content = this.lastMessage?.content ?? [];
+		return content.some((block) => {
+			const text = block.type === "text" ? block.text : block.type === "thinking" ? block.thinking : "";
+			return mentionsAny(text, languages);
+		});
+	}
+
 	setHideThinkingBlock(hide: boolean): void {
 		this.hideThinkingBlock = hide;
 		this.thinkingVisibilityOverrides.clear();
@@ -103,21 +136,74 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 
-	override render(width: number): string[] {
-		const lines = super.render(width);
+	override renderShared(width: number): string[] {
+		if (this.contentIsStale && this.lastMessage) this.buildContent(this.lastMessage);
+		const lines = super.renderShared(width);
 		if (this.hasToolCalls || lines.length === 0) {
 			return lines;
 		}
+		// The marked lines are kept with the lines they were made from: same lines, same array (renderShared()).
+		if (lines !== this.markedFrom) {
+			const marked = lines.slice();
+			marked[0] = OSC133_ZONE_START + marked[0];
+			marked[marked.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + marked[marked.length - 1];
+			this.markedFrom = lines;
+			this.markedLines = marked;
+		}
+		return this.markedLines;
+	}
 
-		lines[0] = OSC133_ZONE_START + lines[0];
-		lines[lines.length - 1] = OSC133_ZONE_END + OSC133_ZONE_FINAL + lines[lines.length - 1];
-		return lines;
+	/**
+	 * renderShared()'s lines as LiveLines (renderLiveLines()): the children's live lines with the prompt markers added,
+	 * changed from the first line the children's lines changed from (and the line that was last before).
+	 */
+	renderLive(width: number): LiveLines {
+		if (this.contentIsStale && this.lastMessage) this.buildContent(this.lastMessage);
+		const children = this.renderLiveChildren(width);
+		const count = children.lines.length;
+		if (this.hasToolCalls || count === 0) {
+			return children;
+		}
+		let marked = this.markedLive;
+		let start = 0;
+		if (marked?.from === children) {
+			const changed = children.changedSince(marked.revision);
+			if (changed === Number.POSITIVE_INFINITY) return marked.lines;
+			// (The line that was last loses its end marker, and the line now last gets it.)
+			start = Math.min(changed, marked.length - 1, count - 1);
+		} else {
+			marked = { from: children, revision: 0, length: 0, lines: new LiveLineArray() };
+			this.markedLive = marked;
+		}
+		start = Math.max(0, start);
+		marked.lines.edit(start);
+		for (let index = start; index < count; index++) {
+			let line = children.lines[index]!;
+			if (index === 0) line = OSC133_ZONE_START + line;
+			if (index === count - 1) line = OSC133_ZONE_END + OSC133_ZONE_FINAL + line;
+			marked.lines.lines.push(line);
+		}
+		marked.revision = children.revision;
+		marked.length = count;
+		return marked.lines;
 	}
 
 	updateContent(message: AssistantMessage, isStreaming = this.isStreaming): void {
 		this.lastMessage = message;
 		this.isStreaming = isStreaming;
+		reportRenderChange(this);
+		// While a reply streams, every delta of it comes here, and the screen is drawn a few dozen times a second at most: the
+		// components are made when it is (render()), from the latest message, not for each delta (and its text trimmed, a
+		// copy of all of it so far, each time).
+		if (isStreaming) {
+			this.contentIsStale = true;
+			return;
+		}
+		this.buildContent(message);
+	}
 
+	private buildContent(message: AssistantMessage): void {
+		this.contentIsStale = false;
 		// Clear content container
 		this.contentContainer.clear();
 		const previousSlots = this.markdownSlots;
@@ -163,6 +249,7 @@ export class AssistantMessageComponent extends Container {
 									this.messageId,
 									this.timestamp,
 								),
+								complete: !this.isStreaming,
 							}),
 					),
 				);
@@ -214,6 +301,7 @@ export class AssistantMessageComponent extends Container {
 											this.messageId,
 											this.timestamp,
 										),
+										complete: !this.isStreaming,
 									},
 								),
 						);
@@ -257,3 +345,8 @@ export class AssistantMessageComponent extends Container {
 		}
 	}
 }
+
+markReportsChanges(AssistantMessageComponent);
+markLiveRender(AssistantMessageComponent.prototype.renderShared, function (this: Component, width: number) {
+	return (this as AssistantMessageComponent).renderLive(width);
+});

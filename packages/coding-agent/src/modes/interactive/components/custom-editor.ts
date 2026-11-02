@@ -13,6 +13,8 @@ export type CustomEditorOptions = EditorOptions & {
 export class CustomEditor extends Editor {
 	private keybindings: KeybindingsManager;
 	private workingStatusIndicator: StatusIndicator | undefined;
+	/** The status last drawn in the border and its width: the same text on every frame between spinner ticks. */
+	private borderStatus = { text: "", width: 0 };
 	public readonly embedWorkingStatus: boolean;
 	public actionHandlers: Map<AppKeybinding, () => void> = new Map();
 
@@ -39,7 +41,8 @@ export class CustomEditor extends Editor {
 		}
 
 		let status = this.workingStatusIndicator.renderInBorder(Math.max(1, width - 5));
-		let statusWidth = visibleWidth(status);
+		if (status !== this.borderStatus.text) this.borderStatus = { text: status, width: visibleWidth(status) };
+		let statusWidth = this.borderStatus.width;
 		if (statusWidth === 0) return super.renderTopBorder(width, hiddenLineCount);
 
 		const overflowLabel = hiddenLineCount > 0 ? ` ↑ ${hiddenLineCount} more ` : undefined;

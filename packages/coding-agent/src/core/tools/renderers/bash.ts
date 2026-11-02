@@ -14,6 +14,7 @@ import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/t
 import type { BashToolDetails } from "../bash.ts";
 import { getTextOutput, invalidArgText, startToolTimer, str, toolTimerText } from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
+import { declarePlainRenderers } from "./highlighting.ts";
 
 const BASH_PREVIEW_LINES = 5;
 export const BASH_UPDATE_THROTTLE_MS = 100;
@@ -47,18 +48,17 @@ function rebuildBashResultRenderComponent(
 	}
 
 	if (output) {
-		const styledOutput = output
-			.split("\n")
-			.map((line) => theme.fg("toolOutput", line))
-			.join("\n");
-
+		const styleLine = (line: string) => theme.fg("toolOutput", line);
 		if (options.expanded) {
+			const styledOutput = output.split("\n").map(styleLine).join("\n");
 			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
 		} else {
+			// (Collapsed: only the lines shown are styled and wrapped.)
 			component.addChild(new Spacer(1));
 			component.addChild(
 				new VisualLinePreview({
-					text: styledOutput,
+					lines: output.split("\n"),
+					styleLine,
 					maxVisualLines: BASH_PREVIEW_LINES,
 					keep: "end",
 					formatHint: (hidden) =>
@@ -91,7 +91,7 @@ function rebuildBashResultRenderComponent(
 
 /** Shell renderers are shared by bash and powershell, which differ only in the prompt they display. */
 export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> {
-	return {
+	const renderers: Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> = {
 		renderCall(args, _theme, context) {
 			startToolTimer(context);
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
@@ -106,4 +106,6 @@ export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, a
 			return component;
 		},
 	};
+	declarePlainRenderers(renderers);
+	return renderers;
 }

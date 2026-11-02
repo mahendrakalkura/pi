@@ -8,7 +8,7 @@ import {
 	imageFallback,
 	renderImage,
 } from "../terminal-image.ts";
-import type { Component } from "../tui.ts";
+import { type Component, markReportsChanges, markStableRender, reportRenderChange } from "../tui.ts";
 import { truncateToWidth } from "../utils.ts";
 
 /**
@@ -88,6 +88,7 @@ export class Image implements Component {
 	invalidate(): void {
 		this.cachedLines = undefined;
 		this.cachedWidth = undefined;
+		reportRenderChange(this);
 	}
 
 	render(width: number): string[] {
@@ -165,3 +166,6 @@ export class Image implements Component {
 		return lines;
 	}
 }
+
+markStableRender(Image);
+markReportsChanges(Image);
