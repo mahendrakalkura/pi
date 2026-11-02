@@ -2,7 +2,15 @@ import { Lexer, Marked, type Token, Tokenizer, type TokenizerExtension, type Tok
 import markedCjkFriendly from "marked-cjk-friendly";
 import { renderLatex } from "../latex.ts";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
-import { type Component, LiveLineArray, type LiveLines, markLiveRender, markStableRender } from "../tui.ts";
+import {
+	type Component,
+	LiveLineArray,
+	type LiveLines,
+	markLiveRender,
+	markReportsChanges,
+	markStableRender,
+	reportRenderChange,
+} from "../tui.ts";
 import { applyBackgroundToLine, cjkPunctuationRegex, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
@@ -761,6 +769,7 @@ export class Markdown implements Component {
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
+		reportRenderChange(this);
 	}
 
 	/** The tokens of the text at `width` (after the transform and tab replacement), or undefined when it has no text. */
@@ -883,7 +892,10 @@ export class Markdown implements Component {
 		this.cachedWidth = width;
 		this.cachedLines = result;
 
-		return result.length > 0 || rendered ? result : [""];
+		if (result.length > 0 || rendered) return result;
+		// (The next render returns none: a change, for containers that render this again only when told.)
+		reportRenderChange(this);
+		return [""];
 	}
 
 	/**
@@ -954,6 +966,8 @@ export class Markdown implements Component {
 			lines.edit(0);
 			lines.lines.push("");
 			live.substituted = true;
+			// (The next render returns none: a change, for containers that render this again only when told.)
+			reportRenderChange(this);
 		}
 		return lines;
 	}
@@ -1696,6 +1710,7 @@ export class Markdown implements Component {
 }
 
 markStableRender(Markdown);
+markReportsChanges(Markdown);
 markLiveRender(Markdown.prototype.render, function (this: Component, width: number) {
 	return (this as Markdown).renderLive(width);
 });

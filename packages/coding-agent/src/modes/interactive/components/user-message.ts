@@ -1,4 +1,4 @@
-import { Container, Markdown, type MarkdownTheme } from "@earendil-works/pi-tui";
+import { Container, Markdown, type MarkdownTheme, markReportsChanges } from "@earendil-works/pi-tui";
 import type { MarkdownTransformer } from "../../../core/extensions/types.ts";
 import { getMarkdownTheme, theme } from "../theme/theme.ts";
 import { mentionsAny } from "./assistant-message.ts";
@@ -95,3 +95,5 @@ export class UserMessageComponent extends Container {
 		return this.markedLines;
 	}
 }
+
+markReportsChanges(UserMessageComponent);
