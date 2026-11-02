@@ -3,7 +3,7 @@ import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
 import { VStack } from "./components/v-stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
 import { cropKittyImageLine, getKittyImageMetadata, getMaxKittyImageRows, isImageLine } from "./terminal-image.ts";
-import { type Component, CURSOR_MARKER, compositeTuiLine, renderSharedLines } from "./tui.ts";
+import { type Component, CURSOR_MARKER, compositeTuiLine, renderLiveLines, renderSharedLines } from "./tui.ts";
 import {
 	extractAnsiCode,
 	getActiveBackgroundAnsi,
@@ -53,7 +53,7 @@ export interface ScrollbarGeometry {
 
 interface LayoutContext {
 	viewport: { width: number; height: number };
-	renderCache: Map<Component, Map<number, string[]>>;
+	renderCache: Map<Component, Map<number, readonly string[]>>;
 	requestRender: () => void;
 	primaryScrollView: ScrollView | undefined;
 }
@@ -66,17 +66,18 @@ function intersect(a: LayoutRect, b: LayoutRect): LayoutRect {
 	return { x, y, width: Math.max(0, right - x), height: Math.max(0, bottom - y) };
 }
 
-function renderCached(context: LayoutContext, component: Component, width: number): string[] {
+function renderCached(context: LayoutContext, component: Component, width: number): readonly string[] {
 	const safeWidth = Math.max(1, Math.floor(width));
 	let widths = context.renderCache.get(component);
 	if (!widths) {
-		widths = new Map<number, string[]>();
+		widths = new Map<number, readonly string[]>();
 		context.renderCache.set(component, widths);
 	}
 	let lines = widths.get(safeWidth);
 	if (!lines) {
-		// (Shared lines: layout only reads them.)
-		lines = renderSharedLines(component, safeWidth);
+		// (Shared lines, or live lines that change at the next render: the layout reads them for this frame only, and the
+		// frame's boxes until the next one is laid out.)
+		lines = renderLiveLines(component, safeWidth)?.lines ?? renderSharedLines(component, safeWidth);
 		widths.set(safeWidth, lines);
 	}
 	return lines;

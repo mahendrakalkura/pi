@@ -2,7 +2,7 @@ import { Lexer, Marked, type Token, Tokenizer, type TokenizerExtension, type Tok
 import markedCjkFriendly from "marked-cjk-friendly";
 import { renderLatex } from "../latex.ts";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
-import { type Component, markStableRender } from "../tui.ts";
+import { type Component, LiveLineArray, type LiveLines, markLiveRender, markStableRender } from "../tui.ts";
 import { applyBackgroundToLine, cjkPunctuationRegex, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
@@ -392,6 +392,12 @@ function lastBlockSettlesOneBefore(tokens: readonly Token[], before: number, las
 }
 
 /**
+ * For tokens lexed from those of a shorter source (lexAddedMarkdown()): those tokens, and how many leading tokens the two
+ * have in common (the same objects). Held weakly: the shorter source's tokens are not needed once these are rendered.
+ */
+const lexedFrom = new WeakMap<Token[], { tokens: WeakRef<Token[]>; shared: number }>();
+
+/**
  * The tokens of `source`, which is `previous.source` with text added at its end. Where a top-level block ends depends on the
  * line that follows it and on nothing after that line. The last block may still be on its first line ("2" turning into "2."
  * makes it an item of the list before it), so the block before it is not settled either: the blocks before those two are
@@ -456,7 +462,11 @@ function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | un
 		length += token.raw.length;
 	}
 	// (As in lexMarkdown(): the next time, each token has to begin where the ones before it add up to.)
-	return length === source.length ? tokens : undefined;
+	if (length !== source.length) {
+		return undefined;
+	}
+	lexedFrom.set(tokens, { tokens: new WeakRef(previous.tokens), shared });
+	return tokens;
 }
 
 /**
@@ -661,6 +671,19 @@ export class Markdown implements Component {
 	 */
 	private wraps = new Map<number, Map<string, readonly string[]>>();
 	private nextWraps = new Map<number, Map<string, readonly string[]>>();
+	/**
+	 * What renderLive() holds: the lines, the text and width they are for, the tokens their blocks were rendered from and
+	 * where each block's lines end (not counting the padding), and whether the lines are the empty line render() returns for
+	 * an empty result.
+	 */
+	private live: {
+		array: LiveLineArray;
+		text?: string;
+		width?: number;
+		tokens?: Token[];
+		ends: number[];
+		substituted: boolean;
+	} = { array: new LiveLineArray(), ends: [], substituted: false };
 	// The last render's top-level blocks. While a message streams only its last block changes, so a render styles and
 	// wraps only that block. Each render keeps only the blocks it used, which drops a streamed block's earlier versions.
 	// Held weakly like the tokens: the blocks repeat the source in their keys and the code in their highlighting, and
@@ -695,6 +718,9 @@ export class Markdown implements Component {
 		// The theme may have changed, which changes every styled line and the default style's prefix.
 		this.blocks = undefined;
 		this.defaultStylePrefix = undefined;
+		// (What renderLive() kept is for the theme before this: it is rendered again from nothing.)
+		this.live.tokens = undefined;
+		this.live.ends.length = 0;
 	}
 
 	private clearRenderCache(): void {
@@ -703,25 +729,15 @@ export class Markdown implements Component {
 		this.cachedLines = undefined;
 	}
 
-	render(width: number): string[] {
-		// Check cache
-		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
-			return this.cachedLines;
-		}
-
+	/** The tokens of the text at `width` (after the transform and tab replacement), or undefined when it has no text. */
+	private tokensFor(width: number): { tokens: TokensList; contentWidth: number } | undefined {
 		// Calculate available width for content (subtract horizontal padding)
 		const contentWidth = Math.max(1, width - this.paddingX * 2);
 		const text = this.options.transform?.(this.text, contentWidth) ?? this.text;
 
 		// Don't render anything if there's no actual text
 		if (!text || !/\S/.test(text)) {
-			this.blocks = undefined;
-			const result: string[] = [];
-			// Update cache
-			this.cachedText = this.text;
-			this.cachedWidth = width;
-			this.cachedLines = result;
-			return result;
+			return undefined;
 		}
 
 		// Replace tabs with 3 spaces for consistent rendering
@@ -734,16 +750,52 @@ export class Markdown implements Component {
 			tokens = lexMarkdown(normalizedText, this.options.complete);
 			this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
 		}
+		return { tokens, contentWidth };
+	}
 
+	/** The empty lines above and below the content. */
+	private paddingLines(width: number): string[] {
+		const bgFn = this.defaultTextStyle?.bgColor;
+		const emptyLine = " ".repeat(width);
+		const emptyLines: string[] = [];
+		for (let i = 0; i < this.paddingY; i++) {
+			const line = bgFn ? applyBackgroundToLine(emptyLine, width, bgFn) : emptyLine;
+			emptyLines.push(line);
+		}
+		// (The lines of the blocks are flat already: renderBlock().)
+		flattenLines(emptyLines);
+		return emptyLines;
+	}
+
+	/** Keeps the lines wrapped by this render, if it rendered any blocks (wrapLine()). */
+	private keepWraps(): void {
+		if (this.nextWraps.size > 0) {
+			this.wraps = this.nextWraps;
+			this.nextWraps = new Map();
+		}
+	}
+
+	/**
+	 * Renders the top-level blocks of `tokens` from `from` on into `lines`, whose first lines are the padding and the
+	 * blocks before `from`, and records in `ends` the number of content lines up to and including each block.
+	 */
+	private renderBlocksInto(
+		tokens: TokensList,
+		from: number,
+		width: number,
+		contentWidth: number,
+		lines: string[],
+		ends: number[],
+	): void {
 		// A reference link resolves through a definition anywhere in the text, so blocks with the same source can render
 		// differently; such texts are rare in practice and render without reusing blocks.
 		const reuseBlocks = Object.keys(tokens.links).length === 0;
 		const previousBlocks = this.blocks?.deref();
 		const blocks = new Map<string, RenderedBlock>();
 		this.blocks = new WeakRef(blocks);
-		const contentLines: string[] = [];
-		for (let i = 0; i < tokens.length; i++) {
-			const token = tokens[i];
+		let contentLength = from > 0 ? ends[from - 1]! : 0;
+		for (let i = from; i < tokens.length; i++) {
+			const token = tokens[i]!;
 			const nextTokenType = tokens[i + 1]?.type;
 			const reused = reuseBlocks ? (blocks.get(token.raw) ?? previousBlocks?.get(token.raw)) : undefined;
 			const block = reused ?? { width: -1, nextTokenType, lines: [], highlightedCode: new Map() };
@@ -752,35 +804,120 @@ export class Markdown implements Component {
 			}
 			if (reuseBlocks) blocks.set(token.raw, block);
 			for (const line of block.lines) {
-				contentLines.push(line);
+				lines.push(line);
 			}
+			contentLength += block.lines.length;
+			ends.push(contentLength);
 		}
+	}
 
-		// Add top/bottom padding (empty lines)
-		const bgFn = this.defaultTextStyle?.bgColor;
-		const emptyLine = " ".repeat(width);
-		const emptyLines: string[] = [];
-		for (let i = 0; i < this.paddingY; i++) {
-			const line = bgFn ? applyBackgroundToLine(emptyLine, width, bgFn) : emptyLine;
-			emptyLines.push(line);
+	render(width: number): string[] {
+		// Check cache
+		if (this.cachedLines && this.cachedText === this.text && this.cachedWidth === width) {
+			return this.cachedLines;
 		}
-		flattenLines(emptyLines);
+		// (Rendered last as live lines, for the same text and width: what that render would have kept, with nothing in its
+		// place for an empty result.)
+		const rendered = this.cachedText === this.text && this.cachedWidth === width;
+
+		const prepared = this.tokensFor(width);
+		if (!prepared) {
+			this.blocks = undefined;
+			const result: string[] = [];
+			// Update cache
+			this.cachedText = this.text;
+			this.cachedWidth = width;
+			this.cachedLines = result;
+			return result;
+		}
+		const { tokens, contentWidth } = prepared;
+
+		const contentLines: string[] = [];
+		this.renderBlocksInto(tokens, 0, width, contentWidth, contentLines, []);
 
 		// Combine top padding, content, and bottom padding
+		const emptyLines = this.paddingLines(width);
 		const result = emptyLines.concat(contentLines, emptyLines);
-
-		// The wrapped lines kept are those of this render's blocks (a render that rendered none keeps the last ones).
-		if (this.nextWraps.size > 0) {
-			this.wraps = this.nextWraps;
-			this.nextWraps = new Map();
-		}
+		this.keepWraps();
 
 		// Update cache
 		this.cachedText = this.text;
 		this.cachedWidth = width;
 		this.cachedLines = result;
 
-		return result.length > 0 ? result : [""];
+		return result.length > 0 || rendered ? result : [""];
+	}
+
+	/**
+	 * render()'s lines as LiveLines (renderLiveLines()): changed in place from the first line of the first block rendered
+	 * again. While a reply streams in, its text is lexed from the tokens of the text before (lexMarkdown()), and the lines
+	 * of the blocks the two have in common are the lines of this component's last render: only the blocks lexed again are
+	 * rendered and added, so a chunk does not cost time in proportion to the length of the reply. What it holds after each
+	 * call is what render() returns for the call.
+	 */
+	renderLive(width: number): LiveLines {
+		const live = this.live;
+		const lines = live.array;
+		const rendered = this.cachedText === this.text && this.cachedWidth === width;
+		if (rendered && live.text === this.text && live.width === width) {
+			// What render() returns when nothing changed: the result kept, not the line in place of an empty one.
+			if (live.substituted) {
+				lines.edit(0);
+				live.substituted = false;
+			}
+			return lines;
+		}
+
+		const prepared = this.tokensFor(width);
+		// (The lines kept are for the width before this one: another width renders every block again.)
+		const sameWidth = live.width === width;
+		live.text = this.text;
+		live.width = width;
+		this.cachedText = this.text;
+		this.cachedWidth = width;
+		this.cachedLines = undefined;
+		if (!prepared) {
+			if (lines.lines.length > 0) lines.edit(0);
+			live.tokens = undefined;
+			live.substituted = false;
+			return lines;
+		}
+		const { tokens, contentWidth } = prepared;
+		const before = live.tokens;
+		const sameContent = markdownCaching && before !== undefined && !live.substituted && sameWidth;
+		if (!(sameContent && before === tokens)) {
+			let reused = 0;
+			const from = sameContent ? lexedFrom.get(tokens) : undefined;
+			if (from && before !== undefined && from.tokens.deref() === before) {
+				reused = from.shared;
+				// (The lines of a block depend on the type of the block after it.)
+				if (reused > 0 && tokens[reused]?.type !== before[reused]?.type) {
+					reused--;
+				}
+			}
+			const padding = this.paddingLines(width);
+			const ends = live.ends;
+			if (reused > 0) {
+				lines.edit(padding.length + ends[reused - 1]!);
+				ends.length = reused;
+			} else {
+				lines.edit(0);
+				ends.length = 0;
+				for (const line of padding) lines.lines.push(line);
+			}
+			this.renderBlocksInto(tokens, reused, width, contentWidth, lines.lines, ends);
+			for (const line of padding) lines.lines.push(line);
+			this.keepWraps();
+		}
+		live.tokens = tokens;
+		live.substituted = false;
+		if (lines.lines.length === 0 && !rendered) {
+			// (As render(): an empty result is returned as one empty line, and kept as none.)
+			lines.edit(0);
+			lines.lines.push("");
+			live.substituted = true;
+		}
+		return lines;
 	}
 
 	/**
@@ -1511,3 +1648,6 @@ export class Markdown implements Component {
 }
 
 markStableRender(Markdown);
+markLiveRender(Markdown.prototype.render, function (this: Component, width: number) {
+	return (this as Markdown).renderLive(width);
+});
