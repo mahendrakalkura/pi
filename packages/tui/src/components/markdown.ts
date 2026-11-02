@@ -206,6 +206,124 @@ markdownParser.use({
 	extensions: [...LATEX_MARKDOWN_EXTENSIONS],
 });
 
+interface LexedMarkdown {
+	source: string;
+	tokens: TokensList;
+	/** Whether lexing can go on from these tokens when text is added to the source. */
+	resumable: boolean;
+}
+
+/** The sources lexed last, most recent last: a message that is streaming in is lexed again each time it grows. */
+const lexedMarkdown: LexedMarkdown[] = [];
+const LEXED_MARKDOWN_KEPT = 8;
+
+let markdownCaching = true;
+
+/** For tests: with caching off, every render lexes and renders all of its text, taking and keeping nothing. */
+export function setMarkdownCachingForTest(enabled: boolean): void {
+	markdownCaching = enabled;
+}
+
+function hasLinkDefinitions(tokens: Token[]): boolean {
+	const links = (tokens as Partial<{ links: Record<string, unknown> }>).links;
+	return links !== undefined && Object.keys(links).length > 0;
+}
+
+/**
+ * The tokens of `source`, which is `previous.source` with text added at its end. Where a top-level block ends depends on the
+ * line that follows it and on nothing after that line. The last block may still be on its first line ("2" turning into "2."
+ * makes it an item of the list before it), so the block before it is not settled either: the blocks before those two are
+ * what they were, and the text from the last two on is lexed.
+ * Undefined when that would not give what lexing all of it gives: link definitions change how links before them read.
+ */
+function lexAddedMarkdown(previous: LexedMarkdown, source: string): Token[] | undefined {
+	let last = previous.tokens.length;
+	for (let blocks = 0; blocks < 2; blocks++) {
+		last--;
+		while (last >= 0 && previous.tokens[last].type === "space") {
+			last--;
+		}
+	}
+	if (last <= 0) {
+		return undefined;
+	}
+	let offset = 0;
+	for (let i = 0; i < last; i++) {
+		offset += previous.tokens[i].raw.length;
+	}
+	const added = markdownParser.lexer(source.slice(offset));
+	if (hasLinkDefinitions(added)) {
+		return undefined;
+	}
+	const tokens = previous.tokens.slice(0, last) as TokensList;
+	// (The list is a TokensList like the lexer's: neither the shorter source nor the added text has link definitions.)
+	tokens.links = {};
+	let length = offset;
+	for (const token of added) {
+		tokens.push(token);
+		length += token.raw.length;
+	}
+	// (As in lexMarkdown(): the next time, each token has to begin where the ones before it add up to.)
+	return length === source.length ? tokens : undefined;
+}
+
+/**
+ * Lexes Markdown, reusing what was lexed before when `source` is a source lexed earlier or one with text added at its end
+ * (a message streaming in), so that the cost of a new chunk does not grow with the length of the message.
+ */
+function lexMarkdown(source: string): TokensList {
+	if (!markdownCaching) {
+		const tokens = markdownParser.lexer(source);
+		trimPartialClosingFences(tokens);
+		return tokens;
+	}
+	let previous = -1;
+	for (let i = lexedMarkdown.length - 1; i >= 0; i--) {
+		const entry = lexedMarkdown[i];
+		if (entry.source === source) {
+			lexedMarkdown.splice(i, 1);
+			lexedMarkdown.push(entry);
+			return entry.tokens;
+		}
+		if (
+			entry.resumable &&
+			source.length > entry.source.length &&
+			(previous < 0 || entry.source.length > lexedMarkdown[previous].source.length) &&
+			source.startsWith(entry.source)
+		) {
+			previous = i;
+		}
+	}
+
+	let tokens = previous >= 0 ? lexAddedMarkdown(lexedMarkdown[previous], source) : undefined;
+	let resumable = tokens !== undefined;
+	if (!tokens) {
+		tokens = markdownParser.lexer(source);
+		let length = 0;
+		for (const token of tokens) {
+			length += token.raw.length;
+		}
+		// (The lexer rewrites line endings: only when the tokens add up to the source is it known where each begins.)
+		resumable = !hasLinkDefinitions(tokens) && length === source.length;
+	}
+	trimPartialClosingFences(tokens);
+
+	if (previous >= 0) {
+		// The shorter source is not coming back.
+		lexedMarkdown.splice(previous, 1);
+	}
+	lexedMarkdown.push({ source, tokens: tokens as TokensList, resumable });
+	if (lexedMarkdown.length > LEXED_MARKDOWN_KEPT) {
+		lexedMarkdown.shift();
+	}
+	return tokens as TokensList;
+}
+
+/** For tests: lexes as render() does. */
+export function lexMarkdownForTest(source: string): TokensList {
+	return lexMarkdown(source);
+}
+
 /**
  * Default text styling for markdown content.
  * Applied to all text unless overridden by markdown formatting.
@@ -363,8 +481,7 @@ export class Markdown implements Component {
 		const cached = this.cachedTokens?.deref();
 		let tokens = cached?.source === normalizedText ? cached.tokens : undefined;
 		if (!tokens) {
-			tokens = markdownParser.lexer(normalizedText);
-			trimPartialClosingFences(tokens);
+			tokens = lexMarkdown(normalizedText);
 			this.cachedTokens = new WeakRef({ source: normalizedText, tokens });
 		}
 
