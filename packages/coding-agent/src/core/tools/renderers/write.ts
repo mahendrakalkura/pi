@@ -23,7 +23,15 @@ type WriteHighlightCache = {
 	lang: string;
 	rawContent: string;
 	normalizedLines: string[];
+	/**
+	 * The lines highlighted. When the call is shown collapsed, only the first lines are: the lines after the ones that can
+	 * be shown are highlighted when the call is expanded (`all`), not as each one arrives and again when the file is
+	 * complete, which for a large file stops everything for as long as highlighting all of it takes.
+	 */
 	highlightedLines: string[];
+	all: boolean;
+	/** Made from the complete file, not from the pieces it arrived in. */
+	complete?: boolean;
 };
 class WriteCallRenderComponent extends Text {
 	// Line by line highlighting of a call whose content is still streaming.
@@ -38,6 +46,8 @@ class WriteCallRenderComponent extends Text {
 	}
 }
 const WRITE_PARTIAL_FULL_HIGHLIGHT_LINES = 50;
+/** The lines of a collapsed call that are shown. */
+const WRITE_COLLAPSED_LINES = 10;
 function highlightSingleLine(line: string, lang: string): string {
 	const highlighted = highlightCode(line, lang);
 	return highlighted[0] ?? "";
@@ -63,21 +73,79 @@ function rebuildWriteHighlightCacheFull(rawPath: string | null, fileContent: str
 		rawContent: fileContent,
 		normalizedLines: normalized.split("\n"),
 		highlightedLines: highlightCode(normalized, lang),
+		all: true,
 	};
 }
-function updateWriteHighlightCacheIncremental(
-	cache: WriteHighlightCache | undefined,
+/** The cache for a call shown collapsed: the first lines highlighted, as they are while the file streams in. */
+function rebuildWriteHighlightCacheCollapsed(
 	rawPath: string | null,
 	fileContent: string,
 	highlighter: CodeHighlighter,
 ): WriteHighlightCache | undefined {
 	const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
 	if (!lang) return undefined;
-	if (!cache) return rebuildWriteHighlightCacheFull(rawPath, fileContent);
-	if (cache.lang !== lang || cache.rawPath !== rawPath || !fileContent.startsWith(cache.rawContent)) {
-		return rebuildWriteHighlightCacheFull(rawPath, fileContent);
+	const cache: WriteHighlightCache = {
+		rawPath,
+		lang,
+		rawContent: fileContent,
+		normalizedLines: replaceTabs(normalizeDisplayText(fileContent)).split("\n"),
+		highlightedLines: [],
+		all: false,
+	};
+	refreshWriteHighlightPrefix(cache, highlighter);
+	cache.all = cache.normalizedLines.length <= WRITE_PARTIAL_FULL_HIGHLIGHT_LINES;
+	return cache;
+}
+/** Highlights, each on its own, the lines after the first ones that a collapsed call left unhighlighted. */
+function highlightRemainingLines(cache: WriteHighlightCache): void {
+	if (cache.all) return;
+	for (
+		let i = Math.min(WRITE_PARTIAL_FULL_HIGHLIGHT_LINES, cache.normalizedLines.length);
+		i < cache.normalizedLines.length;
+		i++
+	) {
+		cache.highlightedLines[i] = highlightSingleLine(cache.normalizedLines[i], cache.lang);
 	}
+	cache.all = true;
+}
+function updateWriteHighlightCacheIncremental(
+	cache: WriteHighlightCache | undefined,
+	rawPath: string | null,
+	fileContent: string,
+	expanded: boolean,
+	highlighter: CodeHighlighter,
+): WriteHighlightCache | undefined {
+	const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
+	if (!lang) return undefined;
+	const rebuild = (path: string | null, content: string) =>
+		expanded
+			? rebuildWriteHighlightCacheFull(path, content)
+			: rebuildWriteHighlightCacheCollapsed(path, content, highlighter);
+	if (!cache) return rebuild(rawPath, fileContent);
+	if (cache.lang !== lang || cache.rawPath !== rawPath || !fileContent.startsWith(cache.rawContent)) {
+		return rebuild(rawPath, fileContent);
+	}
+	if (expanded) highlightRemainingLines(cache);
 	if (fileContent.length === cache.rawContent.length) return cache;
+	if (!expanded) {
+		// Collapsed: the lines are kept, and the first of them highlighted.
+		const added = replaceTabs(normalizeDisplayText(fileContent.slice(cache.rawContent.length))).split("\n");
+		cache.rawContent = fileContent;
+		cache.all = false;
+		cache.complete = false;
+		if (cache.normalizedLines.length === 0) cache.normalizedLines.push("");
+		const lastLine = cache.normalizedLines.length - 1;
+		cache.normalizedLines[lastLine] += added[0];
+		cache.highlightedLines[lastLine] = highlightSingleLine(cache.normalizedLines[lastLine], cache.lang);
+		for (let i = 1; i < added.length; i++) {
+			cache.normalizedLines.push(added[i]);
+			cache.highlightedLines.push(highlightSingleLine(added[i], cache.lang));
+		}
+		refreshWriteHighlightPrefix(cache, highlighter);
+		// (While the first lines are all the lines, every line is highlighted.)
+		cache.all = cache.normalizedLines.length <= WRITE_PARTIAL_FULL_HIGHLIGHT_LINES;
+		return cache;
+	}
 
 	const deltaRaw = fileContent.slice(cache.rawContent.length);
 	const deltaDisplay = normalizeDisplayText(deltaRaw);
@@ -123,14 +191,31 @@ function formatWriteCall(
 		text += `\n\n${theme.fg("error", "[invalid content arg - expected string]")}`;
 	} else if (fileContent) {
 		const lang = rawPath ? getLanguageFromPath(rawPath) : undefined;
-		const renderedLines = lang
-			? (cache?.highlightedLines ?? highlighter.highlight(replaceTabs(normalizeDisplayText(fileContent)), lang))
-			: normalizeDisplayText(fileContent).split("\n");
-		const lines = trimTrailingEmptyLines(renderedLines);
-		const totalLines = lines.length;
-		const maxLines = options.expanded ? lines.length : 10;
-		const displayLines = lines.slice(0, maxLines);
-		const remaining = lines.length - maxLines;
+		let totalLines: number;
+		let displayLines: string[];
+		if (lang && cache && !cache.all && !options.expanded) {
+			// Collapsed, with only the first lines highlighted. The lines are counted as they are when all are
+			// highlighted: without the empty lines at the end, unless an empty line is not empty once highlighted (in a
+			// language without a highlighter, every line is colored).
+			totalLines = cache.normalizedLines.length;
+			if (
+				totalLines > 0 &&
+				cache.normalizedLines[totalLines - 1] === "" &&
+				highlightSingleLine("", cache.lang) === ""
+			) {
+				while (totalLines > 0 && cache.normalizedLines[totalLines - 1] === "") totalLines--;
+			}
+			displayLines = cache.highlightedLines.slice(0, Math.min(WRITE_COLLAPSED_LINES, totalLines));
+		} else {
+			const renderedLines = lang
+				? (cache?.highlightedLines ?? highlighter.highlight(replaceTabs(normalizeDisplayText(fileContent)), lang))
+				: normalizeDisplayText(fileContent).split("\n");
+			const lines = trimTrailingEmptyLines(renderedLines);
+			totalLines = lines.length;
+			displayLines = lines.slice(0, options.expanded ? lines.length : WRITE_COLLAPSED_LINES);
+		}
+		const maxLines = options.expanded ? totalLines : WRITE_COLLAPSED_LINES;
+		const remaining = totalLines - maxLines;
 		text += `\n\n${displayLines.map((line) => (lang ? line : theme.fg("toolOutput", replaceTabs(line)))).join("\n")}`;
 		if (remaining > 0) {
 			text += `${theme.fg("muted", `\n... (${remaining} more lines, ${totalLines} total,`)} ${keyHint("app.tools.expand", "to expand")}${theme.fg("muted", ")")}`;
@@ -163,10 +248,31 @@ export const writeRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "rend
 		const fileContent = str(renderArgs?.content);
 		const component =
 			(context.lastComponent as WriteCallRenderComponent | undefined) ?? new WriteCallRenderComponent();
-		component.cache =
-			fileContent !== null && !context.argsComplete
-				? updateWriteHighlightCacheIncremental(component.cache, rawPath, fileContent, component.highlighter)
-				: undefined;
+		if (fileContent !== null) {
+			// Expanded, the whole file is highlighted once it is complete. Collapsed, the first lines are, as they were
+			// while it streamed in.
+			if (!context.argsComplete) {
+				component.cache = updateWriteHighlightCacheIncremental(
+					component.cache,
+					rawPath,
+					fileContent,
+					context.expanded,
+					component.highlighter,
+				);
+			} else if (context.expanded) {
+				component.cache = rebuildWriteHighlightCacheFull(rawPath, fileContent);
+			} else {
+				const cache = component.cache;
+				if (cache?.complete && !cache.all && cache.rawPath === rawPath && cache.rawContent === fileContent) {
+					refreshWriteHighlightPrefix(cache, component.highlighter);
+				} else {
+					component.cache = rebuildWriteHighlightCacheCollapsed(rawPath, fileContent, component.highlighter);
+					if (component.cache) component.cache.complete = true;
+				}
+			}
+		} else {
+			component.cache = undefined;
+		}
 		component.setText(
 			formatWriteCall(
 				renderArgs,
