@@ -206,6 +206,7 @@ export class AssistantMessageComponent extends Container {
 									this.messageId,
 									this.timestamp,
 								),
+								complete: !this.isStreaming,
 							}),
 					),
 				);
@@ -257,6 +258,7 @@ export class AssistantMessageComponent extends Container {
 											this.messageId,
 											this.timestamp,
 										),
+										complete: !this.isStreaming,
 									},
 								),
 						);
