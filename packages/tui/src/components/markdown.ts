@@ -1531,6 +1531,20 @@ export class Markdown implements Component {
 	}
 
 	/**
+	 * Pad a table cell line to the column width, honoring the column's alignment row
+	 * (`:---` left, `:---:` center, `---:` right). Unaligned columns pad on the right.
+	 */
+	private alignCellText(text: string, width: number, align: Tokens.Table["align"][number]): string {
+		const gap = Math.max(0, width - visibleWidth(text));
+		if (align === "right") return " ".repeat(gap) + text;
+		if (align === "center") {
+			const leading = Math.floor(gap / 2);
+			return " ".repeat(leading) + text + " ".repeat(gap - leading);
+		}
+		return text + " ".repeat(gap);
+	}
+
+	/**
 	 * Render a table with width-aware cell wrapping.
 	 * Cells that don't fit are wrapped to multiple lines.
 	 */
@@ -1665,8 +1679,7 @@ export class Markdown implements Component {
 		for (let lineIdx = 0; lineIdx < headerLineCount; lineIdx++) {
 			const rowParts = headerCellLines.map((cellLines, colIdx) => {
 				const text = cellLines[lineIdx] || "";
-				const padded = text + " ".repeat(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
-				return this.theme.bold(padded);
+				return this.theme.bold(this.alignCellText(text, columnWidths[colIdx], token.align[colIdx]));
 			});
 			lines.push(`│ ${rowParts.join(" │ ")} │`);
 		}
@@ -1688,7 +1701,7 @@ export class Markdown implements Component {
 			for (let lineIdx = 0; lineIdx < rowLineCount; lineIdx++) {
 				const rowParts = rowCellLines.map((cellLines, colIdx) => {
 					const text = cellLines[lineIdx] || "";
-					return text + " ".repeat(Math.max(0, columnWidths[colIdx] - visibleWidth(text)));
+					return this.alignCellText(text, columnWidths[colIdx], token.align[colIdx]);
 				});
 				lines.push(`│ ${rowParts.join(" │ ")} │`);
 			}

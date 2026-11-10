@@ -479,6 +479,23 @@ describe("Markdown component", () => {
 			assert.ok(plainLines.some((line) => line.includes("Long text")));
 		});
 
+		it("should right-align and center cells per the alignment row", () => {
+			const markdown = new Markdown(
+				`| Name | Amount | Mid |
+| :--- | ---: | :---: |
+| Alpha | 1 | x |
+| Beta | 12345 | yy |`,
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const plainLines = markdown.render(80).map((line) => stripAnsi(line).trimEnd());
+			// Name is left, Amount is right, Mid is centered; each cell is padded to its column width.
+			assert.ok(plainLines.includes("│ Alpha │      1 │  x  │"), JSON.stringify(plainLines));
+			assert.ok(plainLines.includes("│ Beta  │  12345 │ yy  │"), JSON.stringify(plainLines));
+		});
+
 		it("should handle tables with varying column widths", () => {
 			const markdown = new Markdown(
 				`| Short | Very long column header |
