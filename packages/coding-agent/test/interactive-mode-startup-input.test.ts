@@ -93,6 +93,22 @@ describe("InteractiveMode startup input", () => {
 		expect(context.editor.addToHistory).toHaveBeenCalledWith("early prompt");
 	});
 
+	it("adds a built-in command to editor history before running it", async () => {
+		const order: string[] = [];
+		const context = {
+			...createSubmitContext(),
+			handleNameCommand: vi.fn((text: string) => void order.push(`run:${text}`)),
+			isExtensionCommand: () => false,
+		};
+		context.editor.addToHistory = vi.fn((text: string) => void order.push(`history:${text}`));
+		interactiveModePrototype.setupEditorSubmitHandler.call(context);
+
+		await context.defaultEditor.onSubmit?.(" /name session label ");
+
+		expect(order).toEqual(["history:/name session label", "run:/name session label"]);
+		expect(context.pendingUserInputs).toEqual([]);
+	});
+
 	it("adds command-line prompts to editor history before sending them", async () => {
 		const order: string[] = [];
 		const context: InitialMessagesContext = {
