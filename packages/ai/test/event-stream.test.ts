@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import type { AssistantMessage } from "../src/types.ts";
+import { lazyStream } from "../src/api/lazy.ts";
+import type { Api, AssistantMessage, AssistantMessageEvent, Model } from "../src/types.ts";
 import { AssistantMessageEventStream, EventStream } from "../src/utils/event-stream.ts";
 
 // Regression tests for https://github.com/earendil-works/pi/issues/9055
@@ -165,5 +166,75 @@ describe("AssistantMessageEventStream timing", () => {
 		const late = message(Date.now());
 		stream.push({ type: "done", reason: "stop", message: late });
 		expect(late.durationMs).toBeUndefined();
+	});
+});
+
+describe("EventStream.forwardTo and lazyStream", () => {
+	const model = { id: "m", provider: "p", api: "openai-completions" } as Model<Api>;
+	const text = (delta: string): AssistantMessageEvent => ({
+		type: "text_delta",
+		contentIndex: 0,
+		delta,
+		partial: message(Date.now()),
+	});
+	const deltas = (events: AssistantMessageEvent[]) =>
+		events.map((event) => (event.type === "text_delta" ? event.delta : event.type));
+
+	it("hands queued events to the sink in order, then each pushed one, and none after completion", async () => {
+		const stream = new EventStream<number, number>(
+			(event) => event === 3,
+			(event) => event,
+		);
+		stream.push(1);
+		const seen: number[] = [];
+		stream.forwardTo((event) => seen.push(event));
+		expect(seen).toEqual([1]);
+		stream.push(2);
+		stream.push(3);
+		stream.push(4);
+		expect(seen).toEqual([1, 2, 3]);
+		expect(await stream.result()).toBe(3);
+	});
+
+	it("forwards an event stream's events, before and after setup returns it, and ends with its result", async () => {
+		const inner = new AssistantMessageEventStream();
+		inner.push(text("a"));
+		const outer = lazyStream(model, async () => inner);
+		const events: AssistantMessageEvent[] = [];
+		const consumed = (async () => {
+			for await (const event of outer) events.push(event);
+		})();
+		await sleep(0);
+		inner.push(text("b"));
+		const answer = message(Date.now());
+		inner.push({ type: "done", reason: "stop", message: answer });
+		await consumed;
+		expect(deltas(events)).toEqual(["a", "b", "done"]);
+		expect(await outer.result()).toBe(answer);
+	});
+
+	it("ends with the result an event stream ends with, without a final event", async () => {
+		const inner = new AssistantMessageEventStream();
+		const outer = lazyStream(model, async () => inner);
+		const answer = message(Date.now());
+		inner.push(text("a"));
+		inner.end(answer);
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of outer) events.push(event);
+		expect(deltas(events)).toEqual(["a"]);
+		expect(await outer.result()).toBe(answer);
+	});
+
+	it("still iterates a source that is not an event stream", async () => {
+		const answer = message(Date.now());
+		async function* source(): AsyncGenerator<AssistantMessageEvent> {
+			yield text("a");
+			yield { type: "done", reason: "stop", message: answer };
+		}
+		const outer = lazyStream(model, async () => source());
+		const events: AssistantMessageEvent[] = [];
+		for await (const event of outer) events.push(event);
+		expect(deltas(events)).toEqual(["a", "done"]);
+		expect(await outer.result()).toBe(answer);
 	});
 });

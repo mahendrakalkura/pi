@@ -492,6 +492,18 @@ function asciiVisibleWidth(str: string): number {
 			const length = ansiCodeLength(str, i);
 			if (length === 0) return -1;
 			i += length;
+		} else if (
+			(code >= 0xa0 && code <= 0x2ff && code !== 0xad) ||
+			(code >= 0x2500 && code <= 0x25fc) ||
+			(code >= 0x2010 && code <= 0x2027) ||
+			(code >= 0x2190 && code <= 0x22ff)
+		) {
+			// Latin-1 and Latin Extended letters and signs, typographic punctuation, arrows and mathematical operators,
+			// box drawing, block elements and geometric shapes: each is a grapheme of its own, one cell wide, whatever
+			// is beside it here (anything that would join it, such as a combining mark or a variation selector, is
+			// outside these ranges and takes the general path).
+			width++;
+			i++;
 		} else {
 			return -1;
 		}
@@ -955,21 +967,27 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 		return [""];
 	}
 
+	// One line (what Markdown and most components wrap): no ANSI state to carry over to a line after it.
+	if (text.indexOf("\n") === -1 && text.indexOf("\r") === -1) {
+		return wrapSingleLine(text, width);
+	}
+
 	// Handle newlines by processing each line separately
 	// Track ANSI state across lines so styles carry over after literal newlines
 	const inputLines = text.split(/\r\n|\r|\n/);
 	const result: string[] = [];
 	const tracker = new AnsiCodeTracker();
 
-	for (const inputLine of inputLines) {
+	for (let index = 0; index < inputLines.length; index++) {
+		const inputLine = inputLines[index]!;
 		// Prepend active ANSI codes from previous lines (except for first line)
 		const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
 		const wrappedLines = wrapSingleLine(prefix + inputLine, width);
 		for (const wrappedLine of wrappedLines) {
 			result.push(wrappedLine);
 		}
-		// Update tracker with codes from this line for next iteration
-		updateTrackerFromText(inputLine, tracker);
+		// Update tracker with codes from this line for the next one (the last line has none after it)
+		if (index < inputLines.length - 1) updateTrackerFromText(inputLine, tracker);
 	}
 
 	return result.length > 0 ? result : [""];
@@ -1211,6 +1229,12 @@ export function truncateToWidth(
 		return finalizeTruncatedResult("", 0, clippedEllipsis.text, clippedEllipsis.width, maxWidth, pad);
 	}
 
+	// Text of single-cell characters and escape sequences that fits is returned as it is, without segmenting it.
+	const simpleWidth = asciiVisibleWidth(text);
+	if (simpleWidth !== -1 && simpleWidth <= maxWidth) {
+		return pad ? text + " ".repeat(maxWidth - simpleWidth) : text;
+	}
+
 	if (isPrintableAscii(text)) {
 		if (text.length <= maxWidth) {
 			return pad ? text + " ".repeat(maxWidth - text.length) : text;
@@ -1347,11 +1371,13 @@ export function sliceWithWidth(
 	while (i < line.length) {
 		const ansi = extractAnsiCode(line, i);
 		if (ansi) {
+			// APC sequences (cursor markers) are positional one-shot commands, not persistent style
+			// state, so codes before the range carry over only when they are not APC.
 			if (currentCol >= startCol && currentCol < endCol) {
 				// Keep original order: codes from before the range must precede codes at the boundary
 				result += pendingAnsi + ansi.code;
 				pendingAnsi = "";
-			} else if (currentCol < startCol) pendingAnsi += ansi.code;
+			} else if (currentCol < startCol && !ansi.code.startsWith("\x1b_")) pendingAnsi += ansi.code;
 			i += ansi.length;
 			continue;
 		}

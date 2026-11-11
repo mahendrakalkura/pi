@@ -176,16 +176,33 @@ export function compareVersions(v1: ChangelogEntry, v2: ChangelogEntry): number 
 	return v1.patch - v2.patch;
 }
 
+function parseVersion(version: string): ChangelogEntry {
+	const parts = version.split(".").map(Number);
+	return { major: parts[0] || 0, minor: parts[1] || 0, patch: parts[2] || 0, content: "" };
+}
+
 /**
- * Get entries newer than lastVersion
+ * Whether `version` is `other` or newer (major.minor.patch, as getNewEntries compares them).
  */
-export function getNewEntries(entries: ChangelogEntry[], lastVersion: string): ChangelogEntry[] {
-	// Parse lastVersion
-	const parts = lastVersion.split(".").map(Number);
+export function isVersionAtLeast(version: string, other: string): boolean {
+	return compareVersions(parseVersion(version), parseVersion(other)) >= 0;
+}
+
+/**
+ * Get entries newer than lastVersion, or undefined when lastVersion has no major.minor.patch to compare against
+ */
+export function getNewEntries(entries: ChangelogEntry[], lastVersion: string): ChangelogEntry[] | undefined {
+	// Read only the leading major.minor.patch, like the changelog headings, so a prerelease such as
+	// 0.1.5-20261020.7 counts as 0.1.5 and its notes are not shown again on every launch (#11703).
+	// Alternatives considered: plain string comparison orders 0.10.0 before 0.9.0; numeric localeCompare
+	// works by accident and is locale-dependent; strict semver orders 0.1.5-x before 0.1.5, which repeats
+	// the [0.1.5] notes forever.
+	const parts = lastVersion.trim().match(/^v?(\d+)\.(\d+)\.(\d+)/);
+	if (!parts) return undefined;
 	const last: ChangelogEntry = {
-		major: parts[0] || 0,
-		minor: parts[1] || 0,
-		patch: parts[2] || 0,
+		major: Number(parts[1]),
+		minor: Number(parts[2]),
+		patch: Number(parts[3]),
 		content: "",
 	};
 

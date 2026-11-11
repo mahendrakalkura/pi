@@ -34,6 +34,7 @@ function createTempFile(): string {
 }
 
 function createSessionManager(options: {
+	cwd?: string;
 	persisted?: boolean;
 	sessionFile?: string;
 	sessionId?: string;
@@ -41,6 +42,7 @@ function createSessionManager(options: {
 	usesDefaultSessionDir?: boolean;
 }): SessionManager {
 	return {
+		getCwd: () => options.cwd ?? "/tmp/project",
 		isPersisted: () => options.persisted ?? true,
 		getSessionFile: () => options.sessionFile,
 		getSessionId: () => options.sessionId ?? "0197f6e4-4cf9-7f44-a2d8-f8f7f49ee9d3",
@@ -55,7 +57,19 @@ describe("formatResumeCommand", () => {
 		const sessionFile = createTempFile();
 		const sessionManager = createSessionManager({ sessionFile, sessionId: "test-session" });
 
-		expect(formatResumeCommand(sessionManager)).toBe(`${APP_NAME} --session test-session`);
+		expect(formatResumeCommand(sessionManager)).toBe(`cd /tmp/project && ${APP_NAME} --session test-session`);
+	});
+
+	it("quotes working directories containing spaces", () => {
+		setStdoutIsTTY(true);
+		const sessionFile = createTempFile();
+		const sessionManager = createSessionManager({
+			cwd: "/tmp/my project",
+			sessionFile,
+			sessionId: "test-session",
+		});
+
+		expect(formatResumeCommand(sessionManager)).toBe(`cd '/tmp/my project' && ${APP_NAME} --session test-session`);
 	});
 
 	it("includes unquoted safe session dirs for non-default session dirs", () => {
@@ -69,7 +83,7 @@ describe("formatResumeCommand", () => {
 		});
 
 		expect(formatResumeCommand(sessionManager)).toBe(
-			`${APP_NAME} --session-dir /tmp/custom-pi-sessions --session test-session`,
+			`cd /tmp/project && ${APP_NAME} --session-dir /tmp/custom-pi-sessions --session test-session`,
 		);
 	});
 
@@ -84,7 +98,7 @@ describe("formatResumeCommand", () => {
 		});
 
 		expect(formatResumeCommand(sessionManager)).toBe(
-			`${APP_NAME} --session-dir '/tmp/custom pi sessions' --session test-session`,
+			`cd /tmp/project && ${APP_NAME} --session-dir '/tmp/custom pi sessions' --session test-session`,
 		);
 	});
 
@@ -99,7 +113,7 @@ describe("formatResumeCommand", () => {
 		});
 
 		expect(formatResumeCommand(sessionManager)).toBe(
-			`${APP_NAME} --session-dir '/tmp/custom pi'\\''s sessions' --session test-session`,
+			`cd /tmp/project && ${APP_NAME} --session-dir '/tmp/custom pi'\\''s sessions' --session test-session`,
 		);
 	});
 

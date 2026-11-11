@@ -2,6 +2,7 @@ import {
 	createModels,
 	createProvider,
 	type ImageModel,
+	InMemoryCredentialStore,
 	InMemoryModelsStore,
 	type Model,
 	type ModelsPublication,
@@ -101,6 +102,26 @@ describe("remote catalog provider", () => {
 		const requested = new URL(String(fetchSpy.mock.calls[0]?.[0]));
 		expect(requested.pathname).toBe("/api/models/providers/test-provider");
 		expect(requested.searchParams.get("types")).toBe(REMOTE_CATALOG_MODEL_TYPES.join(","));
+	});
+
+	it("gives each caller its own list of the models, and the models as they are after a refresh", async () => {
+		vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(JSON.stringify({ dynamic: model("dynamic") }), {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const provider = testProvider();
+		const before = provider.getModels();
+		expect(before.map((entry) => entry.id)).toEqual(["static"]);
+		(before as Model<"openai-completions">[]).push(model("pushed by a caller"));
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static"]);
+		expect(provider.getModels()).not.toBe(provider.getModels());
+
+		await refreshProvider(provider, new InMemoryModelsStore());
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
+		expect(provider.getAllModels?.().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
 	});
 
 	it("overlays image and classifier models and drops unknown model types", async () => {
@@ -283,6 +304,45 @@ describe("remote catalog provider", () => {
 
 		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "newer"]);
 		expect((await store.read(provider.id))?.models.map((entry) => entry.id)).toEqual(["newer"]);
+	});
+
+	it("fetches the pi.dev catalog without refreshing a stale OAuth login", async () => {
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+			async () =>
+				new Response(JSON.stringify({ dynamic: model("dynamic") }), {
+					headers: { "content-type": "application/json" },
+				}),
+		);
+		const oauthRefresh = vi.fn(async (): Promise<never> => {
+			throw new Error("invalid_grant");
+		});
+		const provider = withRemoteCatalog({
+			...builtinProvider(),
+			auth: {
+				oauth: {
+					name: "Test OAuth",
+					login: async () => {
+						throw new Error("not used");
+					},
+					refresh: oauthRefresh,
+					toAuth: async (credential) => ({ apiKey: credential.access }),
+				},
+			},
+		});
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify(provider.id, async () => ({
+			type: "oauth",
+			access: "expired",
+			refresh: "revoked",
+			expires: 0,
+		}));
+		const models = createModels({ credentials, modelsStore: new InMemoryModelsStore() });
+		models.setProvider(provider);
+
+		expect((await models.refresh({ force: true })).errors.size).toBe(0);
+		expect(oauthRefresh).not.toHaveBeenCalled();
+		expect(fetchSpy).toHaveBeenCalledTimes(1);
+		expect(provider.getModels().map((entry) => entry.id)).toEqual(["static", "dynamic"]);
 	});
 
 	it("treats unimplemented pi.dev catalog routes as an unavailable overlay", async () => {

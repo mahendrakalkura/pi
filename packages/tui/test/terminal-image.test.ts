@@ -43,6 +43,7 @@ const ENV_KEYS = [
 	"WEZTERM_PANE",
 	"ITERM_SESSION_ID",
 	"WT_SESSION",
+	"ALACRITTY_WINDOW_ID",
 	"CMUX_WORKSPACE_ID",
 	"WARP_SESSION_ID",
 	"WARP_TERMINAL_SESSION_UUID",
@@ -442,6 +443,15 @@ describe("detectCapabilities", () => {
 		withEnv({ TERM_PROGRAM: "vscode" }, () => {
 			const caps = detectCapabilities();
 			assert.strictEqual(caps.hyperlinks, true);
+		});
+	});
+
+	it("enables hyperlinks for Alacritty without TERM_PROGRAM", () => {
+		withEnv({ TERM: "alacritty", COLORTERM: "truecolor" }, () => {
+			assert.deepStrictEqual(detectCapabilities(), { images: null, trueColor: true, hyperlinks: true });
+		});
+		withEnv({ TERM: "xterm-256color", COLORTERM: "truecolor", ALACRITTY_WINDOW_ID: "1" }, () => {
+			assert.deepStrictEqual(detectCapabilities(), { images: null, trueColor: true, hyperlinks: true });
 		});
 	});
 
@@ -955,5 +965,14 @@ describe("hyperlink", () => {
 		const result = hyperlink("README.md", "file:///home/user/README.md");
 		assert.ok(result.includes("file:///home/user/README.md"));
 		assert.ok(result.includes("README.md"));
+	});
+});
+
+describe("Kitty image controls", () => {
+	it("crops nothing, quickly, in a line of many image commands with no controls end", () => {
+		const line = "\x1b_G".repeat(100_000);
+		const started = performance.now();
+		assert.strictEqual(cropKittyImageLine(line, 1, 1), line);
+		assert.ok(performance.now() - started < 1000);
 	});
 });
