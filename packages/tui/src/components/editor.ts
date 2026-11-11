@@ -1711,6 +1711,12 @@ export class Editor implements Component, Focusable {
 		return this.state.cursorCol > 0 && currentLine[this.state.cursorCol - 1] === "\\";
 	}
 
+	/** Submit the current text the way Enter does: expand paste markers, clear the editor and its undo stack, call onSubmit. */
+	submit(): void {
+		if (this.disableSubmit) return;
+		this.submitValue();
+	}
+
 	private submitValue(): void {
 		this.cancelAutocomplete();
 		const result = this.expandPasteMarkers(this.state.lines.join("\n")).trim();

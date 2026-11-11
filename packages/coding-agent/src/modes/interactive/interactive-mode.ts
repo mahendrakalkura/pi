@@ -4796,8 +4796,10 @@ export class InteractiveMode {
 			this.updatePendingMessagesDisplay();
 			this.ui.requestRender();
 		}
-		// If not streaming, Alt+Enter acts like regular Enter (trigger onSubmit)
-		else if (this.editor.onSubmit) {
+		// If not streaming, Alt+Enter acts like regular Enter, through the editor's own submit when it has one
+		else if (this.editor.submit) {
+			this.editor.submit();
+		} else if (this.editor.onSubmit) {
 			this.editor.setText("");
 			this.editor.onSubmit(text);
 		}

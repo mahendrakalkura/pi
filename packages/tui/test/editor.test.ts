@@ -1607,6 +1607,20 @@ describe("Editor component", () => {
 	});
 
 	describe("Undo", () => {
+		it("leaves nothing to undo after submit(), as after Enter", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+
+			editor.handleInput("a");
+			editor.handleInput("b");
+			editor.submit();
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+
+			assert.deepStrictEqual(submitted, ["ab"]);
+			assert.strictEqual(editor.getText(), "");
+		});
+
 		it("does nothing when undo stack is empty", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 
