@@ -16,6 +16,7 @@ type SubmitContext = {
 	flushPendingBashComponents: () => void;
 	onInputCallback?: (text: string) => void;
 	pendingUserInputs: string[];
+	submitPrompt: (text: string) => Promise<void>;
 };
 
 type InputContext = {
@@ -43,6 +44,7 @@ type InteractiveModePrivate = {
 		initialMessages: string[] | undefined,
 	): Promise<void>;
 	setupEditorSubmitHandler(this: SubmitContext): void;
+	submitPrompt(this: SubmitContext, text: string): Promise<void>;
 	getUserInput(this: InputContext): Promise<string>;
 };
 
@@ -63,6 +65,7 @@ function createSubmitContext(): SubmitContext {
 		},
 		flushPendingBashComponents: vi.fn(),
 		pendingUserInputs: [],
+		submitPrompt: interactiveModePrototype.submitPrompt,
 	};
 }
 
