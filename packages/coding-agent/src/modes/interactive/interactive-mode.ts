@@ -306,6 +306,9 @@ function isUsageSessionEntry(item: RenderSessionItem): item is Extract<SessionEn
 	return "type" in item && item.type === "usage";
 }
 
+// How often a command-line prompt checks whether a selector has handed the keyboard back to the editor.
+const EDITOR_FOCUS_POLL_MS = 50;
+
 // EIO: tty reads/ioctls from an orphaned background process group, or writes after hangup.
 // ENOTTY: the tty was revoked (macOS) and stdin is no longer a terminal.
 const DEAD_TERMINAL_ERROR_CODES = new Set(["EIO", "EPIPE", "ENOTCONN", "ENOTTY"]);
@@ -1325,15 +1328,16 @@ export class InteractiveMode {
 	}
 
 	/**
-	 * Send the prompts given on the command line. Each one enters editor history
-	 * first, so Up recalls it the same way it recalls a typed prompt.
+	 * Send the prompts given on the command line through the editor's submit handler, one after another,
+	 * so history, `!` bash, and built-in and extension commands treat each one as a typed prompt.
 	 */
 	private async promptInitialMessages(
 		initialMessage: string | undefined,
 		initialImages: ImageContent[] | undefined,
 		initialMessages: string[] | undefined,
 	): Promise<void> {
-		if (initialMessage) {
+		// The submit handler takes text only, so a first prompt with images keeps the direct route.
+		if (initialMessage && initialImages && initialImages.length > 0) {
 			this.editor.addToHistory?.(initialMessage);
 			try {
 				await this.session.prompt(initialMessage, { images: initialImages });
@@ -1341,16 +1345,38 @@ export class InteractiveMode {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
 			}
+		} else if (initialMessage) {
+			await this.submitInitialMessage(initialMessage);
 		}
 
 		for (const message of initialMessages ?? []) {
-			this.editor.addToHistory?.(message);
+			await this.submitInitialMessage(message);
+		}
+	}
+
+	/** Submit one command-line prompt as if typed, and finish it before the next one starts. */
+	private async submitInitialMessage(text: string): Promise<void> {
+		try {
+			await this.defaultEditor.onSubmit?.(text);
+		} catch (error: unknown) {
+			const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
+			this.showError(errorMessage);
+		}
+
+		// A plain prompt, and any prompt typed meanwhile, waits in pendingUserInputs for the main loop;
+		// send them now, in order, so the next command-line prompt follows them.
+		for (let queued = this.pendingUserInputs.shift(); queued !== undefined; queued = this.pendingUserInputs.shift()) {
 			try {
-				await this.session.prompt(message);
+				await this.session.prompt(queued);
 			} catch (error: unknown) {
 				const errorMessage = error instanceof Error ? error.message : "Unknown error occurred";
 				this.showError(errorMessage);
 			}
+		}
+
+		// A built-in selector holds the keyboard until it closes, so a typed prompt could not follow it sooner.
+		while (this.renderer.getFocusedComponent() !== this.editor) {
+			await new Promise((resolve) => setTimeout(resolve, EDITOR_FOCUS_POLL_MS));
 		}
 	}
 
