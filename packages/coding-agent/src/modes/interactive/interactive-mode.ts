@@ -758,22 +758,23 @@ export class InteractiveMode {
 
 	private getBuiltInCommandConflictDiagnostics(extensionRunner: ExtensionRunner): ResourceDiagnostic[] {
 		const builtinNames = new Set(BUILTIN_SLASH_COMMANDS.map((command) => command.name));
+		// A command registered once under a built-in's name replaces the built-in, so only duplicates warn.
 		return extensionRunner
 			.getRegisteredCommands()
-			.filter((command) => builtinNames.has(command.name))
+			.filter((command) => builtinNames.has(command.name) && command.invocationName !== command.name)
 			.map((command) => ({
 				type: "warning" as const,
-				message:
-					command.invocationName === command.name
-						? `Extension command '/${command.name}' conflicts with built-in interactive command. Skipping in autocomplete.`
-						: `Extension command '/${command.name}' conflicts with built-in interactive command. Available as '/${command.invocationName}'.`,
+				message: `Extension command '/${command.name}' conflicts with built-in interactive command. Available as '/${command.invocationName}'.`,
 				path: command.sourceInfo.path,
 			}));
 	}
 
 	private createBaseAutocompleteProvider(): AutocompleteProvider {
-		// Define commands for autocomplete
-		const slashCommands: SlashCommand[] = BUILTIN_SLASH_COMMANDS.map((command) => ({
+		// Define commands for autocomplete. An extension command that takes a built-in's name replaces the built-in.
+		const registeredCommands = this.session.extensionRunner.getRegisteredCommands();
+		const replacedNames = new Set(registeredCommands.map((command) => command.invocationName));
+		const builtinCommands = BUILTIN_SLASH_COMMANDS.filter((command) => !replacedNames.has(command.name));
+		const slashCommands: SlashCommand[] = builtinCommands.map((command) => ({
 			name: command.name,
 			description: command.description,
 			...(command.argumentHint && { argumentHint: command.argumentHint }),
@@ -841,8 +842,7 @@ export class InteractiveMode {
 
 		// Convert extension commands to SlashCommand format
 		const builtinCommandNames = new Set(slashCommands.map((c) => c.name));
-		const extensionCommands: SlashCommand[] = this.session.extensionRunner
-			.getRegisteredCommands()
+		const extensionCommands: SlashCommand[] = registeredCommands
 			.filter((cmd) => !builtinCommandNames.has(cmd.name))
 			.map((cmd) => ({
 				name: cmd.invocationName,
@@ -3387,6 +3387,12 @@ export class InteractiveMode {
 			text = text.trim();
 			if (!text) return;
 
+			// An extension command that takes a built-in's name replaces the built-in.
+			if (text.startsWith("/") && this.isExtensionCommand(text)) {
+				await this.submitPrompt(text);
+				return;
+			}
+
 			// Handle commands
 			if (text === "/settings") {
 				this.showSettingsSelector();
@@ -3542,40 +3548,45 @@ export class InteractiveMode {
 				}
 			}
 
-			// Queue input during compaction (extension commands execute immediately)
-			if (this.session.isCompacting) {
-				if (this.isExtensionCommand(text)) {
-					this.editor.addToHistory?.(text);
-					this.editor.setText("");
-					await this.session.prompt(text);
-				} else {
-					this.queueCompactionMessage(text, "steer");
-				}
-				return;
-			}
+			await this.submitPrompt(text);
+		};
+	}
 
-			// If streaming, use prompt() with steer behavior
-			// This handles extension commands (execute immediately), prompt template expansion, and queueing
-			if (this.session.isStreaming) {
+	/** Send a prompt or an extension command the way the editor submits it: queued, steered, or sent now. */
+	private async submitPrompt(text: string): Promise<void> {
+		// Queue input during compaction (extension commands execute immediately)
+		if (this.session.isCompacting) {
+			if (this.isExtensionCommand(text)) {
 				this.editor.addToHistory?.(text);
 				this.editor.setText("");
-				await this.session.prompt(text, { streamingBehavior: "steer" });
-				this.updatePendingMessagesDisplay();
-				this.ui.requestRender();
-				return;
-			}
-
-			// Normal message submission
-			// First, move any pending bash components to chat
-			this.flushPendingBashComponents();
-
-			if (this.onInputCallback) {
-				this.onInputCallback(text);
+				await this.session.prompt(text);
 			} else {
-				this.pendingUserInputs.push(text);
+				this.queueCompactionMessage(text, "steer");
 			}
+			return;
+		}
+
+		// If streaming, use prompt() with steer behavior
+		// This handles extension commands (execute immediately), prompt template expansion, and queueing
+		if (this.session.isStreaming) {
 			this.editor.addToHistory?.(text);
-		};
+			this.editor.setText("");
+			await this.session.prompt(text, { streamingBehavior: "steer" });
+			this.updatePendingMessagesDisplay();
+			this.ui.requestRender();
+			return;
+		}
+
+		// Normal message submission
+		// First, move any pending bash components to chat
+		this.flushPendingBashComponents();
+
+		if (this.onInputCallback) {
+			this.onInputCallback(text);
+		} else {
+			this.pendingUserInputs.push(text);
+		}
+		this.editor.addToHistory?.(text);
 	}
 
 	private subscribeToAgent(): void {
