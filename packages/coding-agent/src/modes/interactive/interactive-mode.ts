@@ -3477,6 +3477,9 @@ export class InteractiveMode {
 			text = text.trim();
 			if (!text) return;
 
+			// Every submission enters history first, built-in commands included, so Up recalls whatever was sent.
+			this.editor.addToHistory?.(text);
+
 			// An extension command that takes a built-in's name replaces the built-in.
 			if (text.startsWith("/") && this.isExtensionCommand(text)) {
 				await this.submitPrompt(text);
@@ -3632,7 +3635,6 @@ export class InteractiveMode {
 						this.editor.setText(text);
 						return;
 					}
-					this.editor.addToHistory?.(text);
 					await this.handleBashCommand(command, isExcluded);
 					this.isBashMode = false;
 					this.updateEditorBorderColor();
@@ -3649,7 +3651,6 @@ export class InteractiveMode {
 		// Queue input during compaction (extension commands execute immediately)
 		if (this.session.isCompacting) {
 			if (this.isExtensionCommand(text)) {
-				this.editor.addToHistory?.(text);
 				this.editor.setText("");
 				await this.session.prompt(text);
 			} else {
@@ -3661,7 +3662,6 @@ export class InteractiveMode {
 		// If streaming, use prompt() with steer behavior
 		// This handles extension commands (execute immediately), prompt template expansion, and queueing
 		if (this.session.isStreaming) {
-			this.editor.addToHistory?.(text);
 			this.editor.setText("");
 			await this.session.prompt(text, { streamingBehavior: "steer" });
 			this.updatePendingMessagesDisplay();
@@ -3678,7 +3678,6 @@ export class InteractiveMode {
 		} else {
 			this.pendingUserInputs.push(text);
 		}
-		this.editor.addToHistory?.(text);
 	}
 
 	private subscribeToAgent(): void {
