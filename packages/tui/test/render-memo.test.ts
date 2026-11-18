@@ -91,7 +91,7 @@ function mouse(y: number, width = 20, height = 100): TuiMouseEvent {
 function fresh(children: Component[], width = 20): string[] {
 	const container = new Container();
 	for (const child of children) container.addChild(child);
-	return container.render(width);
+	return [...container.render(width)];
 }
 
 describe("Container keeps its lines", () => {

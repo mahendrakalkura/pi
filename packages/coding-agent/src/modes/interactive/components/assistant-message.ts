@@ -56,8 +56,8 @@ export class AssistantMessageComponent extends Container {
 	private messageId?: string;
 	private timestamp?: string;
 	private contentIsStale = false;
-	private markedFrom?: string[];
-	private markedLines: string[] = [];
+	private markedFrom?: readonly string[];
+	private markedLines: readonly string[] = [];
 	/** renderLive()'s lines: the children's live lines with the prompt markers added, and what they were made from. */
 	private markedLive?: { from: LiveLines; revision: number; length: number; lines: LiveLineArray };
 	private thinkingVisibilityOverrides = new Map<number, boolean>();
