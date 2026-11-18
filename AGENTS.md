@@ -273,6 +273,8 @@ git push fork --tags
 
 To take later Pi-Bolt commits, fetch with `git fetch --no-tags https://github.com/opensec-git/Pi-Bolt pi-bolt:refs/pi-bolt/main`, cherry-pick with `-x`, then delete the ref with `git update-ref -d refs/pi-bolt/main`. Without `--no-tags`, the fetch adds Pi-Bolt's 36 `bolt-v*` tags.
 
+Upstream `b7bb7ca90` (#11968) made `render()` output read-only and gave `Container` and `Box` a child-line cache of their own (`renderChildLines()`). The 2026-11-19 sync ported Pi-Bolt `79406d9a2` (containers keep their lines) onto it instead of dropping it: `Container.render()` returns `renderShared()` without a copy, `renderChildren()` replaces upstream's `renderChildLines()` and `dispatchMouseToChildLines()`, and the live-lines and change-report commits built on it stay. Tests read `render()` output and never modify it.
+
 Pi-Bolt performance commits left out, and why:
 
 - `5053b8724` and `42c2eab76` change fullscreen mode only, and `tuiMode` is `regular`.
