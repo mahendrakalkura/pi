@@ -77,7 +77,7 @@ function makeTree(): Tree {
 /** The tree's lines rendered from nothing: no caches, every container's children joined by a loop. */
 function reference(component: Component, width: number): string[] {
 	if (component instanceof Container) return component.children.flatMap((child) => reference(child, width));
-	return component.render(width);
+	return [...component.render(width)];
 }
 
 const PIECES = [
