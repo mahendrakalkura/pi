@@ -296,7 +296,8 @@ const result = await Bun.build({
 	// `pi --version` drops from about 250 ms to 50 ms. Without format "esm", Bun compiles the bytecode as CommonJS,
 	// which rejects the bundle's import.meta at startup.
 	bytecode: true,
-	compile: { autoloadBunfig: false, autoloadDotenv: false, outfile },
+	// package.json autoload resolves dependencies whose entry is only in `main` or `exports` (upstream #12046).
+	compile: { autoloadBunfig: false, autoloadDotenv: false, autoloadPackageJson: true, outfile },
 	format: "esm",
 	// Workers are embedded only as explicit entrypoints, at their path relative to `root`. Upstream's
 	// main entry is dist/bun/cli.js, which puts that root at the package directory; config.ts and
