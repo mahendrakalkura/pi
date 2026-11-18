@@ -287,14 +287,14 @@ describe("Markdown lexing of a growing source", () => {
 
 	it("blocks are rendered again for another width, style or theme, and after invalidate()", () => {
 		const source = `<!-- styles ${Math.random()} -->\n\n# Heading\n\nSome *text* that is long enough to be wrapped when the width is small.\n\n- a\n- b\n\nlast`;
-		const cold = (render: () => string[]) => {
+		const cold = (render: () => readonly string[]) => {
 			setMarkdownCachingForTest(false);
 			const lines = render();
 			setMarkdownCachingForTest(true);
 			return lines;
 		};
 		const upper = { ...defaultMarkdownTheme, heading: (text: string) => `<<${text.toUpperCase()}>>` };
-		const renders: Array<() => string[]> = [
+		const renders: Array<() => readonly string[]> = [
 			() => new Markdown(source, 1, 0, defaultMarkdownTheme).render(72),
 			() => new Markdown(source, 1, 0, defaultMarkdownTheme).render(30),
 			() => new Markdown(source, 3, 1, defaultMarkdownTheme).render(72),

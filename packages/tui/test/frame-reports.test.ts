@@ -140,7 +140,7 @@ function reference(component: Component, width: number): string[] {
 	}
 	if (component instanceof MouseRegion) return reference((component as unknown as { child: Component }).child, width);
 	if (component instanceof Container) return component.children.flatMap((child) => reference(child, width));
-	return component.render(width);
+	return [...component.render(width)];
 }
 
 /** The reference document, as the layout reads it: its lines from nothing on every render. */

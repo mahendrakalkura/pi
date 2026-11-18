@@ -328,9 +328,8 @@ describe("transcript frames with change reports", () => {
 				const label = `seed ${seed} step ${step}: ${log.slice(-10).join(" ")}`;
 				expect(frame.lines, label).toEqual(want.lines);
 				if (next() < 0.1) {
-					// (What render() hands out is the caller's own: changing it changes nothing drawn.)
-					const lines = reported.document.render(width - 1);
-					lines.length = 0;
+					// (render() output is read-only: reading it changes nothing drawn.)
+					expect(reported.document.render(width - 1).length).toBeGreaterThanOrEqual(0);
 				}
 			}
 		});
