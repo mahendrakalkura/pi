@@ -3,7 +3,7 @@ import { allocateStackSizes, visibleStackEntries } from "./components/stack.ts";
 import { VStack } from "./components/v-stack.ts";
 import { getLayoutNode } from "./layout-node.ts";
 import { cropKittyImageLine, getKittyImageMetadata, getMaxKittyImageRows, isImageLine } from "./terminal-image.ts";
-import { type Component, CURSOR_MARKER, compositeTuiLine } from "./tui.ts";
+import { type Component, CURSOR_MARKER, compositeTuiLine, renderLiveLines, renderSharedLines } from "./tui.ts";
 import {
 	extractAnsiCode,
 	getActiveBackgroundAnsi,
@@ -82,7 +82,12 @@ function renderCached(context: LayoutContext, component: Component, width: numbe
 	}
 	let lines = widths.get(safeWidth);
 	if (!lines) {
-		lines = context.reusableOutput?.get(component)?.get(safeWidth) ?? component.render(safeWidth);
+		// (Output of an earlier frame with the same content, shared lines, or live lines that change at the next render: the
+		// layout reads them for this frame only, and the frame's boxes until the next one is laid out.)
+		lines =
+			context.reusableOutput?.get(component)?.get(safeWidth) ??
+			renderLiveLines(component, safeWidth)?.lines ??
+			renderSharedLines(component, safeWidth);
 		widths.set(safeWidth, lines);
 	}
 	return lines;
