@@ -1,4 +1,4 @@
-import type { Component } from "../tui.ts";
+import { type Component, markStableRender } from "../tui.ts";
 import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
 
 /**
@@ -113,3 +113,5 @@ export class Text implements Component {
 		return result.length > 0 ? result : [""];
 	}
 }
+
+markStableRender(Text);

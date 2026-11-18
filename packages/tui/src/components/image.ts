@@ -8,7 +8,7 @@ import {
 	imageFallback,
 	renderImage,
 } from "../terminal-image.ts";
-import type { Component } from "../tui.ts";
+import { type Component, markStableRender } from "../tui.ts";
 import { truncateToWidth } from "../utils.ts";
 
 /**
@@ -165,3 +165,5 @@ export class Image implements Component {
 		return lines;
 	}
 }
+
+markStableRender(Image);
