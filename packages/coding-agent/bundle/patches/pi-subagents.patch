@@ -75,6 +75,37 @@ diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-suba
      customTools: childTools,
      excludeTools: EXCLUDED_TOOL_NAMES,
      resourceLoader: loader,
+diff -ruN a/src/lifecycle/subagent-manager.ts b/src/lifecycle/subagent-manager.ts
+--- a/src/lifecycle/subagent-manager.ts
++++ b/src/lifecycle/subagent-manager.ts
+@@ -59,6 +59,12 @@
+    * it. Omitted, the resumed outcome is announced like any other completion.
+    */
+   claimOutcome?: boolean;
++  /**
++   * Return as soon as the resumed run starts instead of when it ends. Nothing
++   * carries the outcome back, so any claim an earlier carrier left on the
++   * record is dropped and the completion is announced like a background spawn's.
++   */
++  background?: boolean;
+ }
+ 
+ /** A spawn's resolved identity and mode — the invariants every front door shares. */
+@@ -403,6 +409,14 @@
+     if (!agent) return { kind: "refused", reason: "unknown-agent" };
+     const refusal = agent.resumeRefusal;
+     if (refusal) return { kind: "refused", reason: refusal };
++    if (options.background) {
++      // A settled record has no live carrier, so a claim still on it is stale:
++      // a foreground spawn, a foreground resume, or a get_subagent_result wait
++      // that never released it. Left in place it would silence the nudge.
++      agent.release();
++      agent.resume(prompt, options.signal).catch((err) => debugLog("background resume", err));
++      return { kind: "resumed", record: agent };
++    }
+     // Before the resume starts: resetForResume runs synchronously inside
+     // resume(), so a claim taken afterwards would miss the terminal edge.
+     if (options.claimOutcome) agent.claim();
 diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-extensions.ts
 --- a/src/session/child-inline-extensions.ts
 +++ b/src/session/child-inline-extensions.ts
@@ -226,6 +257,316 @@ diff -ruN a/src/settings.ts b/src/settings.ts
    const promptInheritance = sanitizePromptInheritance(r.promptInheritance);
    if (promptInheritance) {
      out.promptInheritance = promptInheritance;
+diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
+--- a/src/tools/agent-tool.ts
++++ b/src/tools/agent-tool.ts
+@@ -71,7 +71,7 @@
+ 		params: Record<string, unknown>,
+ 		signal: AbortSignal | undefined,
+ 		onUpdate: ((update: AgentToolResult<AgentDetails>) => void) | undefined,
+-		_ctx: ExtensionContext,
++		ctx: ExtensionContext,
+ 	) {
+ 		// Reload custom agents so new .pi/agents/*.md files are picked up without restart
+ 		this.registry.reload();
+@@ -85,12 +85,30 @@
+ 		);
+ 		if ("error" in config) return textResult(config.error);
+ 
++		// Only TUI resumes can run in the background; launches honor the agent's resolved settings.
++		const isTui = ctx.mode === "tui";
++		const runInBackground = params.resume
++			? isTui && params.run_in_background === true
++			: config.execution.runInBackground;
++		if (isTui && !runInBackground) {
++			throw new Error(params.resume
++				? "The interactive subagent tool requires run_in_background: true for a resume."
++				: `The interactive subagent tool requires a background launch, but agent "${config.identity.subagentType}" resolves to foreground. Use run_in_background: true with an agent that permits background launches.`);
++		}
++
+ 		// ---- Boundary extraction (after config so inheritContext is resolved) ----
+ 		const snapshot = this.runtime.buildSnapshot(config.execution.inheritContext);
+ 		const { parentSessionFile, parentSessionId } = this.runtime.getSessionInfo();
+ 		const parentSession: ParentSessionInfo = { parentSessionFile, parentSessionId, toolCallId };
+ 
+ 		// ---- Resume existing agent ----
++		if (params.resume && runInBackground) {
++			return this.resumeInBackground(
++				params.resume as string,
++				params.prompt as string,
++				config.presentation.detailBase,
++			);
++		}
+ 		if (params.resume) {
+ 			return this.resumeExisting(
+ 				params.resume as string,
+@@ -101,7 +119,7 @@
+ 		}
+ 
+ 		// ---- Background execution ----
+-		if (config.execution.runInBackground) {
++		if (runInBackground) {
+ 			return spawnBackground(
+ 				this.manager,
+ 				{ config, snapshot, parentSession, settings: this.settings },
+@@ -148,6 +166,42 @@
+ 		);
+ 	}
+ 
++	/**
++	 * Continue an existing agent's session with a new prompt in the background,
++	 * returning its ID at once. The resumed outcome is announced on completion,
++	 * like a background spawn's.
++	 */
++	private async resumeInBackground(
++		id: string,
++		prompt: string,
++		detailBase: SpawnPresentation["detailBase"],
++	) {
++		const outcome = await this.manager.resume(id, prompt, { background: true });
++		if (outcome.kind === "refused") {
++			return textResult(resumeRefusalMessage(outcome.reason, id));
++		}
++		const record = outcome.record;
++		const details: AgentDetails = {
++			...detailBase,
++			toolUses: 0,
++			tokens: "",
++			durationMs: 0,
++			status: "background",
++			agentId: record.id,
++		};
++		return textResult(
++			"Agent resumed in background.\n" +
++				`Agent ID: ${record.id}\n` +
++				`Type: ${getDisplayName(record.type, this.registry)}\n` +
++				`Description: ${record.description}\n` +
++				(record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
++				"\nYou will be notified when this agent completes.\n" +
++				"Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n" +
++				"Do not duplicate this agent's work.",
++			details,
++		);
++	}
++
+ 	toToolDefinition() {
+ 		const typeListText = this.typeListText;
+ 		const availableTypesText = this.availableTypesText;
+@@ -218,7 +272,8 @@
+ 				),
+ 				resume: Type.Optional(
+ 					Type.String({
+-						description: "Optional agent ID to resume from. Continues from previous context.",
++						description:
++							"Optional agent ID to resume from. Continues from previous context. In TUI mode, set run_in_background: true to return the ID at once and receive a completion notification. In print, JSON, and RPC modes, the call waits for the resumed result regardless of the flag.",
+ 					}),
+ 				),
+ 				inherit_context: Type.Optional(
+diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
+--- a/test/background-resume.test.ts
++++ b/test/background-resume.test.ts
+@@ -0,0 +1,201 @@
++// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
++
++import { describe, expect, it } from "bun:test";
++import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
++import { AgentTypeRegistry } from "#src/config/agent-types";
++import { ConcurrencyLimiter } from "#src/lifecycle/concurrency-limiter";
++import { SubagentManager } from "#src/lifecycle/subagent-manager";
++import { NotificationManager } from "#src/observation/notification";
++import { SubagentEventsObserver } from "#src/observation/subagent-events-observer";
++import { AgentTool } from "#src/tools/agent-tool";
++import { GetResultTool } from "#src/tools/get-result-tool";
++import type { AgentConfig } from "#src/types";
++
++const AGENT_TYPE = "general-purpose";
++const NOTIFICATION = "subagent-notification";
++
++// Sent is one message the notification layer handed to pi.sendMessage.
++interface Sent {
++  message: { content: string; customType: string };
++  options?: { triggerTurn?: boolean };
++}
++
++// harness wires a real manager, notification layer, Agent tool and get_subagent_result tool around a fake
++// child session whose first run answers "one" at once and whose resumed runs answer only when release() is called.
++function harness(config?: Pick<AgentConfig, "locked" | "runInBackground">) {
++  const sent: Sent[] = [];
++  const resumes: Array<(text: string) => void> = [];
++  const session = {
++    getContextPercent: () => null,
++    getSessionStats: () => ({}),
++    outputFile: undefined,
++    resumeTurnLoop: () => new Promise<string>((resolve) => resumes.push(resolve)),
++    runTurnLoop: async () => ({ aborted: false, responseText: "one", steered: false }),
++    subscribe: () => () => {},
++  };
++  const registry = new AgentTypeRegistry(() => config ? new Map([[AGENT_TYPE, {
++    name: AGENT_TYPE,
++    displayName: "General Purpose",
++    description: "Test agent",
++    systemPrompt: "",
++    promptMode: "append",
++    ...config,
++  }]]) : new Map());
++  const notifications = new NotificationManager((message, options) => sent.push({ message, options }));
++  const manager = new SubagentManager({
++    baseCwd: "/tmp",
++    createSubagentSession: async () => session as never,
++    limiter: new ConcurrencyLimiter(() => 4),
++    observer: new SubagentEventsObserver({ appendEntry: () => {}, emit: () => {}, notifications }),
++    registry,
++  });
++  const runtime = {
++    buildSnapshot: () => ({}) as never,
++    getModelInfo: () => ({ modelRegistry: undefined, parentModel: undefined }),
++    getSessionInfo: () => ({ parentSessionFile: "", parentSessionId: "parent" }),
++  };
++  const agentTool = new AgentTool(manager, runtime, { defaultMaxTurns: undefined, maxConcurrent: 4 }, registry, "/tmp");
++  const getResult = new GetResultTool(manager, registry);
++
++  // call runs the subagent tool and returns its text and details.
++  async function call(params: Record<string, unknown>, mode: ExtensionContext["mode"] = "print") {
++    const ctx = { mode, hasUI: mode === "tui" || mode === "rpc" } as ExtensionContext;
++    const result = await agentTool.toToolDefinition().execute("call", { description: "count", prompt: "say one", subagent_type: AGENT_TYPE, ...params }, undefined, undefined, ctx);
++    const first = result.content[0];
++    return { details: result.details as { agentId?: string; status?: string } | undefined, text: first?.type === "text" ? first.text : "" };
++  }
++
++  // release answers the oldest pending resumed run.
++  function release(text: string): void {
++    resumes.shift()?.(text);
++  }
++
++  return { call, getResult, manager, notifications: () => sent.filter(({ message }) => message.customType === NOTIFICATION), release, resumes };
++}
++
++// settle lets every pending promise callback run.
++async function settle(): Promise<void> {
++  for (let round = 0; round < 5; round += 1) await new Promise((resolve) => setTimeout(resolve, 0));
++}
++
++describe("launch routing after agent config resolution", () => {
++  it.each<Pick<AgentConfig, "locked" | "runInBackground">>([
++    { locked: ["run_in_background"], runInBackground: false },
++    { locked: ["run_in_background"] },
++    { locked: true, runInBackground: false },
++  ])("rejects an effective foreground launch in TUI but preserves the lock in headless modes (%j)", async (config) => {
++    const { call, manager } = harness(config);
++    await expect(call({ run_in_background: true }, "tui")).rejects.toThrow("resolves to foreground");
++    expect(manager.listAgents()).toHaveLength(0);
++
++    for (const mode of ["print", "json", "rpc"] as const) {
++      const result = await call({ run_in_background: true }, mode);
++      expect(result.details?.status).toBe("completed");
++      expect(result.text).toContain("parameter was ignored");
++    }
++  });
++
++  it.each<Pick<AgentConfig, "locked" | "runInBackground">>([
++    { runInBackground: false },
++    { locked: ["run_in_background"], runInBackground: true },
++  ])("routes an effective background launch through the background runner in TUI (%j)", async (config) => {
++    const { call, getResult, manager } = harness(config);
++    const result = await call({ run_in_background: true }, "tui");
++    expect(result.details?.status).toBe("background");
++    const id = result.details?.agentId ?? "";
++    await getResult.execute("call", { agent_id: id, wait: true }, new AbortController().signal, undefined, undefined);
++    expect(manager.getRecord(id)?.result).toBe("one");
++  });
++});
++
++describe("TUI resume with run_in_background", () => {
++  it("returns at once with the agent ID and announces the resumed run when it ends", async () => {
++    const { call, getResult, manager, notifications, release, resumes } = harness();
++    const spawned = await call({ prompt: "say one", run_in_background: true });
++    const id = spawned.details?.agentId ?? "";
++    await getResult.execute("call", { agent_id: id, wait: true }, new AbortController().signal, undefined, undefined);
++    expect(manager.getRecord(id)?.result).toBe("one");
++    const before = notifications().length;
++
++    await expect(call({ prompt: "say two", resume: id }, "tui")).rejects.toThrow("requires run_in_background: true for a resume");
++    expect(resumes).toHaveLength(0);
++
++    const resumed = await call({ prompt: "say two", resume: id, run_in_background: true }, "tui");
++    expect(resumed.text).toContain("Agent resumed in background.");
++    expect(resumed.text).toContain(`Agent ID: ${id}`);
++    expect(resumed.text).toContain("You will be notified when this agent completes.");
++    expect(resumed.details).toMatchObject({ agentId: id, status: "background" });
++    expect(resumes).toHaveLength(1);
++    expect(manager.getRecord(id)?.status).toBe("running");
++    expect(notifications()).toHaveLength(before);
++
++    release("two");
++    await settle();
++    expect(manager.getRecord(id)?.result).toBe("two");
++    const nudges = notifications().slice(before);
++    expect(nudges).toHaveLength(1);
++    expect(nudges[0].message.content).toContain("two");
++    expect(nudges[0].options?.triggerTurn).toBe(true);
++  });
++
++  it("announces a resumed run of an agent that first ran in the foreground", async () => {
++    const { call, manager, notifications, release } = harness();
++    await call({ prompt: "say one" });
++    const id = manager.listAgents()[0]?.id ?? "";
++    expect(manager.getRecord(id)?.claimed).toBe(true);
++
++    const resumed = await call({ prompt: "say two", resume: id, run_in_background: true }, "tui");
++    expect(resumed.text).toContain("Agent resumed in background.");
++    release("two");
++    await settle();
++    expect(notifications().map(({ message }) => message.content).join("\n")).toContain("two");
++  });
++
++  it("refuses a background resume of an agent that is still running", async () => {
++    const { call, release } = harness();
++    const spawned = await call({ prompt: "say one", run_in_background: true });
++    const id = spawned.details?.agentId ?? "";
++    await settle();
++    await call({ prompt: "say two", resume: id, run_in_background: true }, "tui");
++
++    const refused = await call({ prompt: "say three", resume: id, run_in_background: true }, "tui");
++    expect(refused.text).toContain("is still running");
++    release("two");
++    await settle();
++  });
++});
++
++describe.each(["json", "print", "rpc"] as const)("resume in %s mode", (mode) => {
++  it.each([
++    ["omitted", {}],
++    ["false", { run_in_background: false }],
++    ["true", { run_in_background: true }],
++  ] as const)("waits and returns the result without a notification (run_in_background: %s)", async (_label, flags) => {
++    const { call, manager, notifications, release, resumes } = harness();
++    const spawned = await call({ prompt: "say one", run_in_background: true }, mode);
++    expect(spawned.details?.status).toBe("background");
++    const id = spawned.details?.agentId ?? "";
++    await manager.waitForAll();
++    const before = notifications().length;
++
++    let returned = false;
++    const pending = call({ prompt: "say two", resume: id, ...flags }, mode).then((result) => {
++      returned = true;
++      return result;
++    });
++    await settle();
++    const started = resumes.length;
++    const returnedBeforeRelease = returned;
++
++    release("two");
++    const resumed = await pending;
++    expect(started).toBe(1);
++    expect(returnedBeforeRelease).toBe(false);
++    expect(resumed.details).toMatchObject({ agentId: id, status: "completed" });
++    expect(resumed.text).toContain(`Agent ID: ${id}`);
++    expect(resumed.text).toContain("two");
++    await settle();
++    expect(notifications()).toHaveLength(before);
++  });
++});
 diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.test.ts
 --- a/test/child-inline-extensions.test.ts
 +++ b/test/child-inline-extensions.test.ts
