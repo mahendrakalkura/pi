@@ -27,7 +27,15 @@ diff -ruN a/src/index.ts b/src/index.ts
 diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-subagent-session.ts
 --- a/src/lifecycle/create-subagent-session.ts
 +++ b/src/lifecycle/create-subagent-session.ts
-@@ -70,6 +70,8 @@
+@@ -24,6 +24,7 @@
+ import { SubagentSession } from "#src/lifecycle/subagent-session";
+ import { AskParentTool, type QuestionRecorder } from "#src/session/ask-parent-tool";
+ import type { EnvInfo } from "#src/session/env";
++import { childToolAllowlist } from "#src/session/main-session-tools";
+ import type { ModelRegistry } from "#src/session/model-resolver";
+ import { NotifyParentTool, type UpdateAnnouncer } from "#src/session/notify-parent-tool";
+ import { type AssemblerIO, assembleSessionConfig } from "#src/session/session-config";
+@@ -70,6 +71,8 @@
    systemPromptOverride?: () => string;
    /** Override the append system prompt. Receives the current base value; return the replacement. */
    appendSystemPromptOverride?: (base: string[]) => string[];
@@ -36,7 +44,21 @@ diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-suba
  }
  
  /** Options passed to SessionFactoryIO.createSession. */
-@@ -250,6 +252,7 @@
+@@ -80,8 +83,11 @@
+   settingsManager: SettingsManager;
+   modelRegistry: ModelRegistry;
+   model?: Model<any>;
+-  /** Allowlist: only these tool names are enabled in the session. */
+-  tools: string[];
++  /**
++   * Allowlist: only these tool names are enabled in the session. Absent, the
++   * session selects its tools the way a main Pi session does.
++   */
++  tools?: string[];
+   /**
+    * Tool definitions supplied directly rather than by an extension. The SDK
+    * filters these through `tools` too, so every name here must also be listed
+@@ -250,6 +256,7 @@
      noContextFiles: true,
      systemPromptOverride: () => cfg.systemPrompt,
      appendSystemPromptOverride: () => [],
@@ -44,6 +66,15 @@ diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-suba
    });
    await loader.reload();
  
+@@ -269,7 +276,7 @@
+     settingsManager: sessionSettings,
+     modelRegistry: snapshot.modelRegistry,
+     model: cfg.model,
+-    tools: [...cfg.toolNames, ...childTools.map((tool) => tool.name)],
++    tools: childToolAllowlist(cfg.toolNames, childTools.map((tool) => tool.name)),
+     customTools: childTools,
+     excludeTools: EXCLUDED_TOOL_NAMES,
+     resourceLoader: loader,
 diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-extensions.ts
 --- a/src/session/child-inline-extensions.ts
 +++ b/src/session/child-inline-extensions.ts
@@ -57,9 +88,9 @@ diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-ex
 + * `subagents.json` `childInlineExtensions` names the ones a child may load.
 + *
 + * They load only in a child whose `tools:` names a tool outside the seven
-+ * built-ins. The allowlist would drop their tools anyway, but their
-+ * `session_start` and `session_shutdown` handlers would still run in every
-+ * child for nothing.
++ * built-ins, `*` included. The allowlist would drop their tools anyway, but
++ * their `session_start` and `session_shutdown` handlers would still run in
++ * every child for nothing.
 + */
 +
 +import type { InlineExtension } from "@earendil-works/pi-coding-agent";
@@ -86,6 +117,36 @@ diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-ex
 +  return (published as InlineExtension[]).filter(
 +    (input) => typeof input !== "function" && wanted.has(input.name),
 +  );
++}
+diff -ruN a/src/session/main-session-tools.ts b/src/session/main-session-tools.ts
+--- a/src/session/main-session-tools.ts
++++ b/src/session/main-session-tools.ts
+@@ -0,0 +1,26 @@
++/**
++ * main-session-tools.ts - Give an agent exactly the tools a main Pi session holds.
++ *
++ * An agent's `tools:` list is an allowlist, and Pi activates every registered
++ * tool an allowlist matches on every tool-registry rebuild. A plain `*` pattern
++ * would therefore also activate tools a main session leaves inactive: `grep`,
++ * `find`, `ls`, and any tool an extension deactivates at session start.
++ *
++ * `tools: *` instead passes no allowlist at all, so the child selects its tools
++ * the way a main session does: the `defaultTools` setting plus every extension
++ * tool that activates when it registers. The recursion guard still applies,
++ * because it is a denylist, and the child's protocol tools still register,
++ * because nothing filters them.
++ */
++
++/** The `tools:` entry that gives an agent the main session's own tool selection. */
++export const MAIN_SESSION_TOOLS = "*";
++
++/** The child's tool allowlist, or none when the agent asks for the main session's selection. */
++export function childToolAllowlist(
++  toolNames: readonly string[],
++  protocolTools: readonly string[],
++): string[] | undefined {
++  if (toolNames.includes(MAIN_SESSION_TOOLS)) return undefined;
++  return [...toolNames, ...protocolTools];
 +}
 diff -ruN a/src/settings.ts b/src/settings.ts
 --- a/src/settings.ts
@@ -168,9 +229,9 @@ diff -ruN a/src/settings.ts b/src/settings.ts
 diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.test.ts
 --- a/test/child-inline-extensions.test.ts
 +++ b/test/child-inline-extensions.test.ts
-@@ -0,0 +1,85 @@
+@@ -0,0 +1,97 @@
 +// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
-+// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test/child-inline-extensions.test.ts
++// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
 +
 +import { afterEach, describe, expect, it } from "bun:test";
 +import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
@@ -207,6 +268,18 @@ diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.
 +      (input) => (typeof input === "function" ? "" : input.name),
 +    );
 +    expect(names).toEqual(["browser", "browser-use"]);
++  });
++
++  it("gives an agent that lists * the named extensions only", () => {
++    publish([
++      { factory, name: "browser" },
++      { factory, name: "@gotgenes/pi-subagents" },
++      { factory, name: "codemode", builtin: true },
++    ]);
++    const names = childInlineExtensions(["browser", "codemode"], ["*"]).map((input) =>
++      typeof input === "function" ? "" : input.name,
++    );
++    expect(names).toEqual(["browser", "codemode"]);
 +  });
 +
 +  it("gives nothing to an agent that lists only built-in tools", () => {
@@ -252,5 +325,109 @@ diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.
 +
 +  it("drops a value that is not a list", () => {
 +    expect(load("browser").childInlineExtensions).toBeUndefined();
++  });
++});
+diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
+--- a/test/main-session-tools.test.ts
++++ b/test/main-session-tools.test.ts
+@@ -0,0 +1,100 @@
++// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
++
++import { describe, expect, it } from "bun:test";
++import type { AgentSession, SettingsManager } from "@earendil-works/pi-coding-agent";
++import type { AgentConfigLookup } from "#src/config/agent-types";
++import {
++  type CreateSessionOptions,
++  createSubagentSession,
++  type SubagentSessionDeps,
++} from "#src/lifecycle/create-subagent-session";
++import type { ParentSnapshot } from "#src/lifecycle/parent-snapshot";
++import { childToolAllowlist, MAIN_SESSION_TOOLS } from "#src/session/main-session-tools";
++
++const PROTOCOL_TOOLS = ["ask_parent", "notify_parent"];
++const RECURSION_GUARD = ["subagent", "get_subagent_result", "steer_subagent"];
++
++describe("childToolAllowlist", () => {
++  it("passes no allowlist for an agent that lists *", () => {
++    expect(childToolAllowlist([MAIN_SESSION_TOOLS], PROTOCOL_TOOLS)).toBeUndefined();
++    expect(childToolAllowlist(["read", MAIN_SESSION_TOOLS], PROTOCOL_TOOLS)).toBeUndefined();
++  });
++
++  it("appends the protocol tools to any other list", () => {
++    expect(childToolAllowlist(["read", "browser_*"], PROTOCOL_TOOLS)).toEqual([
++      "read",
++      "browser_*",
++      ...PROTOCOL_TOOLS,
++    ]);
++    expect(childToolAllowlist([], [])).toEqual([]);
++  });
++});
++
++describe("createSubagentSession tool selection", () => {
++  // spawn creates a child of an agent with the given tools: list and returns what reached createSession.
++  async function spawn(toolNames: string[]): Promise<CreateSessionOptions> {
++    let captured: CreateSessionOptions | undefined;
++    const session = {
++      bindExtensions: async () => {},
++      messages: [],
++      subscribe: () => () => {},
++    } as unknown as AgentSession;
++    const registry: AgentConfigLookup = {
++      getToolNamesForType: () => toolNames,
++      resolveAgentConfig: (type) => ({
++        description: type,
++        name: type,
++        promptMode: "append",
++        systemPrompt: "",
++        toolNames,
++      }),
++    };
++    const deps: SubagentSessionDeps = {
++      exec: (async () => ({ code: 0, killed: false, stderr: "", stdout: "" })) as never,
++      io: {
++        assemblerIO: { buildAgentPrompt: () => "prompt", loadProjectContext: () => undefined } as never,
++        createLoaderSettingsManager: (parent) => parent,
++        createResourceLoader: () => ({ reload: async () => {} }),
++        createSession: async (options) => {
++          captured = options;
++          return { session };
++        },
++        createSessionManager: () => ({
++          getSessionFile: () => undefined,
++          getSessionId: () => "child",
++          newSession: () => {},
++        }),
++        createSettingsManager: () => ({}) as SettingsManager,
++        deriveSessionDir: () => "/tmp",
++        detectEnv: async () => ({ branch: "", isGitRepo: false, platform: "linux" }),
++        getAgentDir: () => "/tmp",
++      },
++      lifecycle: { bound: () => {}, completed: () => {}, disposed: () => {}, sessionCreated: () => {}, spawning: () => {} },
++      registry,
++      resolvePromptInheritance: () => "full",
++    };
++    const snapshot: ParentSnapshot = {
++      cwd: "/tmp",
++      model: undefined,
++      modelRegistry: { find: () => undefined } as never,
++      systemPrompt: "parent",
++    };
++    await createSubagentSession({ askParent: () => {}, snapshot, type: "general-purpose" }, deps);
++    if (!captured) throw new Error("createSession was not called");
++    return captured;
++  }
++
++  it("gives an agent that lists * the main session's selection, the guard, and ask_parent", async () => {
++    const options = await spawn([MAIN_SESSION_TOOLS]);
++    expect(options.tools).toBeUndefined();
++    expect(options.excludeTools).toEqual(RECURSION_GUARD);
++    expect(options.customTools?.map((tool) => tool.name)).toEqual(["ask_parent"]);
++  });
++
++  it("keeps the allowlist of an agent that names its tools", async () => {
++    const options = await spawn(["read", "browser_*"]);
++    expect(options.tools).toEqual(["read", "browser_*", "ask_parent"]);
++    expect(options.excludeTools).toEqual(RECURSION_GUARD);
 +  });
 +});
