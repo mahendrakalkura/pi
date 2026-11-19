@@ -1,0 +1,256 @@
+diff -ruN a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -46,6 +46,7 @@
+ import { createSubagentRuntime } from "#src/runtime";
+ import { publishSubagentsService, unpublishSubagentsService } from "#src/service/service";
+ import { SubagentsServiceAdapter } from "#src/service/service-adapter";
++import { childInlineExtensions } from "#src/session/child-inline-extensions";
+ import { detectEnv } from "#src/session/env";
+ 
+ import { resolveModel } from "#src/session/model-resolver";
+@@ -118,7 +119,13 @@
+     io: {
+       detectEnv,
+       getAgentDir,
+-      createResourceLoader: (opts) => new DefaultResourceLoader(opts),
++      // The parent's inline extensions reach a child only through this list;
++      // the child's loader cannot discover them on disk.
++      createResourceLoader: ({ toolNames, ...opts }) =>
++        new DefaultResourceLoader({
++          ...opts,
++          extensionFactories: childInlineExtensions(settings.childInlineExtensions, toolNames),
++        }),
+       deriveSessionDir: deriveSubagentSessionDir,
+       createSessionManager: (cwd, dir) => SessionManager.create(cwd, dir),
+       createSettingsManager: (cwd, dir) => SdkSettingsManager.create(cwd, dir),
+diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-subagent-session.ts
+--- a/src/lifecycle/create-subagent-session.ts
++++ b/src/lifecycle/create-subagent-session.ts
+@@ -70,6 +70,8 @@
+   systemPromptOverride?: () => string;
+   /** Override the append system prompt. Receives the current base value; return the replacement. */
+   appendSystemPromptOverride?: (base: string[]) => string[];
++  /** The agent's tool allowlist, which decides whether the parent's inline extensions load in the child. */
++  toolNames?: readonly string[];
+ }
+ 
+ /** Options passed to SessionFactoryIO.createSession. */
+@@ -250,6 +252,7 @@
+     noContextFiles: true,
+     systemPromptOverride: () => cfg.systemPrompt,
+     appendSystemPromptOverride: () => [],
++    toolNames: cfg.toolNames,
+   });
+   await loader.reload();
+ 
+diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-extensions.ts
+--- a/src/session/child-inline-extensions.ts
++++ b/src/session/child-inline-extensions.ts
+@@ -0,0 +1,39 @@
++/**
++ * child-inline-extensions.ts - Hand a child the parent's inline extensions it needs.
++ *
++ * Pi loads extensions compiled into its binary as inline factories, which a
++ * child's own `DefaultResourceLoader` never discovers on disk. The Pi fork's
++ * `main()` publishes those factories under `Symbol.for("pi:inline-extensions")`;
++ * `subagents.json` `childInlineExtensions` names the ones a child may load.
++ *
++ * They load only in a child whose `tools:` names a tool outside the seven
++ * built-ins. The allowlist would drop their tools anyway, but their
++ * `session_start` and `session_shutdown` handlers would still run in every
++ * child for nothing.
++ */
++
++import type { InlineExtension } from "@earendil-works/pi-coding-agent";
++import { BUILTIN_TOOL_NAMES } from "#src/config/agent-types";
++
++/** Global key the Pi fork's `main()` publishes its inline extensions under. */
++const INLINE_EXTENSIONS_KEY = Symbol.for("pi:inline-extensions");
++
++/** The published inline extensions named in `names`, or none when the agent lists only built-in tools. */
++export function childInlineExtensions(
++  names: readonly string[],
++  toolNames: readonly string[] | undefined,
++): InlineExtension[] {
++  // Nothing is configured, or the agent asks for no extension tool.
++  if (names.length === 0) return [];
++  if (!toolNames?.some((name) => !BUILTIN_TOOL_NAMES.includes(name))) return [];
++
++  // A Pi build that publishes nothing leaves the child as it was.
++  const published = (globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY];
++  if (!Array.isArray(published)) return [];
++
++  // Only named extensions can be picked; a bare factory has no name to match.
++  const wanted = new Set(names);
++  return (published as InlineExtension[]).filter(
++    (input) => typeof input !== "function" && wanted.has(input.name),
++  );
++}
+diff -ruN a/src/settings.ts b/src/settings.ts
+--- a/src/settings.ts
++++ b/src/settings.ts
+@@ -37,6 +37,12 @@
+    */
+   excludedExtensionPackages?: string[];
+   /**
++   * Names of the parent's inline extensions (the factories Pi publishes under
++   * `Symbol.for("pi:inline-extensions")`) that load in a child whose `tools:`
++   * names a tool outside the seven built-ins.
++   */
++  childInlineExtensions?: string[];
++  /**
+    * Prompt-inheritance strategy per provider, keyed by the provider id of the
+    * child's resolved model. Every provider not listed inherits `"full"`.
+    * The key is the provider rather than the agent because re-homing is a
+@@ -66,6 +72,8 @@
+    */
+   excludedExtensionPackages?: string[];
+   /** Present only when non-empty, and round-tripped for the same reason. */
++  childInlineExtensions?: string[];
++  /** Present only when non-empty, and round-tripped for the same reason. */
+   promptInheritance?: Record<string, PromptInheritance>;
+ }
+ 
+@@ -93,6 +101,7 @@
+   private _abortAllOnInterrupt: boolean = DEFAULT_ABORT_ALL_ON_INTERRUPT;
+   private _midRunUpdates: boolean = DEFAULT_MID_RUN_UPDATES;
+   private _excludedExtensionPackages: string[] = [];
++  private _childInlineExtensions: string[] = [];
+   private _promptInheritance: Record<string, PromptInheritance> = {};
+ 
+   private readonly emit: SettingsEmit;
+@@ -171,6 +180,12 @@
+     return this._excludedExtensionPackages;
+   }
+ 
++  // -- childInlineExtensions: hand-edited only; no /subagents:settings affordance --
++
++  get childInlineExtensions(): readonly string[] {
++    return this._childInlineExtensions;
++  }
++
+   // ── promptInheritance: hand-edited only; no /subagents:settings affordance ──
+ 
+   /**
+@@ -205,6 +220,7 @@
+     if (typeof settings.midRunUpdates === "boolean") this._midRunUpdates = settings.midRunUpdates;
+     // Assigned unconditionally: removing the key from disk must clear the value.
+     this._excludedExtensionPackages = [...(settings.excludedExtensionPackages ?? [])];
++    this._childInlineExtensions = [...(settings.childInlineExtensions ?? [])];
+     this._promptInheritance = { ...settings.promptInheritance };
+     this.emit("subagents:settings_loaded", { settings });
+     return settings;
+@@ -227,6 +243,9 @@
+     if (this._excludedExtensionPackages.length > 0) {
+       snapshot.excludedExtensionPackages = [...this._excludedExtensionPackages];
+     }
++    if (this._childInlineExtensions.length > 0) {
++      snapshot.childInlineExtensions = [...this._childInlineExtensions];
++    }
+     if (Object.keys(this._promptInheritance).length > 0) {
+       snapshot.promptInheritance = { ...this._promptInheritance };
+     }
+@@ -375,6 +394,13 @@
+       .filter(Boolean);
+     out.excludedExtensionPackages = [...new Set(sources)];
+   }
++  if (Array.isArray(r.childInlineExtensions)) {
++    const names = r.childInlineExtensions
++      .filter((value): value is string => typeof value === "string")
++      .map((value) => value.trim())
++      .filter(Boolean);
++    out.childInlineExtensions = [...new Set(names)];
++  }
+   const promptInheritance = sanitizePromptInheritance(r.promptInheritance);
+   if (promptInheritance) {
+     out.promptInheritance = promptInheritance;
+diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.test.ts
+--- a/test/child-inline-extensions.test.ts
++++ b/test/child-inline-extensions.test.ts
+@@ -0,0 +1,85 @@
++// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test/child-inline-extensions.test.ts
++
++import { afterEach, describe, expect, it } from "bun:test";
++import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { childInlineExtensions } from "#src/session/child-inline-extensions";
++import { loadSettings } from "#src/settings";
++
++const BROWSER_NAMES = ["browser", "browser-use"];
++const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
++const INLINE_EXTENSIONS_KEY = Symbol.for("pi:inline-extensions");
++
++// factory stands in for an extension factory; the filter never calls it.
++const factory = () => {};
++
++// publish sets what the Pi fork's main() would publish.
++function publish(value: unknown): void {
++  (globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY] = value;
++}
++
++describe("childInlineExtensions", () => {
++  afterEach(() => {
++    delete (globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY];
++  });
++
++  it("gives an agent that lists browser_* the named extensions only", () => {
++    publish([
++      factory,
++      { factory, name: "browser" },
++      { factory, name: "browser-use" },
++      { factory, name: "status" },
++    ]);
++    const names = childInlineExtensions(BROWSER_NAMES, [...BUILTIN_TOOLS, "browser_*"]).map(
++      (input) => (typeof input === "function" ? "" : input.name),
++    );
++    expect(names).toEqual(["browser", "browser-use"]);
++  });
++
++  it("gives nothing to an agent that lists only built-in tools", () => {
++    publish([{ factory, name: "browser" }]);
++    expect(childInlineExtensions(BROWSER_NAMES, BUILTIN_TOOLS)).toEqual([]);
++    expect(childInlineExtensions(BROWSER_NAMES, undefined)).toEqual([]);
++  });
++
++  it("gives nothing when Pi published nothing", () => {
++    expect(childInlineExtensions(BROWSER_NAMES, ["browser_*"])).toEqual([]);
++    publish("not a list");
++    expect(childInlineExtensions(BROWSER_NAMES, ["browser_*"])).toEqual([]);
++  });
++
++  it("gives nothing when no names are configured", () => {
++    publish([{ factory, name: "browser" }]);
++    expect(childInlineExtensions([], ["browser_*"])).toEqual([]);
++  });
++});
++
++describe("childInlineExtensions setting", () => {
++  const dirs: string[] = [];
++
++  afterEach(() => {
++    for (const dir of dirs.splice(0)) rmSync(dir, { force: true, recursive: true });
++  });
++
++  // load reads a global subagents.json holding the given value under childInlineExtensions.
++  function load(value: unknown) {
++    const agentDir = mkdtempSync(join(tmpdir(), "pi-subagents-agent-"));
++    const cwd = mkdtempSync(join(tmpdir(), "pi-subagents-cwd-"));
++    dirs.push(agentDir, cwd);
++    writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({ childInlineExtensions: value }));
++    return loadSettings(agentDir, cwd);
++  }
++
++  it("trims names, drops duplicates, blanks, and non-strings", () => {
++    expect(load([" browser ", "browser", "", 7, null, "browser-use"]).childInlineExtensions).toEqual([
++      "browser",
++      "browser-use",
++    ]);
++  });
++
++  it("drops a value that is not a list", () => {
++    expect(load("browser").childInlineExtensions).toBeUndefined();
++  });
++});
