@@ -54,6 +54,7 @@ export function useHold<C extends Contract>(Type: C, params: ParamsOf<C>): Held<
 	const host = useHost();
 	const key = canonicalJson(params as never, BACKGROUND_CONTEXT);
 	const [held, setHeld] = useState<{ readonly key: string; readonly ref: Held<C> } | undefined>(undefined);
+	// biome-ignore lint/correctness/useExhaustiveDependencies: `key` is `params` by value: an inline object must not re-hold.
 	useEffect(() => {
 		const ref = host.hold(Type, params, BACKGROUND_CONTEXT);
 		setHeld({ key, ref });
