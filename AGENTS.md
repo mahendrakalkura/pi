@@ -229,6 +229,11 @@ mise exec node@24 -- npm --prefix packages/durable run build
 # The pi-env tests spawn the Rust daemon and fail with "Build the daemon first" when
 # `packages/env/daemon/target/debug/pi-env` is missing. CI builds it the same way before `npm test`.
 mise exec node@24 -- npm run build:daemon --workspace packages/env
+# coding-agent's `test/subagent-extension.test.ts` imports `@earendil-works/pi-coding-agent` through its
+# `dist/index.js`, which no build above produces, so a fresh checkout fails it with "Failed to resolve entry
+# for package". CI runs the full build before `npm test`; `build:offline` is the same build without the
+# model-catalog download.
+mise exec node@24 -- npm run build:offline
 env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
 # test.sh must not see the provider API keys the Fish shell exports: with keys present, Pi's
 # test harness sees hundreds of available models and the selector tests assert on a short list.
