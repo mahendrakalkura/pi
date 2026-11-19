@@ -1,0 +1,143 @@
+diff -ruN a/src/lsp/processRegistry.ts b/src/lsp/processRegistry.ts
+--- a/src/lsp/processRegistry.ts
++++ b/src/lsp/processRegistry.ts
+@@ -40,6 +40,11 @@
+   kept: LspProcessEntry[];
+ }
+ 
++// Pi runs every subagent child in its parent's process, so one process holds several live owners.
++// An entry this process owns is stale only when its owner is no longer live here; without this,
++// a child's startup cleanup would terminate its parent's running language servers.
++const liveOwners = new Set<string>();
++
+ export class LspProcessRegistry {
+   private readonly path: string;
+   private readonly dir: string;
+@@ -54,6 +59,7 @@
+     this.dir = options.dir ?? dirname(this.path);
+     this.probe = options.probe ?? nodeProcessProbe;
+     this.terminateGraceMs = options.terminateGraceMs ?? 1500;
++    liveOwners.add(this.ownerId);
+   }
+ 
+   async list(): Promise<LspProcessEntry[]> {
+@@ -118,6 +124,7 @@
+   }
+ 
+   async terminateOwnedProcesses(): Promise<CleanupResult> {
++    liveOwners.delete(this.ownerId);
+     return this.terminateProcesses((entry) => entry.ownerId === this.ownerId);
+   }
+ 
+@@ -150,7 +157,8 @@
+   }
+ 
+   private async isStaleOwner(entry: LspProcessEntry): Promise<boolean> {
+-    return entry.ownerPid === process.pid || !(await this.probe.isRunning(entry.ownerPid));
++    if (entry.ownerPid === process.pid) return !liveOwners.has(entry.ownerId);
++    return !(await this.probe.isRunning(entry.ownerPid));
+   }
+ 
+   private async terminateEntry(entry: LspProcessEntry): Promise<void> {
+diff -ruN a/test/process-registry.test.ts b/test/process-registry.test.ts
+--- a/test/process-registry.test.ts
++++ b/test/process-registry.test.ts
+@@ -0,0 +1,98 @@
++// Tests for the Pi fork's pi-lsp-adapter patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/pi-lsp-adapter && bun test ./test
++
++import { afterEach, describe, expect, it } from "bun:test";
++import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { type LspProcessEntry, LspProcessRegistry, type ProcessProbe } from "../src/lsp/processRegistry.ts";
++
++// DEAD_PID names an owner process the probe reports as gone.
++const DEAD_PID = 999_999;
++const SERVER_COMMAND = ["typescript-language-server", "--stdio"];
++
++describe("LspProcessRegistry.cleanupStaleProcesses", () => {
++  const dirs: string[] = [];
++
++  afterEach(() => {
++    for (const dir of dirs.splice(0)) rmSync(dir, { force: true, recursive: true });
++  });
++
++  // setup writes one owner file per entry and returns a registry for a new owner plus the pids it terminates.
++  function setup(entries: LspProcessEntry[]): {
++    record: () => void;
++    registry: (ownerId: string) => LspProcessRegistry;
++    terminated: number[];
++  } {
++    const dir = mkdtempSync(join(tmpdir(), "pi-lsp-pids-"));
++    dirs.push(dir);
++    const record = () => {
++      for (const entry of entries) {
++        writeFileSync(join(dir, `${entry.ownerId}.json`), JSON.stringify({ processes: [entry] }));
++      }
++    };
++    record();
++    const terminated: number[] = [];
++    const probe: ProcessProbe = {
++      commandMatches: () => true,
++      isRunning: (pid) => pid !== DEAD_PID,
++      terminate: (pid) => {
++        terminated.push(pid);
++      },
++    };
++    const registry = (ownerId: string) =>
++      new LspProcessRegistry({ dir, ownerId, path: join(dir, `${ownerId}.json`), probe, terminateGraceMs: 0 });
++    return { record, registry, terminated };
++  }
++
++  // entry is a language server the given owner started.
++  function entry(ownerId: string, ownerPid: number, pid: number): LspProcessEntry {
++    return {
++      command: SERVER_COMMAND,
++      cwd: "/tmp",
++      id: `${ownerId}-server`,
++      ownerId,
++      ownerPid,
++      pid,
++      rootDir: "/tmp",
++      serverId: "typescript",
++      startedAt: "2026-11-19T00:00:00.000Z",
++    };
++  }
++
++  it("keeps the servers of a live owner in this process, as a subagent child's startup must", async () => {
++    const { registry, terminated } = setup([entry("parent", process.pid, 101)]);
++    registry("parent");
++
++    const result = await registry("child").cleanupStaleProcesses();
++    expect(terminated).toEqual([]);
++    expect(result.kept.map((kept) => kept.pid)).toEqual([101]);
++  });
++
++  it("terminates the servers of an owner in this process that has shut down", async () => {
++    const { record, registry, terminated } = setup([entry("finished", process.pid, 102)]);
++    await registry("finished").terminateOwnedProcesses();
++
++    // The server outlived its owner's shutdown, so its entry is still on disk.
++    record();
++    terminated.splice(0);
++
++    await registry("next").cleanupStaleProcesses();
++    expect(terminated).toContain(102);
++  });
++
++  it("terminates the servers of an unknown owner that held this pid before", async () => {
++    const { registry, terminated } = setup([entry("previous-process", process.pid, 103)]);
++
++    await registry("fresh").cleanupStaleProcesses();
++    expect(terminated).toContain(103);
++  });
++
++  it("terminates the servers of an owner in a process that is gone, and keeps one that runs", async () => {
++    const { registry, terminated } = setup([entry("gone", DEAD_PID, 104), entry("other-process", 1, 105)]);
++
++    await registry("fresh").cleanupStaleProcesses();
++    expect(terminated).toContain(104);
++    expect(terminated).not.toContain(105);
++  });
++});
