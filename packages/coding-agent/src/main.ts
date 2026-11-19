@@ -79,6 +79,12 @@ import { cleanupWindowsSelfUpdateQuarantine } from "./utils/windows-self-update.
 const EXTENSION_LOAD_FAILURE_HINT = `Hint: Start without extensions using "${APP_NAME} -ne".`;
 
 /**
+ * Global key under which main() publishes its inline extensions, so an extension that creates child
+ * sessions (such as pi-subagents) can hand them to the child's resource loader.
+ */
+const INLINE_EXTENSIONS_KEY = Symbol.for("pi:inline-extensions");
+
+/**
  * Read all content from piped stdin.
  * Returns undefined if stdin is a TTY (interactive terminal).
  */
@@ -607,6 +613,7 @@ export async function main(args: string[], options?: MainOptions) {
 	// Commands and startup selectors can load user-authored themes before runtime creation.
 	setThemeJsonValidator(validateThemeJson);
 	const extensionFactories = [...builtInExtensions, ...(options?.extensionFactories ?? [])];
+	(globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY] = extensionFactories;
 	const offlineMode = args.includes("--offline") || isTruthyEnvFlag(process.env.PI_OFFLINE);
 	if (offlineMode) {
 		process.env.PI_OFFLINE = "1";
