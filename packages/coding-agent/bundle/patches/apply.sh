@@ -1,8 +1,11 @@
 # Applies every patch below to node_modules after every `npm install` in packages/coding-agent/bundle.
 # - chrome-devtools-mcp.patch makes chrome-devtools-mcp name the CDP target of every page it lists, so
 #   the browser guard in the dotfiles knows which window holds each page.
+# - pi-lsp-adapter.patch keeps the language servers of every live owner in this process, so a
+#   subagent child's startup cleanup never terminates its parent's servers.
 # - pi-subagents.patch hands a child session the inline extensions that subagents.json
-#   `childInlineExtensions` names, out of the ones Pi's main() publishes on globalThis.
+#   `childInlineExtensions` names, out of the ones Pi's main() publishes on globalThis, and gives an
+#   agent whose `tools:` holds `*` the main session's own tool selection.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -25,4 +28,5 @@ apply_patch() {
 }
 
 apply_patch "@gotgenes/pi-subagents" pi-subagents.patch
+apply_patch pi-lsp-adapter pi-lsp-adapter.patch
 apply_patch chrome-devtools-mcp chrome-devtools-mcp.patch
