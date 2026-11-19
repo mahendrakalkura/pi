@@ -1,25 +1,28 @@
 diff -ruN a/src/index.ts b/src/index.ts
 --- a/src/index.ts
 +++ b/src/index.ts
-@@ -46,6 +46,7 @@
+@@ -41,6 +41,7 @@
  import { createSubagentRuntime } from "#src/runtime";
  import { publishSubagentsService, unpublishSubagentsService } from "#src/service/service";
  import { SubagentsServiceAdapter } from "#src/service/service-adapter";
 +import { childInlineExtensions } from "#src/session/child-inline-extensions";
  import { detectEnv } from "#src/session/env";
- 
  import { resolveModel } from "#src/session/model-resolver";
-@@ -118,7 +119,13 @@
+ import { createExcludedPackagesStorage } from "#src/session/package-exclusions";
+@@ -117,7 +118,16 @@
      io: {
        detectEnv,
        getAgentDir,
 -      createResourceLoader: (opts) => new DefaultResourceLoader(opts),
 +      // The parent's inline extensions reach a child only through this list;
 +      // the child's loader cannot discover them on disk.
-+      createResourceLoader: ({ toolNames, ...opts }) =>
++      createResourceLoader: ({ toolNames, extensionFactories = [], ...opts }) =>
 +        new DefaultResourceLoader({
 +          ...opts,
-+          extensionFactories: childInlineExtensions(settings.childInlineExtensions, toolNames),
++          extensionFactories: [
++            ...extensionFactories,
++            ...childInlineExtensions(settings.childInlineExtensions, toolNames, extensionFactories),
++          ],
 +        }),
        deriveSessionDir: deriveSubagentSessionDir,
        createSessionManager: (cwd, dir) => SessionManager.create(cwd, dir),
@@ -27,24 +30,24 @@ diff -ruN a/src/index.ts b/src/index.ts
 diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-subagent-session.ts
 --- a/src/lifecycle/create-subagent-session.ts
 +++ b/src/lifecycle/create-subagent-session.ts
-@@ -24,6 +24,7 @@
- import { SubagentSession } from "#src/lifecycle/subagent-session";
+@@ -28,6 +28,7 @@
  import { AskParentTool, type QuestionRecorder } from "#src/session/ask-parent-tool";
+ import { builtinExtensionsFor } from "#src/session/builtin-extensions";
  import type { EnvInfo } from "#src/session/env";
 +import { childToolAllowlist } from "#src/session/main-session-tools";
+ import { expandMcpToolPatterns } from "#src/session/mcp-tool-patterns";
  import type { ModelRegistry } from "#src/session/model-resolver";
  import { NotifyParentTool, type UpdateAnnouncer } from "#src/session/notify-parent-tool";
- import { type AssemblerIO, assembleSessionConfig } from "#src/session/session-config";
-@@ -70,6 +71,8 @@
-   systemPromptOverride?: () => string;
-   /** Override the append system prompt. Receives the current base value; return the replacement. */
+@@ -77,6 +78,8 @@
    appendSystemPromptOverride?: (base: string[]) => string[];
+   /** Extensions supplied as code; `builtin` entries are Pi's built-ins, resolved as `builtin:<name>`. */
+   extensionFactories?: InlineExtension[];
 +  /** The agent's tool allowlist, which decides whether the parent's inline extensions load in the child. */
 +  toolNames?: readonly string[];
  }
  
  /** Options passed to SessionFactoryIO.createSession. */
-@@ -80,8 +83,11 @@
+@@ -87,8 +90,11 @@
    settingsManager: SettingsManager;
    modelRegistry: ModelRegistry;
    model?: Model<any>;
@@ -58,58 +61,27 @@ diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-suba
    /**
     * Tool definitions supplied directly rather than by an extension. The SDK
     * filters these through `tools` too, so every name here must also be listed
-@@ -250,6 +256,7 @@
-     noContextFiles: true,
+@@ -274,6 +280,7 @@
      systemPromptOverride: () => cfg.systemPrompt,
      appendSystemPromptOverride: () => [],
-+    toolNames: cfg.toolNames,
+     extensionFactories: builtinExtensionsFor(toolNames),
++    toolNames,
    });
    await loader.reload();
  
-@@ -269,7 +276,7 @@
+@@ -293,7 +300,7 @@
      settingsManager: sessionSettings,
      modelRegistry: snapshot.modelRegistry,
      model: cfg.model,
--    tools: [...cfg.toolNames, ...childTools.map((tool) => tool.name)],
-+    tools: childToolAllowlist(cfg.toolNames, childTools.map((tool) => tool.name)),
+-    tools: [...toolNames, ...childTools.map((tool) => tool.name)],
++    tools: childToolAllowlist(toolNames, childTools.map((tool) => tool.name)),
      customTools: childTools,
      excludeTools: EXCLUDED_TOOL_NAMES,
      resourceLoader: loader,
-diff -ruN a/src/lifecycle/subagent-manager.ts b/src/lifecycle/subagent-manager.ts
---- a/src/lifecycle/subagent-manager.ts
-+++ b/src/lifecycle/subagent-manager.ts
-@@ -59,6 +59,12 @@
-    * it. Omitted, the resumed outcome is announced like any other completion.
-    */
-   claimOutcome?: boolean;
-+  /**
-+   * Return as soon as the resumed run starts instead of when it ends. Nothing
-+   * carries the outcome back, so any claim an earlier carrier left on the
-+   * record is dropped and the completion is announced like a background spawn's.
-+   */
-+  background?: boolean;
- }
- 
- /** A spawn's resolved identity and mode — the invariants every front door shares. */
-@@ -403,6 +409,14 @@
-     if (!agent) return { kind: "refused", reason: "unknown-agent" };
-     const refusal = agent.resumeRefusal;
-     if (refusal) return { kind: "refused", reason: refusal };
-+    if (options.background) {
-+      // A settled record has no live carrier, so a claim still on it is stale:
-+      // a foreground spawn, a foreground resume, or a get_subagent_result wait
-+      // that never released it. Left in place it would silence the nudge.
-+      agent.release();
-+      agent.resume(prompt, options.signal).catch((err) => debugLog("background resume", err));
-+      return { kind: "resumed", record: agent };
-+    }
-     // Before the resume starts: resetForResume runs synchronously inside
-     // resume(), so a claim taken afterwards would miss the terminal edge.
-     if (options.claimOutcome) agent.claim();
 diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-extensions.ts
 --- a/src/session/child-inline-extensions.ts
 +++ b/src/session/child-inline-extensions.ts
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,47 @@
 +/**
 + * child-inline-extensions.ts - Hand a child the parent's inline extensions it needs.
 + *
@@ -130,10 +102,15 @@ diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-ex
 +/** Global key the Pi fork's `main()` publishes its inline extensions under. */
 +const INLINE_EXTENSIONS_KEY = Symbol.for("pi:inline-extensions");
 +
-+/** The published inline extensions named in `names`, or none when the agent lists only built-in tools. */
++/**
++ * The published inline extensions named in `names`, or none when the agent
++ * lists only built-in tools. A name `loaded` already holds is skipped, so a Pi
++ * built-in the core selected for the child's tools never loads twice.
++ */
 +export function childInlineExtensions(
 +  names: readonly string[],
 +  toolNames: readonly string[] | undefined,
++  loaded: readonly InlineExtension[] = [],
 +): InlineExtension[] {
 +  // Nothing is configured, or the agent asks for no extension tool.
 +  if (names.length === 0) return [];
@@ -145,6 +122,9 @@ diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-ex
 +
 +  // Only named extensions can be picked; a bare factory has no name to match.
 +  const wanted = new Set(names);
++  for (const input of loaded) {
++    if (typeof input !== "function") wanted.delete(input.name);
++  }
 +  return (published as InlineExtension[]).filter(
 +    (input) => typeof input !== "function" && wanted.has(input.name),
 +  );
@@ -182,7 +162,7 @@ diff -ruN a/src/session/main-session-tools.ts b/src/session/main-session-tools.t
 diff -ruN a/src/settings.ts b/src/settings.ts
 --- a/src/settings.ts
 +++ b/src/settings.ts
-@@ -37,6 +37,12 @@
+@@ -44,6 +44,12 @@
     */
    excludedExtensionPackages?: string[];
    /**
@@ -195,7 +175,7 @@ diff -ruN a/src/settings.ts b/src/settings.ts
     * Prompt-inheritance strategy per provider, keyed by the provider id of the
     * child's resolved model. Every provider not listed inherits `"full"`.
     * The key is the provider rather than the agent because re-homing is a
-@@ -66,6 +72,8 @@
+@@ -73,6 +79,8 @@
     */
    excludedExtensionPackages?: string[];
    /** Present only when non-empty, and round-tripped for the same reason. */
@@ -204,7 +184,7 @@ diff -ruN a/src/settings.ts b/src/settings.ts
    promptInheritance?: Record<string, PromptInheritance>;
  }
  
-@@ -93,6 +101,7 @@
+@@ -100,6 +108,7 @@
    private _abortAllOnInterrupt: boolean = DEFAULT_ABORT_ALL_ON_INTERRUPT;
    private _midRunUpdates: boolean = DEFAULT_MID_RUN_UPDATES;
    private _excludedExtensionPackages: string[] = [];
@@ -212,7 +192,7 @@ diff -ruN a/src/settings.ts b/src/settings.ts
    private _promptInheritance: Record<string, PromptInheritance> = {};
  
    private readonly emit: SettingsEmit;
-@@ -171,6 +180,12 @@
+@@ -178,6 +187,12 @@
      return this._excludedExtensionPackages;
    }
  
@@ -225,7 +205,7 @@ diff -ruN a/src/settings.ts b/src/settings.ts
    // ── promptInheritance: hand-edited only; no /subagents:settings affordance ──
  
    /**
-@@ -205,6 +220,7 @@
+@@ -213,6 +228,7 @@
      if (typeof settings.midRunUpdates === "boolean") this._midRunUpdates = settings.midRunUpdates;
      // Assigned unconditionally: removing the key from disk must clear the value.
      this._excludedExtensionPackages = [...(settings.excludedExtensionPackages ?? [])];
@@ -233,7 +213,7 @@ diff -ruN a/src/settings.ts b/src/settings.ts
      this._promptInheritance = { ...settings.promptInheritance };
      this.emit("subagents:settings_loaded", { settings });
      return settings;
-@@ -227,6 +243,9 @@
+@@ -235,6 +251,9 @@
      if (this._excludedExtensionPackages.length > 0) {
        snapshot.excludedExtensionPackages = [...this._excludedExtensionPackages];
      }
@@ -243,7 +223,7 @@ diff -ruN a/src/settings.ts b/src/settings.ts
      if (Object.keys(this._promptInheritance).length > 0) {
        snapshot.promptInheritance = { ...this._promptInheritance };
      }
-@@ -375,6 +394,13 @@
+@@ -403,6 +422,13 @@
        .filter(Boolean);
      out.excludedExtensionPackages = [...new Set(sources)];
    }
@@ -260,7 +240,7 @@ diff -ruN a/src/settings.ts b/src/settings.ts
 diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
 --- a/src/tools/agent-tool.ts
 +++ b/src/tools/agent-tool.ts
-@@ -71,7 +71,7 @@
+@@ -77,7 +77,7 @@
  		params: Record<string, unknown>,
  		signal: AbortSignal | undefined,
  		onUpdate: ((update: AgentToolResult<AgentDetails>) => void) | undefined,
@@ -269,7 +249,7 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
  	) {
  		// Reload custom agents so new .pi/agents/*.md files are picked up without restart
  		this.registry.reload();
-@@ -85,12 +85,30 @@
+@@ -91,6 +91,17 @@
  		);
  		if ("error" in config) return textResult(config.error);
  
@@ -287,20 +267,18 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
  		// ---- Boundary extraction (after config so inheritContext is resolved) ----
  		const snapshot = this.runtime.buildSnapshot(config.execution.inheritContext);
  		const { parentSessionFile, parentSessionId } = this.runtime.getSessionInfo();
- 		const parentSession: ParentSessionInfo = { parentSessionFile, parentSessionId, toolCallId };
- 
- 		// ---- Resume existing agent ----
-+		if (params.resume && runInBackground) {
-+			return this.resumeInBackground(
-+				params.resume as string,
-+				params.prompt as string,
-+				config.presentation.detailBase,
-+			);
-+		}
+@@ -100,16 +111,16 @@
  		if (params.resume) {
- 			return this.resumeExisting(
- 				params.resume as string,
-@@ -101,7 +119,7 @@
+ 			const id = params.resume as string;
+ 			const prompt = params.prompt as string;
+-			// Only the caller's explicit flag: an agent file's run_in_background
++			// Only the caller's explicit flag in the TUI: an agent file's run_in_background
+ 			// default describes how that type spawns, not how a resume is collected.
+-			if (params.run_in_background === true) {
++			if (runInBackground) {
+ 				return this.resumeInBackground(id, prompt, config);
+ 			}
+ 			return this.resumeExisting(id, prompt, signal, onUpdate, config.presentation.detailBase);
  		}
  
  		// ---- Background execution ----
@@ -309,55 +287,11 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
  			return spawnBackground(
  				this.manager,
  				{ config, snapshot, parentSession, settings: this.settings },
-@@ -148,6 +166,42 @@
- 		);
- 	}
- 
-+	/**
-+	 * Continue an existing agent's session with a new prompt in the background,
-+	 * returning its ID at once. The resumed outcome is announced on completion,
-+	 * like a background spawn's.
-+	 */
-+	private async resumeInBackground(
-+		id: string,
-+		prompt: string,
-+		detailBase: SpawnPresentation["detailBase"],
-+	) {
-+		const outcome = await this.manager.resume(id, prompt, { background: true });
-+		if (outcome.kind === "refused") {
-+			return textResult(resumeRefusalMessage(outcome.reason, id));
-+		}
-+		const record = outcome.record;
-+		const details: AgentDetails = {
-+			...detailBase,
-+			toolUses: 0,
-+			tokens: "",
-+			durationMs: 0,
-+			status: "background",
-+			agentId: record.id,
-+		};
-+		return textResult(
-+			"Agent resumed in background.\n" +
-+				`Agent ID: ${record.id}\n` +
-+				`Type: ${getDisplayName(record.type, this.registry)}\n` +
-+				`Description: ${record.description}\n` +
-+				(record.outputFile ? `Output file: ${record.outputFile}\n` : "") +
-+				"\nYou will be notified when this agent completes.\n" +
-+				"Use get_subagent_result to retrieve full results, or steer_subagent to send it messages.\n" +
-+				"Do not duplicate this agent's work.",
-+			details,
-+		);
-+	}
-+
- 	toToolDefinition() {
- 		const typeListText = this.typeListText;
- 		const availableTypesText = this.availableTypesText;
-@@ -218,7 +272,8 @@
- 				),
+@@ -259,7 +270,7 @@
  				resume: Type.Optional(
  					Type.String({
--						description: "Optional agent ID to resume from. Continues from previous context.",
-+						description:
+ 						description:
+-							"Optional agent ID to resume from. Continues from previous context. Combine with run_in_background: true to resume without waiting.",
 +							"Optional agent ID to resume from. Continues from previous context. In TUI mode, set run_in_background: true to return the ID at once and receive a completion notification. In print, JSON, and RPC modes, the call waits for the resumed result regardless of the flag.",
  					}),
  				),
@@ -365,7 +299,7 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
 diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 --- a/test/background-resume.test.ts
 +++ b/test/background-resume.test.ts
-@@ -0,0 +1,201 @@
+@@ -0,0 +1,210 @@
 +// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
 +// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
 +
@@ -390,17 +324,26 @@ diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 +}
 +
 +// harness wires a real manager, notification layer, Agent tool and get_subagent_result tool around a fake
-+// child session whose first run answers "one" at once and whose resumed runs answer only when release() is called.
++// child session per agent whose first run answers "one" at once and whose resumed runs answer only when release() is called.
 +function harness(config?: Pick<AgentConfig, "locked" | "runInBackground">) {
 +  const sent: Sent[] = [];
 +  const resumes: Array<(text: string) => void> = [];
-+  const session = {
-+    getContextPercent: () => null,
-+    getSessionStats: () => ({}),
-+    outputFile: undefined,
-+    resumeTurnLoop: () => new Promise<string>((resolve) => resumes.push(resolve)),
-+    runTurnLoop: async () => ({ aborted: false, responseText: "one", steered: false }),
-+    subscribe: () => () => {},
++  const turnBudget = { phase: "within" as const, used: 1 };
++  // newSession builds one agent's session: its first run answers at once, and every later run is a
++  // resume that waits for release().
++  const newSession = () => {
++    let runs = 0;
++    return {
++      getContextPercent: () => null,
++      getSessionStats: () => ({}),
++      outputFile: undefined,
++      runTurnLoop: () => {
++        runs += 1;
++        if (runs === 1) return Promise.resolve({ responseText: "one", turnBudget });
++        return new Promise((resolve) => resumes.push((responseText: string) => resolve({ responseText, turnBudget })));
++      },
++      subscribe: () => () => {},
++    };
 +  };
 +  const registry = new AgentTypeRegistry(() => config ? new Map([[AGENT_TYPE, {
 +    name: AGENT_TYPE,
@@ -413,7 +356,7 @@ diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 +  const notifications = new NotificationManager((message, options) => sent.push({ message, options }));
 +  const manager = new SubagentManager({
 +    baseCwd: "/tmp",
-+    createSubagentSession: async () => session as never,
++    createSubagentSession: async () => newSession() as never,
 +    limiter: new ConcurrencyLimiter(() => 4),
 +    observer: new SubagentEventsObserver({ appendEntry: () => {}, emit: () => {}, notifications }),
 +    registry,
@@ -570,7 +513,7 @@ diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.test.ts
 --- a/test/child-inline-extensions.test.ts
 +++ b/test/child-inline-extensions.test.ts
-@@ -0,0 +1,97 @@
+@@ -0,0 +1,109 @@
 +// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
 +// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
 +
@@ -623,6 +566,18 @@ diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.
 +    expect(names).toEqual(["browser", "codemode"]);
 +  });
 +
++  it("skips a name the core already loads for the child's tools", () => {
++    publish([
++      { factory, name: "browser" },
++      { factory, name: "codemode", builtin: true },
++    ]);
++    const loaded = [{ factory, name: "codemode", builtin: true }];
++    const names = childInlineExtensions(["browser", "codemode"], ["codemode", "browser_*"], loaded).map((input) =>
++      typeof input === "function" ? "" : input.name,
++    );
++    expect(names).toEqual(["browser"]);
++  });
++
 +  it("gives nothing to an agent that lists only built-in tools", () => {
 +    publish([{ factory, name: "browser" }]);
 +    expect(childInlineExtensions(BROWSER_NAMES, BUILTIN_TOOLS)).toEqual([]);
@@ -671,7 +626,7 @@ diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.
 diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
 --- a/test/main-session-tools.test.ts
 +++ b/test/main-session-tools.test.ts
-@@ -0,0 +1,100 @@
+@@ -0,0 +1,101 @@
 +// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
 +// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
 +
@@ -745,6 +700,7 @@ diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
 +        getAgentDir: () => "/tmp",
 +      },
 +      lifecycle: { bound: () => {}, completed: () => {}, disposed: () => {}, sessionCreated: () => {}, spawning: () => {} },
++      listParentToolNames: () => [],
 +      registry,
 +      resolvePromptInheritance: () => "full",
 +    };

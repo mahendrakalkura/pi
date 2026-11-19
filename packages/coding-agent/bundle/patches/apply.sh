@@ -5,8 +5,8 @@
 #   subagent child's startup cleanup never terminates its parent's servers.
 # - pi-subagents.patch hands a child session the inline extensions that subagents.json
 #   `childInlineExtensions` names, out of the ones Pi's main() publishes on globalThis, and gives an
-#   agent whose `tools:` holds `*` the main session's own tool selection. It also runs a resume with
-#   run_in_background: true in the background and rejects foreground subagent tool calls in the TUI.
+#   agent whose `tools:` holds `*` the main session's own tool selection. It also keeps background
+#   resumes to the TUI and rejects foreground subagent tool calls there.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
