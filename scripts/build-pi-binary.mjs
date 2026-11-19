@@ -273,6 +273,9 @@ if (testFlag !== -1) {
 		external: ["bun:test"],
 		outdir,
 		plugins: [aliasPlugin(bundleDir), externalDependencyPlugin(bundleDir), pinRequireResolvePlugin(bundleDir)],
+		// Without a pinned root, nine test files made Bun place the output under a root above the repository, in a
+		// nested path through `.pi` that `bun test` skips as hidden, so no test ran.
+		root: testsDir,
 		target: "bun",
 	});
 	if (!built.success) {
