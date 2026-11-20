@@ -715,10 +715,13 @@ describe("ToolExecutionComponent parity", () => {
 		expect(expanded).toContain("hidden content");
 	});
 
+	// A fixed cwd keeps the absolute path label independent of the checkout's length.
+	const compactReadCwd = resolve("/workspace/project");
+	const outsideAgentsPath = resolve(compactReadCwd, "..", "AGENTS.md");
 	for (const scenario of [
 		{
 			title: "SKILL.md",
-			path: join(process.cwd(), "attio", "SKILL.md"),
+			path: join(compactReadCwd, "attio", "SKILL.md"),
 			content: "---\nname: attio\ndescription: CRM helper\n---\n\n# Hidden skill instructions",
 			compact: "[skill] attio",
 			hidden: "Hidden skill instructions",
@@ -726,7 +729,7 @@ describe("ToolExecutionComponent parity", () => {
 		},
 		{
 			title: "AGENTS.md",
-			path: join(process.cwd(), ".pi", "AGENTS.md"),
+			path: join(compactReadCwd, ".pi", "AGENTS.md"),
 			content: "Hidden resource instructions",
 			compact: "read resource .pi/AGENTS.md",
 			hidden: "Hidden resource instructions",
@@ -734,7 +737,7 @@ describe("ToolExecutionComponent parity", () => {
 		},
 		{
 			title: "AGENTS.override.md",
-			path: join(process.cwd(), ".pi", "AGENTS.override.md"),
+			path: join(compactReadCwd, ".pi", "AGENTS.override.md"),
 			content: "Hidden override instructions",
 			compact: "read resource .pi/AGENTS.override.md",
 			hidden: "Hidden override instructions",
@@ -742,9 +745,9 @@ describe("ToolExecutionComponent parity", () => {
 		},
 		{
 			title: "outside AGENTS.md",
-			path: resolve(process.cwd(), "..", "AGENTS.md"),
+			path: outsideAgentsPath,
 			content: "Hidden outside resource instructions",
-			compact: `read resource ${resolve(process.cwd(), "..", "AGENTS.md").replace(/\\/g, "/")}`,
+			compact: `read resource ${outsideAgentsPath.replace(/\\/g, "/")}`,
 			hidden: "Hidden outside resource instructions",
 			absent: undefined,
 		},
@@ -763,9 +766,9 @@ describe("ToolExecutionComponent parity", () => {
 				`tool-compact-${scenario.title}`,
 				{ path: scenario.path },
 				{},
-				createReadToolDefinition(process.cwd()),
+				createReadToolDefinition(compactReadCwd),
 				createFakeTui(),
-				process.cwd(),
+				compactReadCwd,
 			);
 			component.updateResult(
 				{ content: [{ type: "text", text: scenario.content }], details: undefined, isError: false },
