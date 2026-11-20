@@ -1827,6 +1827,9 @@ export interface ExtensionAPI {
 	/** Get the names of the active tools, which are the tools declared to the model. */
 	getActiveTools(): string[];
 
+	/** Names of the tools callable through `ctx.executeTool()`. */
+	getCallableToolNames(): string[];
+
 	/** Check the session's tool-name filter, even before the tool registers. Available after session binding. */
 	isToolAllowed(name: string): boolean;
 
@@ -2217,6 +2220,7 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  * Contains flag values (defaults set during registration, CLI values set after).
  */
 export interface ExtensionRuntimeState {
+	getCallableToolNames: () => string[];
 	flagValues: Map<string, boolean | string>;
 	/** Legacy provider-config registrations queued during extension loading, processed when runner binds. */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;

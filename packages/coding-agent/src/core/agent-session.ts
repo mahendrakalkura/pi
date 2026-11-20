@@ -241,8 +241,19 @@ export type AgentSessionEvent =
 			willRetry: boolean;
 			errorMessage?: string;
 	  }
-	| { type: "auto_retry_start"; attempt: number; maxAttempts: number; delayMs: number; errorMessage: string }
-	| { type: "auto_retry_end"; success: boolean; attempt: number; finalError?: string }
+	| {
+			type: "auto_retry_start";
+			attempt: number;
+			maxAttempts: number;
+			delayMs: number;
+			errorMessage: string;
+	  }
+	| {
+			type: "auto_retry_end";
+			success: boolean;
+			attempt: number;
+			finalError?: string;
+	  }
 	| {
 			type: "summarization_retry_scheduled";
 			attempt: number;
@@ -307,6 +318,7 @@ export interface AgentSessionConfig {
 	 * exposes no tools.
 	 */
 	allowedToolNames?: string[];
+	allowedAutoActivationNames?: string[];
 	/** Optional denylist of tool names or patterns. When provided, matching tools are not exposed. */
 	excludedToolNames?: string[];
 	/**
@@ -420,7 +432,10 @@ export class AgentSession {
 	readonly sessionManager: SessionManager;
 	readonly settingsManager: SettingsManager;
 
-	private _scopedModels: Array<{ model: Model<any>; thinkingLevel?: ThinkingLevel }>;
+	private _scopedModels: Array<{
+		model: Model<any>;
+		thinkingLevel?: ThinkingLevel;
+	}>;
 
 	// Event subscription state
 	private _unsubscribeAgent?: () => void;
@@ -459,7 +474,12 @@ export class AgentSession {
 	 */
 	private _failedResponse: AssistantMessage | undefined;
 	private _contextEstimate:
-		| { sessionManager: SessionManager; revision: number; tokens: number; knownAfterCompaction: boolean }
+		| {
+				sessionManager: SessionManager;
+				revision: number;
+				tokens: number;
+				knownAfterCompaction: boolean;
+		  }
 		| undefined;
 
 	// Bash execution state
@@ -496,6 +516,7 @@ export class AgentSession {
 	private _defaultToolModifiers: string[];
 	/** Matches the `--tools` entries: tool names or patterns. */
 	private _allowedTools?: (name: string) => boolean;
+	private readonly _allowedAutoActivationNames?: Set<string>;
 	/**
 	 * Whether the allowlist filters MCP tools: it is empty (`--no-tools`) or names an MCP tool
 	 * (`mcp__*`). Otherwise it keeps MCP tools registered for codemode and tool_search.
@@ -550,6 +571,9 @@ export class AgentSession {
 		this._initialActiveToolNames = config.initialActiveToolNames;
 		this._usesDefaultTools = config.usesDefaultTools ?? false;
 		this._defaultToolModifiers = config.defaultToolModifiers ?? [];
+		this._allowedAutoActivationNames = config.allowedAutoActivationNames
+			? new Set(config.allowedAutoActivationNames)
+			: undefined;
 		if (config.allowedToolNames) {
 			this._allowedTools = createToolNameMatcher(config.allowedToolNames);
 			this._allowlistFiltersMcp =
@@ -557,7 +581,10 @@ export class AgentSession {
 		}
 		this._excludedTools = config.excludedToolNames ? createToolNameMatcher(config.excludedToolNames) : undefined;
 		this._baseToolsOverride = config.baseToolsOverride;
-		this._sessionStartEvent = config.sessionStartEvent ?? { type: "session_start", reason: "startup" };
+		this._sessionStartEvent = config.sessionStartEvent ?? {
+			type: "session_start",
+			reason: "startup",
+		};
 
 		// Always subscribe to agent events for internal handling
 		// (session persistence, extensions, auto-compaction, retry logic)
@@ -639,7 +666,10 @@ export class AgentSession {
 				})
 			: { model: selectedModel, thinkingLevel: this.thinkingLevel };
 		if (this.agent.streamFunction === streamSimple) {
-			return { ...(await this._getRequiredRequestAuth(model, signal)), thinkingLevel };
+			return {
+				...(await this._getRequiredRequestAuth(model, signal)),
+				thinkingLevel,
+			};
 		}
 		if (runtimeStreamFunctions.get(this.agent.streamFunction) === this._modelRuntime) {
 			return { model, thinkingLevel };
@@ -821,14 +851,20 @@ export class AgentSession {
 				if (!assistantMessage) {
 					return Promise.resolve({
 						toolCall,
-						result: { content: [{ type: "text", text: "No assistant message issued this call" }], details: {} },
+						result: {
+							content: [{ type: "text", text: "No assistant message issued this call" }],
+							details: {},
+						},
 						isError: true,
 					});
 				}
 				return runToolCall(toolCall, {
 					tools: this._getCallableTools(),
 					assistantMessage,
-					context: { messages: this.agent.state.messages, tools: this.agent.state.tools },
+					context: {
+						messages: this.agent.state.messages,
+						tools: this.agent.state.tools,
+					},
 					beforeToolCall: (context) => this._beforeToolCall(context, parentId),
 					afterToolCall: (context) => this._afterToolCall(context, parentId),
 					signal,
@@ -892,7 +928,10 @@ export class AgentSession {
 	 * `knownAfterCompaction` is false when the latest compaction has no projected assistant response with usage after it
 	 * (the size is unknown until the next response).
 	 */
-	private _contextTokenEstimate(): { tokens: number; knownAfterCompaction: boolean } {
+	private _contextTokenEstimate(): {
+		tokens: number;
+		knownAfterCompaction: boolean;
+	} {
 		const sessionManager = this.sessionManager;
 		const revision = sessionManager.getProjectionRevision();
 		const cached = this._contextEstimate;
@@ -920,7 +959,12 @@ export class AgentSession {
 			knownAfterCompaction = branch.slice(compactionIndex + 1).some((entry) => projectedAssistants.has(entry.id));
 		}
 		const tokens = estimateProjectedContextTokens(projection, branch).tokens;
-		this._contextEstimate = { sessionManager, revision, tokens, knownAfterCompaction };
+		this._contextEstimate = {
+			sessionManager,
+			revision,
+			tokens,
+			knownAfterCompaction,
+		};
 		return this._contextEstimate;
 	}
 
@@ -932,7 +976,10 @@ export class AgentSession {
 			return { ...context, messages: projection.messages };
 		}
 		await this._runAutoCompaction("threshold", false);
-		return { ...context, messages: this.sessionManager.buildSessionProjection().messages };
+		return {
+			...context,
+			messages: this.sessionManager.buildSessionProjection().messages,
+		};
 	}
 
 	private _installAgentRequestProjection(): void {
@@ -978,7 +1025,11 @@ export class AgentSession {
 				state,
 			});
 			if (route.state !== undefined && route.state !== state) {
-				const data: VirtualModelStateData = { provider: model.provider, modelId: model.id, state: route.state };
+				const data: VirtualModelStateData = {
+					provider: model.provider,
+					modelId: model.id,
+					state: route.state,
+				};
 				const entry = this.sessionManager.getEntry(
 					this.sessionManager.appendCustomEntry(VIRTUAL_MODEL_STATE_ENTRY, data),
 				);
@@ -990,7 +1041,12 @@ export class AgentSession {
 				await this._runAutoCompaction("threshold", false);
 				({ previous, context } = await prepare());
 			}
-			return { ...previous, context, model: route.model, thinkingLevel: route.thinkingLevel };
+			return {
+				...previous,
+				context,
+				model: route.model,
+				thinkingLevel: route.thinkingLevel,
+			};
 		};
 	}
 
@@ -1060,8 +1116,14 @@ export class AgentSession {
 			const options = normalizeBuildSystemPromptOptions({
 				...runOptions,
 				selectedTools: this.getActiveToolNames(),
-				toolSnippets: { ...this._baseSystemPromptOptions.toolSnippets, ...runOptions.toolSnippets },
-				toolGuidelines: { ...this._baseSystemPromptOptions.toolGuidelines, ...runOptions.toolGuidelines },
+				toolSnippets: {
+					...this._baseSystemPromptOptions.toolSnippets,
+					...runOptions.toolSnippets,
+				},
+				toolGuidelines: {
+					...this._baseSystemPromptOptions.toolGuidelines,
+					...runOptions.toolGuidelines,
+				},
 			});
 			const updateMessage = this._preparePromptAndToolLoadout(options, nextContext.messages);
 			// Keep session.systemPrompt and ctx.getSystemPrompt() in step with what the provider sees.
@@ -1203,7 +1265,10 @@ export class AgentSession {
 
 	private async _emitSessionCompactFailed(event: Omit<SessionCompactFailedEvent, "type">): Promise<void> {
 		if (this._extensionRunner.hasHandlers("session_compact_failed")) {
-			await this._extensionRunner.emit({ type: "session_compact_failed", ...event });
+			await this._extensionRunner.emit({
+				type: "session_compact_failed",
+				...event,
+			});
 		}
 	}
 
@@ -1460,7 +1525,10 @@ export class AgentSession {
 			this._turnIndex = 0;
 			await this._extensionRunner.emit({ type: "agent_start" });
 		} else if (event.type === "agent_end") {
-			await this._extensionRunner.emit({ type: "agent_end", messages: event.messages });
+			await this._extensionRunner.emit({
+				type: "agent_end",
+				messages: event.messages,
+			});
 		} else if (event.type === "turn_start") {
 			const extensionEvent: TurnStartEvent = {
 				type: "turn_start",
@@ -1843,7 +1911,10 @@ export class AgentSession {
 	}
 
 	/** Scoped models for cycling (from --models flag) */
-	get scopedModels(): ReadonlyArray<{ model: Model<any>; thinkingLevel?: ThinkingLevel }> {
+	get scopedModels(): ReadonlyArray<{
+		model: Model<any>;
+		thinkingLevel?: ThinkingLevel;
+	}> {
 		return this._scopedModels;
 	}
 
@@ -2245,7 +2316,11 @@ export class AgentSession {
 				hints.push(processed.message);
 				continue;
 			}
-			normalizedImages.push({ type: "image", data: processed.data, mimeType: processed.mimeType });
+			normalizedImages.push({
+				type: "image",
+				data: processed.data,
+				mimeType: processed.mimeType,
+			});
 			hints.push(...processed.hints);
 		}
 		return { images: normalizedImages, hints };
@@ -2495,7 +2570,11 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		const message: AgentMessage = {
+			role: "user",
+			content,
+			timestamp: Date.now(),
+		};
 		if (images?.length) this._queuedMessagesWithImages.add(message);
 		this.agent.steer(message);
 	}
@@ -2510,7 +2589,11 @@ export class AgentSession {
 		if (images) {
 			content.push(...images);
 		}
-		const message: AgentMessage = { role: "user", content, timestamp: Date.now() };
+		const message: AgentMessage = {
+			role: "user",
+			content,
+			timestamp: Date.now(),
+		};
 		if (images?.length) this._queuedMessagesWithImages.add(message);
 		this.agent.followUp(message);
 	}
@@ -2560,7 +2643,10 @@ export class AgentSession {
 	 */
 	async sendCustomMessage<T = unknown>(
 		message: Pick<CustomMessage<T>, "customType" | "content" | "display" | "details">,
-		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" },
+		options?: {
+			triggerTurn?: boolean;
+			deliverAs?: "steer" | "followUp" | "nextTurn";
+		},
 	): Promise<void> {
 		const appMessage = {
 			role: "custom" as const,
@@ -2632,7 +2718,10 @@ export class AgentSession {
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],
-		options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		options?: {
+			deliverAs?: "steer" | "followUp";
+			expandPromptTemplates?: boolean;
+		},
 	): Promise<void> {
 		// Normalize content to text string + optional images
 		let text: string;
@@ -2828,7 +2917,11 @@ export class AgentSession {
 
 		await this._emitModelSelect(next.model, currentModel, "cycle");
 
-		return { model: next.model, thinkingLevel: this.thinkingLevel, isScoped: true };
+		return {
+			model: next.model,
+			thinkingLevel: this.thinkingLevel,
+			isScoped: true,
+		};
 	}
 
 	private async _cycleAvailableModel(
@@ -2856,7 +2949,11 @@ export class AgentSession {
 
 		await this._emitModelSelect(nextModel, currentModel, "cycle");
 
-		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
+		return {
+			model: nextModel,
+			thinkingLevel: this.thinkingLevel,
+			isScoped: false,
+		};
 	}
 
 	// =========================================================================
@@ -3458,7 +3555,13 @@ export class AgentSession {
 				usage,
 				details,
 			};
-			this._emit({ type: "compaction_end", reason, result, aborted: false, willRetry });
+			this._emit({
+				type: "compaction_end",
+				reason,
+				result,
+				aborted: false,
+				willRetry,
+			});
 
 			if (willRetry) return true;
 
@@ -3564,7 +3667,12 @@ export class AgentSession {
 
 	private buildExtensionResourcePaths(entries: Array<{ path: string; extensionPath: string }>): Array<{
 		path: string;
-		metadata: { source: string; scope: "temporary"; origin: "top-level"; baseDir?: string };
+		metadata: {
+			source: string;
+			scope: "temporary";
+			origin: "top-level";
+			baseDir?: string;
+		};
 	}> {
 		return entries.map((entry) => {
 			const source = this.getExtensionSourceLabel(entry.extensionPath);
@@ -3757,6 +3865,7 @@ export class AgentSession {
 		const previousActivatedOnRegistration = new Set(
 			[...this._toolRegistry.keys()].filter((name) => this._isActivatedOnRegistration(name)),
 		);
+		const previousRegistry = this._toolRegistry;
 		const previousActiveToolNames = this.getActiveToolNames();
 		const allowedTools = this._allowedTools;
 
@@ -3765,7 +3874,9 @@ export class AgentSession {
 			...registeredTools,
 			...this._customTools.map((definition) => ({
 				definition,
-				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, { source: "sdk" }),
+				sourceInfo: createSyntheticSourceInfo(`<sdk:${definition.name}>`, {
+					source: "sdk",
+				}),
 			})),
 		].filter((tool) => this._isAllowedTool(tool.definition.name));
 		const definitionRegistry = new Map<string, ToolDefinitionEntry>(
@@ -3830,7 +3941,14 @@ export class AgentSession {
 			for (const toolName of this._toolRegistry.keys()) {
 				// Naming or matching a tool activates it even when it is not active by default. MCP tools
 				// kept registered without being named stay inactive.
-				if (allowedTools(toolName) && this._isDeclarable(toolName)) {
+				if (!allowedTools(toolName)) continue;
+				const selected = this._allowedAutoActivationNames?.has(toolName);
+				const inheritedDeferredMcp =
+					selected === true &&
+					!previousRegistry.has(toolName) &&
+					isMcpToolName(toolName) &&
+					this._getToolExposure(toolName) === "deferred";
+				if ((this._isDeclarable(toolName) && (selected ?? true)) || inheritedDeferredMcp) {
 					nextActiveToolNames.push(toolName);
 				}
 			}
@@ -3926,7 +4044,10 @@ export class AgentSession {
 
 		const oldRunner = this._extensionRunner;
 		const previousFlagValues = oldRunner.getFlagValues();
-		await emitSessionShutdownEvent(oldRunner, { type: "session_shutdown", reason: "reload" });
+		await emitSessionShutdownEvent(oldRunner, {
+			type: "session_shutdown",
+			reason: "reload",
+		});
 		oldRunner.invalidate();
 		const getDefaultTools = () =>
 			this._usesDefaultTools
@@ -3954,7 +4075,10 @@ export class AgentSession {
 
 		if (this._extensionsBound) {
 			await options?.beforeSessionStart?.();
-			await this._extensionRunner.emit({ type: "session_start", reason: "reload" });
+			await this._extensionRunner.emit({
+				type: "session_start",
+				reason: "reload",
+			});
 			this._extensionRunner.reportUnhandledMcpServers();
 			await this.extendResourcesFromExtensions("reload");
 		}
@@ -4103,7 +4227,11 @@ export class AgentSession {
 	async executeBash(
 		command: string,
 		onChunk?: (chunk: string) => void,
-		options?: { excludeFromContext?: boolean; id?: string; operations?: BashOperations },
+		options?: {
+			excludeFromContext?: boolean;
+			id?: string;
+			operations?: BashOperations;
+		},
 	): Promise<BashResult> {
 		const abortController = new AbortController();
 		this._bashAbortControllers.add(abortController);
@@ -4121,7 +4249,11 @@ export class AgentSession {
 				{
 					onChunk: (delta) => {
 						onChunk?.(delta);
-						this._emit({ type: "bash_execution_update", id: options?.id, delta });
+						this._emit({
+							type: "bash_execution_update",
+							id: options?.id,
+							delta,
+						});
 					},
 					signal: abortController.signal,
 				},
@@ -4204,7 +4336,10 @@ export class AgentSession {
 	 */
 	setSessionName(name: string): void {
 		this.sessionManager.appendSessionInfo(name);
-		const event = { type: "session_info_changed", name: this.sessionManager.getSessionName() } as const;
+		const event = {
+			type: "session_info_changed",
+			name: this.sessionManager.getSessionName(),
+		} as const;
 		this._emit(event);
 		void this._extensionRunner.emit(event);
 	}
@@ -4226,8 +4361,18 @@ export class AgentSession {
 	 */
 	async navigateTree(
 		targetId: string,
-		options: { summarize?: boolean; customInstructions?: string; replaceInstructions?: boolean; label?: string } = {},
-	): Promise<{ editorText?: string; cancelled: boolean; aborted?: boolean; summaryEntry?: BranchSummaryEntry }> {
+		options: {
+			summarize?: boolean;
+			customInstructions?: string;
+			replaceInstructions?: boolean;
+			label?: string;
+		} = {},
+	): Promise<{
+		editorText?: string;
+		cancelled: boolean;
+		aborted?: boolean;
+		summaryEntry?: BranchSummaryEntry;
+	}> {
 		if (this.isStreaming || this._promptPreflightCount > 0) {
 			throw new Error("Wait for the current response to finish before navigating the session tree.");
 		}
@@ -4329,7 +4474,9 @@ export class AgentSession {
 					reserveTokens: branchSummarySettings.reserveTokens,
 					streamFn: this.agent.streamFunction,
 					retry: this.settingsManager.getRetrySettings(),
-					callbacks: this._summarizationRetryCallbacks({ source: "branchSummary" }),
+					callbacks: this._summarizationRetryCallbacks({
+						source: "branchSummary",
+					}),
 				});
 				if (result.aborted) {
 					return { cancelled: true, aborted: true };

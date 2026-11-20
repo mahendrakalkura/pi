@@ -1939,6 +1939,10 @@ Typical `sourceInfo` values:
 
 `pi.setActiveTools()` ignores unknown and `hidden` tools. Tools with `codemode` or `deferred` exposure stay callable from codemode scripts whether active or not.
 
+### pi.getCallableToolNames()
+
+`pi.getCallableToolNames()` returns the current session's tool names callable through `ctx.executeTool()`, including tools with `codemode` or `deferred` exposure. Use it with `pi.getActiveTools()` when copying a session's tool selection. Like `pi.getActiveTools()`, this method requires a bound session.
+
 ### pi.isToolAllowed(name)
 
 `pi.isToolAllowed(name)` checks the session's tool-name filter, including `--tools` and `--exclude-tools`. The check works during `session_start`, before the named tool registers. It does not register or activate a tool, and a `true` result does not guarantee the tool exists, is active, or will pass execution hooks. Like `pi.getActiveTools()`, this method throws if called during extension loading before the session binds.
