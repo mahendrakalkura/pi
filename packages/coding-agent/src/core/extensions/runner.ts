@@ -466,6 +466,7 @@ export class ExtensionRunner {
 		this.executeToolFn = contextActions.executeTool;
 		this.executeCommandToolFn = contextActions.executeCommandTool;
 		this.getCallableToolsFn = contextActions.getCallableTools ?? (() => []);
+		this.runtime.getCallableToolNames = () => this.getCallableToolsFn().map((tool) => tool.name);
 
 		// Servers registered from now on reach the extension that connects them right away. Servers
 		// registered during loading are read on session_start.
