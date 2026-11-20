@@ -29,6 +29,9 @@ export interface EditorComponent extends Component {
 	/** Called when user submits (e.g., Enter key) */
 	onSubmit?: (text: string) => void;
 
+	/** Submit the current text the way Enter does, then call onSubmit */
+	submit?(): void;
+
 	/** Called when text changes */
 	onChange?: (text: string) => void;
 

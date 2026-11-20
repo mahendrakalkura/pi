@@ -1,0 +1,38 @@
+# Applies every patch below to node_modules after every `npm install` in packages/coding-agent/bundle.
+# - pi-lsp-project-roots.patch resolves canonical external worktrees with installed servers.
+# - chrome-devtools-mcp.patch makes chrome-devtools-mcp name the CDP target of every page it lists, so
+#   the browser guard in the dotfiles knows which window holds each page.
+# - pi-browser-use.patch reports a browser tool call that outlives its 60 s timeout as a timeout,
+#   instead of the "Allow remote debugging?" prompt text `existing` mode gives every failure.
+# - pi-lsp-adapter.patch prevents cleanup from deleting or rewriting live owners' registrations.
+# - pi-lsp-errors.patch reports failed LSP requests as errors.
+# - pi-subagents.patch copies the active and callable tools and compiled-in extensions into children.
+# - pi-lsp-child-tools.patch skips LSP initialization when the tool filter excludes all LSP tools.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+# apply_patch applies patches/<patch> to node_modules/<package>, once.
+apply_patch() {
+    local target="node_modules/$1"
+    local patch_file="$PWD/patches/$2"
+
+    # An already patched tree reverses cleanly, so there is nothing to do.
+    if patch --dry-run --reverse --force --silent -p1 -d "$target" -i "$patch_file" > /dev/null 2>&1; then
+        return 0
+    fi
+
+    # A version bump that moves the patched lines fails here, before any file is touched.
+    if ! patch --dry-run --forward --force --silent -p1 -d "$target" -i "$patch_file" > /dev/null; then
+        echo "patches/$2 no longer applies to $target; rebase the patch onto the new version" >&2
+        exit 1
+    fi
+    patch --forward --force --silent --no-backup-if-mismatch -p1 -d "$target" -i "$patch_file"
+}
+
+apply_patch "@gotgenes/pi-subagents" pi-subagents.patch
+apply_patch pi-lsp-adapter pi-lsp-adapter.patch
+apply_patch pi-lsp-adapter pi-lsp-errors.patch
+apply_patch pi-lsp-adapter pi-lsp-project-roots.patch
+apply_patch chrome-devtools-mcp chrome-devtools-mcp.patch
+apply_patch pi-browser-use pi-browser-use.patch
+apply_patch pi-lsp-adapter pi-lsp-child-tools.patch

@@ -165,6 +165,40 @@ describe("TUI debug logging", () => {
 });
 
 describe("TUI bounded render output", () => {
+	it("does not write duplicate cursor markers to the terminal", () => {
+		const terminal = new BoundedWriteTerminal();
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		// Regression for #9257: terminals may render the payload of a leaked APC marker.
+		component.lines = [`\x1b[31m界🙂\x1b[0m${CURSOR_MARKER} world${CURSOR_MARKER}`];
+		tui.addChild(component);
+
+		tui.renderNow();
+
+		const output = terminal.writes.join("");
+		assert.ok(output.includes("\x1b[31m界🙂\x1b[0m world"), "visible styled text should be preserved");
+		assert.ok(!output.includes(CURSOR_MARKER), "internal cursor markers must not reach the terminal");
+		assert.ok(output.includes("\x1b[5G"), "the first marker should keep the cursor at visible column 4");
+	});
+
+	it("does not write cursor markers from other visible or scrollback lines", () => {
+		const terminal = new BoundedWriteTerminal();
+		terminal.rows = 2;
+		const tui = new TuiMainScreen(terminal);
+		const component = new TestComponent();
+		// Regression for #9257: cursor extraction must not leave markers on other rendered lines.
+		component.lines = [`offscreen${CURSOR_MARKER}`, `a${CURSOR_MARKER}`, `visible-b${CURSOR_MARKER}`];
+		tui.addChild(component);
+
+		tui.renderNow();
+
+		const output = terminal.writes.join("");
+		assert.ok(output.includes("offscreen"), "full renders should preserve scrollback content");
+		assert.ok(output.includes("a"), "full renders should preserve other visible lines");
+		assert.ok(!output.includes(CURSOR_MARKER), "internal cursor markers must not reach the terminal");
+		assert.ok(output.includes("\x1b[10G"), "the bottom visible marker should determine the cursor column");
+	});
+
 	it("splits a large full render without changing its output", () => {
 		const terminal = new BoundedWriteTerminal();
 		const tui = new TuiMainScreen(terminal);
@@ -1015,6 +1049,38 @@ describe("TUI fake cursor", () => {
 		await terminal.waitForRender();
 		assert.ok(!terminal.getWrites().includes("\x1b[7m"));
 		assert.ok(terminal.getWrites().endsWith("\x1b[3G"));
+		tui.stop();
+	});
+
+	it("places the cursor and resolves fake cursors in frames where the cursor line did not change", async () => {
+		const terminal = new LoggingVirtualTerminal(20, 5);
+		const tui = new TuiMainScreen(terminal, false);
+		const base = new TestComponent();
+		base.lines = ["first", `abc${CURSOR_MARKER}${renderFakeCursor("d")}ef`];
+		const other = new TestComponent();
+		other.lines = ["x"];
+		tui.addChild(base);
+		tui.addChild(other);
+		tui.start();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("abc\x1b[7md\x1b[27mef"));
+
+		// The cursor line is the same string as the frame before (resolved from the frame before): the cursor is placed.
+		terminal.clearWrites();
+		other.lines = ["y"];
+		tui.requestRender();
+		await terminal.waitForRender();
+		assert.ok(terminal.getWrites().includes("y"));
+		assert.ok(terminal.getWrites().endsWith("\x1b[4G"));
+
+		// Showing the hardware cursor resolves the unchanged lines again: the focused fake cursor goes.
+		terminal.clearWrites();
+		tui.setShowHardwareCursor(true);
+		await terminal.waitForRender();
+		const viewport = await terminal.flushAndGetViewport();
+		assert.strictEqual(viewport[1]?.trimEnd(), "abcdef");
+		assert.ok(!terminal.getWrites().includes("\x1b[7md"));
+		assert.ok(terminal.getWrites().endsWith("\x1b[4G"));
 		tui.stop();
 	});
 

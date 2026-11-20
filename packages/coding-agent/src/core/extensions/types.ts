@@ -240,8 +240,9 @@ export interface ExtensionUIContext {
 			/** Called with the overlay handle after the overlay is shown. Use to control visibility. */
 			onHandle?: (handle: OverlayHandle) => void;
 			/**
-			 * Report pi as blocked on user input (OSC 7501 program status) while this component is visible.
-			 * Only applies to inline components, not overlays.
+			 * Report pi as blocked on user input (OSC 7501 program status) while this component waits for input.
+			 * Inline components report it while visible. Overlays report it until `done()` is called, also while
+			 * hidden with `setHidden()`.
 			 */
 			blocked?: { kind: NonNullable<ProgramStatus["kind"]>; message: string };
 		},
@@ -419,6 +420,11 @@ export interface ExtensionToolContext extends ExtensionContext {
  * Includes session control methods only safe in user-initiated commands.
  */
 export interface ExtensionCommandContext extends ExtensionContext {
+	/** Tools {@link executeTool} can call. */
+	readonly tools: readonly AgentTool[];
+	/** Run a tool through validation and the `tool_call` and `tool_result` hooks without adding transcript entries. */
+	executeTool(name: string, args: unknown, options?: ExecuteToolOptions): Promise<AgentToolCallOutcome>;
+
 	/** Get the current base system-prompt construction options. */
 	getSystemPromptOptions(): BuildSystemPromptOptions;
 
@@ -1558,8 +1564,18 @@ export interface MessageRenderOptions extends KeybindingHints {
 	outputPad: number;
 }
 
+/**
+ * Markdown surface a transformer runs on.
+ * - `user`, `assistant`, `assistant-thinking`: transcript messages (the default types of a transformer)
+ * - `custom`: custom messages without a custom renderer, and expanded skill blocks (their content, without Pi's header)
+ * - `summary`: expanded branch and compaction summaries (the summary, without Pi's header)
+ * - `changelog`: Pi's changelog ("What's New" and `/changelog`), the "Extension Updates" notice, and the release note of
+ *   the "Update Available" notice
+ */
+export type MarkdownMessageType = "user" | "assistant" | "assistant-thinking" | "custom" | "summary" | "changelog";
+
 export interface MarkdownTransformContext {
-	messageType: "user" | "assistant" | "assistant-thinking";
+	messageType: MarkdownMessageType;
 	isStreaming: boolean;
 	availableWidth: number;
 	/** Persisted session-entry id. Undefined for live messages or live rendering; available when rendering from persisted session entries. */
@@ -1569,6 +1585,17 @@ export interface MarkdownTransformContext {
 }
 
 export type MarkdownTransformer = (markdown: string, context: MarkdownTransformContext) => string;
+
+export interface MarkdownTransformerOptions {
+	/** Surfaces the transformer runs on. Default: `["user", "assistant", "assistant-thinking"]`. */
+	messageTypes?: readonly MarkdownMessageType[];
+}
+
+/** A registered Markdown transformer and the surfaces it runs on. */
+export interface MarkdownTransformerRegistration {
+	transformer: MarkdownTransformer;
+	messageTypes: ReadonlySet<MarkdownMessageType>;
+}
 
 export interface EntryRenderOptions extends KeybindingHints {
 	expanded: boolean;
@@ -1738,8 +1765,11 @@ export interface ExtensionAPI {
 	/** Register a custom renderer for CustomMessageEntry. */
 	registerMessageRenderer<T = unknown>(customType: string, renderer: MessageRenderer<T>): void;
 
-	/** Register a transformer for user and assistant Markdown before Pi renders it in the interactive transcript. */
-	registerMarkdownTransformer(transformer: MarkdownTransformer): void;
+	/**
+	 * Register a transformer for Markdown before Pi renders it in interactive mode. By default it runs on user,
+	 * assistant and thinking Markdown; `options.messageTypes` selects the surfaces instead.
+	 */
+	registerMarkdownTransformer(transformer: MarkdownTransformer, options?: MarkdownTransformerOptions): void;
 
 	/** Register a custom renderer for CustomEntry. Custom entries do not participate in LLM context. */
 	registerEntryRenderer<T = unknown>(customType: string, renderer: EntryRenderer<T>): void;
@@ -1788,6 +1818,12 @@ export interface ExtensionAPI {
 
 	/** Get the names of the active tools, which are the tools declared to the model. */
 	getActiveTools(): string[];
+
+	/** Names of the tools callable through `ctx.executeTool()`. */
+	getCallableToolNames(): string[];
+
+	/** Check the session's tool-name filter, even before the tool registers. Available after session binding. */
+	isToolAllowed(name: string): boolean;
 
 	/** Get all configured tools with parameter schema, prompt guidelines, exposure, and source metadata. */
 	getAllTools(): ToolInfo[];
@@ -2176,6 +2212,7 @@ export type SetLabelHandler = (entryId: string, label: string | undefined) => vo
  * Contains flag values (defaults set during registration, CLI values set after).
  */
 export interface ExtensionRuntimeState {
+	getCallableToolNames: () => string[];
 	flagValues: Map<string, boolean | string>;
 	/** Legacy provider-config registrations queued during extension loading, processed when runner binds. */
 	pendingProviderRegistrations: Array<{ name: string; config: ProviderConfig; extensionPath: string }>;
@@ -2191,6 +2228,11 @@ export interface ExtensionRuntimeState {
 	invalidate: (message?: string) => void;
 	/** Retain an event-bus subscription until this runtime is invalidated. */
 	trackEventBusSubscription: (unsubscribe: () => void) => () => void;
+	/**
+	 * Report an error thrown by a `pi.events` handler. Dropped before the runner exists; the runner
+	 * replaces this to call its emitError() until the runner is invalidated.
+	 */
+	reportError: (error: ExtensionError) => void;
 	/**
 	 * Register or unregister a provider.
 	 *
@@ -2218,6 +2260,7 @@ export interface ExtensionActions {
 	getSessionName: GetSessionNameHandler;
 	setLabel: SetLabelHandler;
 	getActiveTools: GetActiveToolsHandler;
+	isToolAllowed: (name: string) => boolean;
 	getAllTools: GetAllToolsHandler;
 	getSettings: GetSettingsHandler;
 	setActiveTools: SetActiveToolsHandler;
@@ -2252,7 +2295,9 @@ export interface ExtensionContextActions {
 		args: unknown,
 		options: ExecuteToolOptions,
 	) => Promise<AgentToolCallOutcome>;
-	/** Backs `ExtensionToolContext.tools`. */
+	/** Backs `ExtensionCommandContext.executeTool()` using the same guarded tool pipeline. */
+	executeCommandTool?: (name: string, args: unknown, options: ExecuteToolOptions) => Promise<AgentToolCallOutcome>;
+	/** Backs `ExtensionToolContext.tools` and `ExtensionCommandContext.tools`. */
 	getCallableTools?: () => readonly AgentTool[];
 }
 
@@ -2300,7 +2345,7 @@ export interface Extension {
 	tools: Map<string, RegisteredTool>;
 	messageRenderers: Map<string, MessageRenderer>;
 	toolRenderers?: ToolRendererResolver[];
-	markdownTransformer?: MarkdownTransformer;
+	markdownTransformer?: MarkdownTransformerRegistration;
 	entryRenderers?: Map<string, EntryRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	flags: Map<string, ExtensionFlag>;

@@ -32,10 +32,16 @@ describe("issue #7829 invalid settings warning", () => {
 				ui: { requestRender: vi.fn() },
 				version: "test",
 				showWarning: (InteractiveMode.prototype as unknown as { showWarning(message: string): void }).showWarning,
+				showRuntimeDiagnostics: (
+					InteractiveMode.prototype as unknown as {
+						showRuntimeDiagnostics(diagnostics: readonly AgentSessionRuntimeDiagnostic[]): void;
+					}
+				).showRuntimeDiagnostics,
 				session: harness.session,
 				checkForPackageUpdates: vi.fn().mockResolvedValue([]),
 				checkTmuxKeyboardSetup: vi.fn().mockResolvedValue(undefined),
 				maybeWarnAboutAnthropicSubscriptionAuth: vi.fn(),
+				promptInitialMessages: vi.fn(async () => {}),
 				getUserInput: vi.fn(() => new Promise<string>(() => {})),
 			};
 			const run = (InteractiveMode.prototype as unknown as { run(this: typeof context): Promise<void> }).run;

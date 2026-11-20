@@ -978,6 +978,18 @@ describe("Editor component", () => {
 			assert.strictEqual(chunks[1]!.text, "world test");
 		});
 
+		it("keeps a wide character wider than the width as a chunk of its own", () => {
+			// (It used to re-wrap the character by itself, without end.)
+			assert.deepStrictEqual(
+				wordWrapLine("a中b", 1).map((chunk) => chunk.text),
+				["a", "中", "b"],
+			);
+			assert.deepStrictEqual(
+				wordWrapLine("中", 1, [...new Intl.Segmenter().segment("中")]).map((chunk) => chunk.text),
+				["中"],
+			);
+		});
+
 		it("keeps whitespace at terminal width boundary on same line", () => {
 			// "hello world " is exactly 12 chars (including trailing space)
 			// The space at position 12 should stay on the first line
@@ -1595,6 +1607,20 @@ describe("Editor component", () => {
 	});
 
 	describe("Undo", () => {
+		it("leaves nothing to undo after submit(), as after Enter", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+
+			editor.handleInput("a");
+			editor.handleInput("b");
+			editor.submit();
+			editor.handleInput("\x1b[45;5u"); // Ctrl+- (undo)
+
+			assert.deepStrictEqual(submitted, ["ab"]);
+			assert.strictEqual(editor.getText(), "");
+		});
+
 		it("does nothing when undo stack is empty", () => {
 			const editor = new Editor(createTestTUI(), defaultEditorTheme);
 
@@ -2289,6 +2315,75 @@ describe("Editor component", () => {
 				assert.strictEqual(editor.getText(), `${before}文档/说明.md`);
 				assert.deepStrictEqual(editor.getCursor(), { line: 0, col: editor.getText().length });
 			}
+		});
+
+		// Regression test for #12309: Enter on a Tab menu for an absolute path submitted the prompt.
+		it("Enter on a Tab path menu with a / prefix completes without submitting", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+			editor.setAutocompleteProvider({
+				getSuggestions: async () => ({
+					items: [
+						{ value: "/tmp/x/file-one.md", label: "file-one.md" },
+						{ value: "/tmp/x/file-two.md", label: "file-two.md" },
+					],
+					prefix: "/tmp/x/fi",
+				}),
+				applyCompletion,
+			});
+			editor.setText("look at /tmp/x/fi");
+
+			editor.handleInput("\t");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\r");
+
+			assert.deepStrictEqual(submitted, []);
+			assert.strictEqual(editor.getText(), "look at /tmp/x/file-one.md");
+		});
+
+		it("Enter on an argument menu with a / prefix completes without submitting", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider(
+					[
+						{
+							name: "open",
+							getArgumentCompletions: (prefix) =>
+								prefix.startsWith("/") ? [{ value: "/tmp/alpha", label: "alpha" }] : null,
+						},
+					],
+					process.cwd(),
+				),
+			);
+
+			for (const char of "/open /tm") editor.handleInput(char);
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\r");
+
+			assert.deepStrictEqual(submitted, []);
+			assert.strictEqual(editor.getText(), "/open /tmp/alpha");
+		});
+
+		it("Enter on a Tab slash command menu submits the command", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			const submitted: string[] = [];
+			editor.onSubmit = (text) => submitted.push(text);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "model" }, { name: "session" }], process.cwd()),
+			);
+			editor.setText("/mo");
+
+			editor.handleInput("\t");
+			await flushAutocomplete();
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\r");
+
+			assert.deepStrictEqual(submitted, ["/model"]);
 		});
 
 		it("ends unquoted trigger and debounce contexts at whitespace or CJK punctuation", async (t) => {
@@ -4032,6 +4127,27 @@ describe("Editor component", () => {
 			editor.handleInput("\x7f"); // delete marker #1, renumber #3 -> #2 and #2 -> #1
 			editor.handleInput("\r");
 			assert.strictEqual(submitted, pasteC + pasteB);
+		});
+
+		// Regression test for #11923
+		it("renumbers short paste markers without a size suffix", () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			let submitted = "";
+			editor.onSubmit = (t) => {
+				submitted = t;
+			};
+
+			const pasteA = bigPaste("alpha");
+			const pasteB = bigPaste("beta");
+			editor.handleInput(`\x1b[200~${pasteA}\x1b[201~`); // #1 = A
+			editor.handleInput(`\x1b[200~${pasteB}\x1b[201~`); // #2 = B
+			editor.handleInput("\x15"); // Ctrl+U clears the line, registry stays
+			for (const ch of "[paste #1][paste #2]") editor.handleInput(ch);
+			editor.handleInput("\x1b[D"); // left over marker #2
+			editor.handleInput("\x7f"); // delete marker #1, renumber #2 -> #1
+			assert.strictEqual(editor.getText(), "[paste #1]");
+			editor.handleInput("\r");
+			assert.strictEqual(submitted, pasteB);
 		});
 
 		it("undo after setText restores paste markers and registry", () => {

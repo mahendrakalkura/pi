@@ -8,14 +8,15 @@ import { createRequire } from "node:module";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Provider } from "@earendil-works/pi-ai";
+import { mcpNamespace } from "@earendil-works/pi-mcp";
 import type { KeyId } from "@earendil-works/pi-tui";
 import type { createJiti } from "jiti";
 import { CONFIG_DIR_NAME, getAgentDir, isBunBinary, isBundledNode } from "../../config.ts";
-import { pathsEqual, resolvePath } from "../../utils/paths.ts";
+import { canonicalizePath, pathsEqual, resolvePath } from "../../utils/paths.ts";
 import { createEventBus, type EventBus } from "../event-bus.ts";
 import type { ExecOptions } from "../exec.ts";
 import { execCommand } from "../exec.ts";
-import { type McpServerConfig, McpServerRegistry, mcpNamespace, validateMcpServerConfig } from "../mcp-servers.ts";
+import { type McpServerConfig, McpServerRegistry, validateMcpServerConfig } from "../mcp-servers.ts";
 import { readPiManifest } from "../pi-manifest.ts";
 import { createSyntheticSourceInfo, getSyntheticPathSource, isSyntheticPath } from "../source-info.ts";
 import { time } from "../timings.ts";
@@ -28,7 +29,9 @@ import type {
 	ExtensionRuntime,
 	ExtensionVirtualModel,
 	LoadExtensionsResult,
+	MarkdownMessageType,
 	MarkdownTransformer,
+	MarkdownTransformerOptions,
 	MessageRenderer,
 	ProviderConfig,
 	RegisteredCommand,
@@ -178,6 +181,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getSessionName: notInitialized,
 		setLabel: notInitialized,
 		getActiveTools: notInitialized,
+		getCallableToolNames: notInitialized,
+		isToolAllowed: notInitialized,
 		getAllTools: notInitialized,
 		getSettings: notInitialized,
 		setActiveTools: notInitialized,
@@ -213,6 +218,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
 			eventBusUnsubscribers.add(trackedUnsubscribe);
 			return trackedUnsubscribe;
 		},
+		// Nothing can show an error yet. The runner replaces this when it is created.
+		reportError: () => {},
 		// Pre-bind: queue registrations so bindCore() can flush them once the
 		// model registry is available. bindCore() replaces both with direct calls.
 		registerProvider: (name, config, extensionPath = "<unknown>") => {
@@ -245,6 +252,8 @@ export function createExtensionRuntime(): ExtensionRuntime {
  * Registration methods write to the extension object.
  * Action methods delegate to the shared runtime.
  */
+const DEFAULT_MARKDOWN_MESSAGE_TYPES: readonly MarkdownMessageType[] = ["user", "assistant", "assistant-thinking"];
+
 function createExtensionAPI(
 	extension: Extension,
 	runtime: ExtensionRuntime,
@@ -357,9 +366,12 @@ function createExtensionAPI(
 			extension.messageRenderers.set(customType, renderer as MessageRenderer);
 		},
 
-		registerMarkdownTransformer(transformer: MarkdownTransformer): void {
+		registerMarkdownTransformer(transformer: MarkdownTransformer, options?: MarkdownTransformerOptions): void {
 			assertActive();
-			extension.markdownTransformer = transformer;
+			extension.markdownTransformer = {
+				transformer,
+				messageTypes: new Set(options?.messageTypes ?? DEFAULT_MARKDOWN_MESSAGE_TYPES),
+			};
 		},
 
 		registerEntryRenderer<T>(customType: string, renderer: EntryRenderer<T>): void {
@@ -420,6 +432,16 @@ function createExtensionAPI(
 		getActiveTools(): string[] {
 			assertActive();
 			return runtime.getActiveTools();
+		},
+
+		getCallableToolNames(): string[] {
+			assertActive();
+			return runtime.getCallableToolNames();
+		},
+
+		isToolAllowed(name: string): boolean {
+			assertActive();
+			return runtime.isToolAllowed(name);
 		},
 
 		getAllTools() {
@@ -524,7 +546,21 @@ function createExtensionAPI(
 			},
 			on(channel, handler) {
 				assertActive();
-				const unsubscribe = runtime.trackEventBusSubscription(eventBus.on(channel, handler));
+				// Report a throwing handler like other extension errors. The event bus would print it with
+				// console.error, which draws over the interactive TUI (#11264).
+				const reportingHandler = async (data: unknown) => {
+					try {
+						await handler(data);
+					} catch (error) {
+						runtime.reportError({
+							extensionPath: extension.path,
+							event: `events:${channel}`,
+							error: error instanceof Error ? error.message : String(error),
+							stack: error instanceof Error ? error.stack : undefined,
+						});
+					}
+				};
+				const unsubscribe = runtime.trackEventBusSubscription(eventBus.on(channel, reportingHandler));
 				if (state === "loading") loadingUnsubscribers.push(unsubscribe);
 				return unsubscribe;
 			},
@@ -582,7 +618,7 @@ async function loadExtensionModule(extensionPath: string, cacheToken?: Extension
 		...resolutionOptions,
 	});
 
-	const module = await jiti.import(extensionPath, { default: true });
+	const module = await jiti.import(canonicalizePath(extensionPath), { default: true });
 	const factory = module as ExtensionFactory;
 	if (typeof factory !== "function") {
 		return undefined;

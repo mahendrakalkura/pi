@@ -7,6 +7,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { getIdentityHeaders } from "../utils/identity.ts";
 import { retryProviderRequest } from "../utils/provider-retry.ts";
+import { cacheRequestBody } from "../utils/request-body.ts";
 import { getDeclaredTools, resolveTranscript, resolveTranscriptTools } from "../utils/transcript.ts";
 import { type AzureEndpointOptions, resolveAzureConfig, resolveDeploymentName } from "./azure-openai-config.ts";
 import { createGrammarToolInputProperties } from "./constrained-sampling.ts";
@@ -17,6 +18,7 @@ import {
 	getResponsesToolSupport,
 	processResponsesStream,
 } from "./openai-responses-shared.ts";
+import { iterateOpenAIStream } from "./openai-sse.ts";
 import { buildBaseOptions, resolveSamplingParams } from "./simple-options.ts";
 
 const AZURE_TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode", "azure"]);
@@ -83,6 +85,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 			if (nextParams !== undefined) {
 				params = nextParams as ResponseCreateParamsStreaming;
 			}
+			cacheRequestBody(client, params.input, "input", options?.sessionId);
 			const requestOptions = {
 				...(options?.signal ? { signal: options.signal } : {}),
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
@@ -99,7 +102,7 @@ export const stream: StreamFunction<"azure-openai-responses", AzureOpenAIRespons
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
-			await processResponsesStream(openaiStream, output, stream, model, {
+			await processResponsesStream(iterateOpenAIStream(openaiStream, response, client), output, stream, model, {
 				onProviderStreamEvent: options?.onProviderStreamEvent,
 				grammarToolInputProperties,
 			});
@@ -205,7 +208,8 @@ function buildParams(
 		model: deploymentName,
 		input: messages,
 		stream: true,
-		prompt_cache_key: clampOpenAIPromptCacheKey(options?.sessionId),
+		prompt_cache_key:
+			model.compat?.promptCacheKeyMode === "disabled" ? undefined : clampOpenAIPromptCacheKey(options?.sessionId),
 		store: false,
 	};
 

@@ -19,6 +19,7 @@ import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { shortHash } from "../utils/hash.ts";
 import { headersToRecord } from "../utils/headers.ts";
 import { getIdentityHeaders } from "../utils/identity.ts";
+import { cacheJsonSerialization } from "../utils/json-body.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
 import { ToolCallArgumentsStream } from "../utils/streaming-json.ts";
 import { getSystemMessageText, renderSystemMessageUpdate } from "../utils/text.ts";
@@ -394,6 +395,7 @@ function toMistralWirePayload(payload: MistralChatPayload): Record<string, unkno
 		remapMistralProperty(wirePayload, source, target);
 	}
 	wirePayload.messages = payload.messages.map((message) => toMistralWireMessage(message));
+	cacheJsonSerialization(wirePayload.messages);
 
 	const responseFormat = wirePayload.response_format;
 	if (isMistralRecord(responseFormat)) {
@@ -529,7 +531,9 @@ function buildChatPayload(
 	};
 
 	const currentTools = getCurrentTools(context.messages);
-	if (currentTools.length > 0) payload.tools = toFunctionTools(currentTools);
+	// Strict tools are opt-in: Mistral Large 4 can go silent for minutes before a strict tool call (#12148).
+	if (currentTools.length > 0)
+		payload.tools = toFunctionTools(currentTools, model.compat?.supportsStrictMode ?? false);
 	if (options?.temperature !== undefined) payload.temperature = options.temperature;
 	if (options?.maxTokens !== undefined) payload.maxTokens = options.maxTokens;
 	if (options?.toolChoice) payload.toolChoice = mapToolChoice(options.toolChoice);
@@ -746,9 +750,9 @@ async function consumeChatStream(
 	}
 }
 
-function toFunctionTools(tools: Tool[]): MistralFunctionTool[] {
+function toFunctionTools(tools: Tool[], supportsStrictMode: boolean): MistralFunctionTool[] {
 	return tools.map((tool) => {
-		const strict = resolveJsonSchemaStrictSampling(tool, true);
+		const strict = resolveJsonSchemaStrictSampling(tool, supportsStrictMode);
 		return {
 			type: "function",
 			function: {

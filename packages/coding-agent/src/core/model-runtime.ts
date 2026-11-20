@@ -191,6 +191,8 @@ export class ModelRuntime implements Models {
 		storedProviders: new Set(),
 		auth: new Map(),
 	};
+	/** Set while registerWithoutRefresh() runs its registrations. */
+	private registeringWithoutRefresh = false;
 	private availabilityRefreshSeq = 0;
 	private availabilityErrorSeq = 0;
 	private readonly providerAvailabilitySeq = new Map<string, number>();
@@ -212,7 +214,7 @@ export class ModelRuntime implements Models {
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
 		this.models = createModels({ credentials, modelsStore });
-		this.rebuildProviders();
+		// (create() composes the providers: once the radius ones are configured.)
 	}
 
 	static async create(options: CreateModelRuntimeOptions = {}): Promise<ModelRuntime> {
@@ -247,8 +249,11 @@ export class ModelRuntime implements Models {
 			providers,
 			process.env.PI_OFFLINE === undefined,
 		);
-		runtime.configureRadiusProviders();
-		runtime.rebuildProviders();
+		// refresh() configures and composes the providers itself, first thing.
+		if (options.refreshOnCreate === false) {
+			runtime.configureRadiusProviders();
+			runtime.rebuildProviders();
+		}
 		const refreshFromNetwork = runtime.modelNetworkEnabled && options.allowModelNetwork === true;
 		const controller =
 			refreshFromNetwork && options.modelRefreshTimeoutMs !== undefined ? new AbortController() : undefined;
@@ -640,6 +645,14 @@ export class ModelRuntime implements Models {
 		});
 	}
 
+	/**
+	 * Wait until credential writes already in progress finish, such as an OAuth refresh started by a
+	 * background catalog refresh. Call before the process exits so a rotated token is not lost.
+	 */
+	settleCredentialWrites(): Promise<void> {
+		return this.credentials.settled();
+	}
+
 	listCredentials(options?: AuthOperationOptions): Promise<readonly CredentialInfo[]> {
 		return this.credentials.list(options);
 	}
@@ -710,14 +723,19 @@ export class ModelRuntime implements Models {
 		options?: ModelsApiStreamOptions<TApi>,
 	): AssistantMessageEventStream {
 		const transcript = normalizeContext(context);
-		return lazyStream(model, async () => {
-			assertChatModel(model);
-			const prepared = await this.prepareRequest(
-				model,
-				options as (StreamOptions & ModelsRequestTransforms) | undefined,
-			);
-			return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				assertChatModel(model);
+				const prepared = await this.prepareRequest(
+					model,
+					options as (StreamOptions & ModelsRequestTransforms) | undefined,
+				);
+				return prepared.provider.stream(prepared.model, transcript, prepared.options as ApiStreamOptions<TApi>);
+			},
+			undefined,
+			options?.signal,
+		);
 	}
 
 	complete<TApi extends Api>(
@@ -733,27 +751,38 @@ export class ModelRuntime implements Models {
 		if (isVirtualModel(model)) {
 			// Requests outside the agent loop are routed here. Callers sized them before routing, so
 			// cap the output budget to the routed model.
-			return lazyStream(model, async () => {
-				const route = await this.resolveModel(model, transcript.messages, {
-					reason: "direct",
-					thinkingLevel: options?.reasoning ?? "off",
-					signal: options?.signal,
-				});
-				const { maxTokens: limit } = route.model;
-				const maxTokens = options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
-				const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
-				// Caller credentials were resolved for the virtual model's provider. Another provider
-				// resolves its own, so they are not sent to the wrong vendor.
-				const { apiKey, headers, env, ...rest } = options ?? {};
-				const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
-				return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
-			});
+			return lazyStream(
+				model,
+				async () => {
+					const route = await this.resolveModel(model, transcript.messages, {
+						reason: "direct",
+						thinkingLevel: options?.reasoning ?? "off",
+						signal: options?.signal,
+					});
+					const { maxTokens: limit } = route.model;
+					const maxTokens =
+						options?.maxTokens && limit > 0 ? Math.min(options.maxTokens, limit) : options?.maxTokens;
+					const reasoning = route.thinkingLevel === "off" ? undefined : route.thinkingLevel;
+					// Caller credentials were resolved for the virtual model's provider. Another provider
+					// resolves its own, so they are not sent to the wrong vendor.
+					const { apiKey, headers, env, ...rest } = options ?? {};
+					const auth = route.model.provider === model.provider ? { apiKey, headers, env } : {};
+					return this.streamSimple(route.model, context, { ...rest, ...auth, maxTokens, reasoning });
+				},
+				undefined,
+				options?.signal,
+			);
 		}
-		return lazyStream(model, async () => {
-			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
-			return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				assertChatModel(model);
+				const prepared = await this.prepareRequest(model, options);
+				return prepared.provider.streamSimple(prepared.model, transcript, prepared.options as SimpleStreamOptions);
+			},
+			undefined,
+			options?.signal,
+		);
 	}
 
 	completeSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): Promise<AssistantMessage> {
@@ -765,14 +794,19 @@ export class ModelRuntime implements Models {
 		handle: DeferredHandle,
 		options?: ModelsDeferredFetchOptions,
 	): AssistantMessageEventStream {
-		return lazyStream(model, async () => {
-			assertChatModel(model);
-			const prepared = await this.prepareRequest(model, options);
-			if (!prepared.provider.fetchDeferred) {
-				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
-			}
-			return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
-		});
+		return lazyStream(
+			model,
+			async () => {
+				assertChatModel(model);
+				const prepared = await this.prepareRequest(model, options);
+				if (!prepared.provider.fetchDeferred) {
+					throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+				}
+				return prepared.provider.fetchDeferred(prepared.model, handle, prepared.options as DeferredFetchOptions);
+			},
+			undefined,
+			options?.signal,
+		);
 	}
 
 	async fetchDeferred(
@@ -896,6 +930,25 @@ export class ModelRuntime implements Models {
 		return { aborted: result.aborted || (options.signal?.aborted ?? false), errors };
 	}
 
+	/**
+	 * Runs `register`, whose provider and model registrations start no refresh of their own, for a caller that refreshes
+	 * once they are all made (createAgentSessionServices()): each would otherwise start a full refresh, which the caller's
+	 * then repeats.
+	 */
+	registerWithoutRefresh(register: () => void): void {
+		this.registeringWithoutRefresh = true;
+		try {
+			register();
+		} finally {
+			this.registeringWithoutRefresh = false;
+		}
+	}
+
+	/** After a registration: a refresh in the background, unless registerWithoutRefresh() leaves it to its caller. */
+	private refreshAfterChange(): void {
+		if (!this.registeringWithoutRefresh) void this.refresh({ allowNetwork: false });
+	}
+
 	registerNativeProvider(provider: Provider): void {
 		if (!provider.id.trim()) throw new Error("Provider id must not be empty.");
 		this.extensionProviders.delete(provider.id);
@@ -907,7 +960,7 @@ export class ModelRuntime implements Models {
 			configuredRequestAuthStatus(this.config.getProvider(provider.id), undefined),
 			provider.auth.oauth && !provider.auth.apiKey ? "oauth" : "api_key",
 		);
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	/**
@@ -953,7 +1006,7 @@ export class ModelRuntime implements Models {
 			configuredRequestAuthStatus(this.config.getProvider(providerId), effective),
 			effective.oauth && !effective.apiKey ? "oauth" : "api_key",
 		);
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	unregisterProvider(providerId: string): void {
@@ -961,7 +1014,7 @@ export class ModelRuntime implements Models {
 		this.nativeExtensionProviders.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	/**
@@ -987,7 +1040,7 @@ export class ModelRuntime implements Models {
 			this.snapshot = { ...this.snapshot, auth, configuredProviders };
 		}
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	unregisterVirtualModel(providerId: string, id: string): void {
@@ -996,7 +1049,7 @@ export class ModelRuntime implements Models {
 		if (models.size === 0) this.virtualModels.delete(providerId);
 		this.recomposeProvider(providerId);
 		this.updateModelSnapshot();
-		void this.refresh({ allowNetwork: false });
+		this.refreshAfterChange();
 	}
 
 	/**

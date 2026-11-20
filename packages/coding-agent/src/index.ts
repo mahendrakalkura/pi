@@ -122,8 +122,11 @@ export type {
 	KeybindingsManager,
 	LoadExtensionsResult,
 	LsToolCallEvent,
+	MarkdownMessageType,
 	MarkdownTransformContext,
 	MarkdownTransformer,
+	MarkdownTransformerOptions,
+	MarkdownTransformerRegistration,
 	McpServersChangeEvent,
 	MessageEndEvent,
 	MessageEndEventResult,
@@ -332,6 +335,7 @@ export {
 	type Skill,
 	type SkillFrontmatter,
 } from "./core/skills.ts";
+export { BUILTIN_SLASH_COMMANDS, type BuiltinSlashCommand } from "./core/slash-commands.ts";
 export { createSyntheticSourceInfo } from "./core/source-info.ts";
 export { type EditDiffResult, generateDiffString, generateUnifiedPatch } from "./core/tools/edit-diff.ts";
 // Tools
