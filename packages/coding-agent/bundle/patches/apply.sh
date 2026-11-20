@@ -5,6 +5,7 @@
 #   instead of the "Allow remote debugging?" prompt text `existing` mode gives every failure.
 # - pi-lsp-adapter.patch keeps the language servers of every live owner in this process, so a
 #   subagent child's startup cleanup never terminates its parent's servers.
+# - pi-lsp-errors.patch reports failed LSP requests as errors.
 # - pi-subagents.patch hands a child session the inline extensions that subagents.json
 #   `childInlineExtensions` names, out of the ones Pi's main() publishes on globalThis, and gives an
 #   agent whose `tools:` holds `*` the main session's own tool selection. It also keeps background
@@ -32,5 +33,6 @@ apply_patch() {
 
 apply_patch "@gotgenes/pi-subagents" pi-subagents.patch
 apply_patch pi-lsp-adapter pi-lsp-adapter.patch
+apply_patch pi-lsp-adapter pi-lsp-errors.patch
 apply_patch chrome-devtools-mcp chrome-devtools-mcp.patch
 apply_patch pi-browser-use pi-browser-use.patch

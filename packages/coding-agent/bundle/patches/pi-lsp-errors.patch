@@ -1,0 +1,92 @@
+diff -ruN a/src/tools/lspFormat.ts b/src/tools/lspFormat.ts
+--- a/src/tools/lspFormat.ts
++++ b/src/tools/lspFormat.ts
+@@ -19,6 +19,8 @@
+ export interface LspToolResult<TDetails> {
+   content: [{ type: "text"; text: string }];
+   details: TDetails;
++  /** Set on a failure, so Pi reports the result to the model and the session log as an error. */
++  isError?: true;
+ }
+ 
+ export interface FormatOptions {
+@@ -96,7 +98,8 @@
+ }
+ 
+ export function failure(tool: string, error: unknown): LspToolResult<{ ok: false; tool: string; error: string }> {
+-  return success(`${tool} failed: ${messageFromError(error)}`, { ok: false, tool, error: messageFromError(error) });
++  const message = messageFromError(error);
++  return { ...success(`${tool} failed: ${message}`, { ok: false, tool, error: message }), isError: true };
+ }
+ 
+ export function formatDiagnostics(
+diff -ruN a/src/tools/resultCache.ts b/src/tools/resultCache.ts
+--- a/src/tools/resultCache.ts
++++ b/src/tools/resultCache.ts
+@@ -80,25 +80,31 @@
+     return this.entries.has(entry.id) ? entry.id : undefined;
+   }
+ 
+-  next(resultId: string): { content: [{ type: "text"; text: string }]; details: unknown } {
++  next(resultId: string): { content: [{ type: "text"; text: string }]; details: unknown; isError?: true } {
+     if (!isLspResultId(resultId)) {
+-      return toolResult("Invalid LSP resultId format. Use the exact resultId from a previous paginated LSP result.", {
+-        ok: false,
+-        error: "invalid-result-id",
+-      });
++      return {
++        ...toolResult("Invalid LSP resultId format. Use the exact resultId from a previous paginated LSP result.", {
++          ok: false,
++          error: "invalid-result-id",
++        }),
++        isError: true,
++      };
+     }
+ 
+     this.evictExpired();
+     const entry = this.entries.get(resultId);
+     if (!entry) {
+-      return toolResult(
+-        "Cached LSP result not found or expired. Re-run the original LSP query to get a fresh resultId.",
+-        {
+-          ok: false,
+-          resultId,
+-          error: "not-found",
+-        },
+-      );
++      return {
++        ...toolResult(
++          "Cached LSP result not found or expired. Re-run the original LSP query to get a fresh resultId.",
++          {
++            ok: false,
++            resultId,
++            error: "not-found",
++          },
++        ),
++        isError: true,
++      };
+     }
+ 
+     entry.accessedAt = this.now();
+diff -ruN a/test/tool-errors.test.ts b/test/tool-errors.test.ts
+--- a/test/tool-errors.test.ts
++++ b/test/tool-errors.test.ts
+@@ -0,0 +1,18 @@
++import { describe, expect, it } from "bun:test";
++import { failure } from "../src/tools/lspFormat.ts";
++import { LspResultCache } from "../src/tools/resultCache.ts";
++
++describe("LSP failures", () => {
++  it("reports a failed tool call as an error and keeps its details", () => {
++    const result = failure("lsp_definition", new Error("no server"));
++    expect(result.isError).toBe(true);
++    expect(result.content[0].text).toBe("lsp_definition failed: no server");
++    expect(result.details).toEqual({ ok: false, tool: "lsp_definition", error: "no server" });
++  });
++
++  it("reports an unknown or malformed lsp_more resultId as an error", () => {
++    const cache = new LspResultCache();
++    expect(cache.next("not-an-id").isError).toBe(true);
++    expect(cache.next("lspres_00000000-0000-4000-8000-000000000000").isError).toBe(true);
++  });
++});
