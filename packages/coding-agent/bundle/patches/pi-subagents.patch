@@ -457,6 +457,34 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
  					}),
  				),
  				inherit_context: Type.Optional(
+diff -ruN a/src/ui/display.ts b/src/ui/display.ts
+--- a/src/ui/display.ts
++++ b/src/ui/display.ts
+@@ -18,6 +18,8 @@
+ export interface ModelIdentity {
+   readonly provider: string;
+   readonly id: string;
++  /** Human-friendly catalog name (`Model.name`); absent on the narrow callers that build this by hand. */
++  readonly name?: string;
+ }
+ 
+ export type Theme = {
+diff -ruN a/src/ui/widget-renderer.ts b/src/ui/widget-renderer.ts
+--- a/src/ui/widget-renderer.ts
++++ b/src/ui/widget-renderer.ts
+@@ -132,9 +132,10 @@
+ 	return budget.phase === "warned" ? theme.fg("warning", turns) : turns;
+ }
+ 
+-/** ` [provider/id]` after the agent's name, or nothing while the model is unknown. */
++/** ` [name]` after the agent's name - the friendly catalog name, or `provider/id`; nothing while the model is unknown. */
+ function modelTag(agent: WidgetAgent, theme: Theme): string {
+-	return agent.model ? ` ${theme.fg("dim", `[${formatModel(agent.model)}]`)}` : "";
++	const label = agent.model ? (agent.model.name || formatModel(agent.model)) : "";
++	return label ? ` ${theme.fg("dim", `[${label}]`)}` : "";
+ }
+ 
+ // ── Full widget rendering ────────────────────────────────────────────────────
 diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 --- a/test/background-resume.test.ts
 +++ b/test/background-resume.test.ts
@@ -985,5 +1013,79 @@ diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
 +    const options = await spawn(["read", "browser_*"]);
 +    expect(options.tools).toEqual(["read", "browser_*", "ask_parent"]);
 +    expect(options.excludeTools).toEqual(RECURSION_GUARD);
++  });
++});
+diff -ruN a/test/model-name.test.ts b/test/model-name.test.ts
+--- a/test/model-name.test.ts
++++ b/test/model-name.test.ts
+@@ -0,0 +1,70 @@
++// Tests for the Pi fork's pi-subagents patch: the agents widget renders the friendly
++// model name when the model carries one, and falls back to provider/id.
++// Run: cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
++
++import { describe, expect, it } from "bun:test";
++import { AgentTypeRegistry } from "#src/config/agent-types";
++import { renderFinishedLine, renderRunningLines, type WidgetAgent } from "#src/ui/widget-renderer";
++
++const THEME = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
++const REGISTRY = new AgentTypeRegistry(() => new Map([["general-purpose", {
++  name: "general-purpose",
++  displayName: "General Purpose",
++  description: "test",
++  systemPrompt: "",
++  promptMode: "append",
++}]]));
++
++function widgetAgent(model: WidgetAgent["model"]): WidgetAgent {
++  return {
++    id: "a",
++    type: "general-purpose",
++    status: "running",
++    description: "do work",
++    toolUses: 3,
++    startedAt: 1000,
++    compactionCount: 0,
++    activeTools: new Map(),
++    responseText: "",
++    contextPercent: null,
++    turnBudget: { used: 3, maxTurns: 60, phase: "within" },
++    model,
++  };
++}
++
++describe("agents widget model tag", () => {
++  it("renders the friendly name alone when the model carries one", () => {
++    const [header] = renderRunningLines(
++      widgetAgent({ provider: "mk-deepseek", id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" }),
++      REGISTRY,
++      0,
++      THEME,
++    );
++    expect(header).toContain("[DeepSeek V4 Pro]");
++    expect(header).not.toContain("mk-deepseek/deepseek-v4-pro");
++  });
++
++  it("falls back to provider/id when the name is absent", () => {
++    const [header] = renderRunningLines(
++      widgetAgent({ provider: "mk-deepseek", id: "deepseek-v4-pro" }),
++      REGISTRY,
++      0,
++      THEME,
++    );
++    expect(header).toContain("[mk-deepseek/deepseek-v4-pro]");
++  });
++
++  it("renders no tag when the model is unknown", () => {
++    const [header] = renderRunningLines(widgetAgent(undefined), REGISTRY, 0, THEME);
++    expect(header).not.toContain("[");
++  });
++
++  it("uses the friendly name on a finished line too", () => {
++    const line = renderFinishedLine(
++      { ...widgetAgent({ provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" }), status: "completed", completedAt: 5000 },
++      REGISTRY,
++      THEME,
++    );
++    expect(line).toContain("[Claude Sonnet 4.5]");
 +  });
 +});
