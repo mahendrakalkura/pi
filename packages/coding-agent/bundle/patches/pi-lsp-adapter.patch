@@ -1,7 +1,7 @@
 diff -ruN a/src/lsp/processRegistry.ts b/src/lsp/processRegistry.ts
 --- a/src/lsp/processRegistry.ts
 +++ b/src/lsp/processRegistry.ts
-@@ -40,6 +40,11 @@
+@@ -40,13 +40,18 @@
    kept: LspProcessEntry[];
  }
  
@@ -9,10 +9,18 @@ diff -ruN a/src/lsp/processRegistry.ts b/src/lsp/processRegistry.ts
 +// An entry this process owns is stale only when its owner is no longer live here; without this,
 +// a child's startup cleanup would terminate its parent's running language servers.
 +const liveOwners = new Set<string>();
++const mutationQueues = new Map<string, Promise<void>>();
 +
  export class LspProcessRegistry {
    private readonly path: string;
    private readonly dir: string;
+   private readonly ownerId: string;
+   private readonly probe: ProcessProbe;
+   private readonly terminateGraceMs: number;
+-  private mutationQueue = Promise.resolve();
+ 
+   constructor(options: LspProcessRegistryOptions) {
+     this.ownerId = options.ownerId;
 @@ -54,6 +59,7 @@
      this.dir = options.dir ?? dirname(this.path);
      this.probe = options.probe ?? nodeProcessProbe;
@@ -21,7 +29,54 @@ diff -ruN a/src/lsp/processRegistry.ts b/src/lsp/processRegistry.ts
    }
  
    async list(): Promise<LspProcessEntry[]> {
-@@ -118,6 +124,7 @@
+@@ -64,7 +70,7 @@
+     entry: Omit<LspProcessEntry, "ownerId" | "ownerPid" | "startedAt"> &
+       Partial<Pick<LspProcessEntry, "ownerId" | "ownerPid" | "startedAt">>,
+   ): Promise<void> {
+-    await this.withMutation(async () => {
++    await withMutation(this.path, async () => {
+       const pidFile = await this.readOwnerFile();
+       const nextEntry: LspProcessEntry = {
+         ...entry,
+@@ -78,7 +84,7 @@
+   }
+ 
+   async unregister(id: string, pid?: number): Promise<void> {
+-    await this.withMutation(async () => {
++    await withMutation(this.path, async () => {
+       const pidFile = await this.readOwnerFile();
+       pidFile.processes = pidFile.processes.filter((entry) => {
+         if (entry.id !== id) return true;
+@@ -90,67 +96,65 @@
+   }
+ 
+   async cleanupStaleProcesses(): Promise<CleanupResult> {
+-    const entries = await this.readAllEntries();
+-    const result: CleanupResult = { terminated: [], removed: [], kept: [] };
+-
+-    for (const entry of entries) {
+-      if (!(await this.probe.isRunning(entry.pid))) {
+-        result.removed.push(entry);
+-        continue;
+-      }
+-
+-      if (!(await this.isStaleOwner(entry))) {
+-        result.kept.push(entry);
+-        continue;
+-      }
+-
+-      if (!(await this.probe.commandMatches(entry.pid, entry.command))) {
+-        result.kept.push(entry);
+-        continue;
+-      }
+-
+-      await this.terminateEntry(entry);
+-      result.terminated.push(entry);
+-    }
+-
+-    await this.rewriteAllEntries(result.kept);
+-    return result;
++    return this.sweepProcesses(() => true, "stale");
    }
  
    async terminateOwnedProcesses(): Promise<CleanupResult> {
@@ -29,7 +84,73 @@ diff -ruN a/src/lsp/processRegistry.ts b/src/lsp/processRegistry.ts
      return this.terminateProcesses((entry) => entry.ownerId === this.ownerId);
    }
  
-@@ -150,7 +157,8 @@
+   async terminateProcesses(predicate: (entry: LspProcessEntry) => boolean = () => true): Promise<CleanupResult> {
+-    const entries = await this.readAllEntries();
+-    const result: CleanupResult = { terminated: [], removed: [], kept: [] };
+-
+-    for (const entry of entries) {
+-      if (!predicate(entry)) {
+-        result.kept.push(entry);
+-        continue;
+-      }
+-
+-      if (!(await this.probe.isRunning(entry.pid))) {
+-        result.removed.push(entry);
+-        continue;
+-      }
++    return this.sweepProcesses(predicate, "explicit");
++  }
+ 
+-      if (!(await this.probe.commandMatches(entry.pid, entry.command))) {
+-        result.kept.push(entry);
+-        continue;
++  private async sweepProcesses(
++    predicate: (entry: LspProcessEntry) => boolean,
++    mode: "stale" | "explicit",
++  ): Promise<CleanupResult> {
++    const result: CleanupResult = { terminated: [], removed: [], kept: [] };
++    for (const path of await this.registryFiles()) {
++      // Select outside the mutation queue so a probe of another owner's
++      // process cannot block that owner's registration.
++      const snapshot = (await this.readFile(path)).processes;
++      for (const entry of snapshot) {
++        if (!predicate(entry) || (mode === "stale" && !(await this.isStaleOwner(entry)))) {
++          result.kept.push(entry);
++          continue;
++        }
++        const running = await this.probe.isRunning(entry.pid);
++        if (running && !(await this.probe.commandMatches(entry.pid, entry.command))) {
++          result.kept.push(entry);
++          continue;
++        }
++        await withMutation(path, async () => {
++          const current = await this.readFile(path);
++          if (!current.processes.some((item) => isSameRegistration(item, entry))) return;
++          if (mode === "stale" && !(await this.isStaleOwner(entry))) {
++            result.kept.push(entry);
++            return;
++          }
++          if (running) {
++            await this.terminateEntry(entry);
++            result.terminated.push(entry);
++          } else {
++            result.removed.push(entry);
++          }
++          // Another running process serializes its own writes, not ours. Even
++          // an explicit stop must not rewrite that process's registry file.
++          if (entry.ownerPid !== process.pid && !(await this.isStaleOwner(entry))) return;
++          const latest = await this.readFile(path);
++          const remaining = latest.processes.filter((item) => !isSameRegistration(item, entry));
++          if (remaining.length !== latest.processes.length) await this.writeFile(path, { processes: remaining });
++        });
+       }
+-
+-      await this.terminateEntry(entry);
+-      result.terminated.push(entry);
+     }
+-
+-    await this.rewriteAllEntries(result.kept);
+     return result;
    }
  
    private async isStaleOwner(entry: LspProcessEntry): Promise<boolean> {
@@ -39,10 +160,78 @@ diff -ruN a/src/lsp/processRegistry.ts b/src/lsp/processRegistry.ts
    }
  
    private async terminateEntry(entry: LspProcessEntry): Promise<void> {
+@@ -161,15 +165,6 @@
+     }
+   }
+ 
+-  private async withMutation<T>(operation: () => Promise<T>): Promise<T> {
+-    const run = this.mutationQueue.catch(() => undefined).then(operation);
+-    this.mutationQueue = run.then(
+-      () => undefined,
+-      () => undefined,
+-    );
+-    return run;
+-  }
+-
+   private async readOwnerFile(): Promise<LspPidFile> {
+     return this.readFile(this.path);
+   }
+@@ -200,28 +195,6 @@
+     return [...files].sort();
+   }
+ 
+-  private async rewriteAllEntries(entries: LspProcessEntry[]): Promise<void> {
+-    const grouped = new Map<string, LspProcessEntry[]>();
+-    for (const entry of entries) {
+-      const filePath = this.pathForOwner(entry.ownerId);
+-      grouped.set(filePath, [...(grouped.get(filePath) ?? []), entry]);
+-    }
+-
+-    for (const filePath of await this.registryFiles()) {
+-      await this.writeFile(filePath, { processes: grouped.get(filePath) ?? [] });
+-      grouped.delete(filePath);
+-    }
+-
+-    for (const [filePath, processes] of grouped) {
+-      await this.writeFile(filePath, { processes });
+-    }
+-  }
+-
+-  private pathForOwner(ownerId: string): string {
+-    if (ownerId === this.ownerId) return this.path;
+-    return join(this.dir, `${safePathSegment(ownerId)}.json`);
+-  }
+-
+   private async readFile(path: string): Promise<LspPidFile> {
+     try {
+       const raw = await readFile(path, "utf8");
+@@ -302,8 +275,20 @@
+   };
+ }
+ 
+-function safePathSegment(value: string): string {
+-  return value.replace(/[^A-Za-z0-9._-]/gu, "_");
++async function withMutation<T>(path: string, operation: () => Promise<T>): Promise<T> {
++  const run = (mutationQueues.get(path) ?? Promise.resolve()).then(operation);
++  const settled = run.then(() => undefined, () => undefined);
++  mutationQueues.set(path, settled);
++  try {
++    return await run;
++  } finally {
++    if (mutationQueues.get(path) === settled) mutationQueues.delete(path);
++  }
++}
++
++function isSameRegistration(left: LspProcessEntry, right: LspProcessEntry): boolean {
++  return isSameOwnerSlot(left, right) && left.ownerPid === right.ownerPid &&
++    left.pid === right.pid && left.startedAt === right.startedAt;
+ }
+ 
+ function isSameOwnerSlot(
 diff -ruN a/test/process-registry.test.ts b/test/process-registry.test.ts
 --- a/test/process-registry.test.ts
 +++ b/test/process-registry.test.ts
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,147 @@
 +// Tests for the Pi fork's pi-lsp-adapter patch. The bundle installs no vitest, so these run under Bun:
 +// cd packages/coding-agent/bundle/node_modules/pi-lsp-adapter && bun test ./test
 +
@@ -64,7 +253,7 @@ diff -ruN a/test/process-registry.test.ts b/test/process-registry.test.ts
 +  });
 +
 +  // setup writes one owner file per entry and returns a registry for a new owner plus the pids it terminates.
-+  function setup(entries: LspProcessEntry[]): {
++  function setup(entries: LspProcessEntry[], override: Partial<ProcessProbe> = {}): {
 +    record: () => void;
 +    registry: (ownerId: string) => LspProcessRegistry;
 +    terminated: number[];
@@ -84,6 +273,7 @@ diff -ruN a/test/process-registry.test.ts b/test/process-registry.test.ts
 +      terminate: (pid) => {
 +        terminated.push(pid);
 +      },
++      ...override,
 +    };
 +    const registry = (ownerId: string) =>
 +      new LspProcessRegistry({ dir, ownerId, path: join(dir, `${ownerId}.json`), probe, terminateGraceMs: 0 });
@@ -139,5 +329,53 @@ diff -ruN a/test/process-registry.test.ts b/test/process-registry.test.ts
 +    await registry("fresh").cleanupStaleProcesses();
 +    expect(terminated).toContain(104);
 +    expect(terminated).not.toContain(105);
++  });
++
++  it("keeps registrations created while another owner sweeps a stale snapshot", async () => {
++    const reached = Promise.withResolvers<void>();
++    const release = Promise.withResolvers<void>();
++    const live = "concurrent-live";
++    const old = "concurrent-old";
++    const { registry } = setup([entry(live, process.pid, 201), entry(old, DEAD_PID, 202)], {
++      isRunning: async (pid) => {
++        if (pid === DEAD_PID) {
++          reached.resolve();
++          await release.promise;
++          return false;
++        }
++        return pid !== 201;
++      },
++    });
++    const parent = registry(live);
++    const janitor = registry("concurrent-janitor");
++    const cleanup = janitor.cleanupStaleProcesses();
++    await reached.promise;
++    await parent.register({ ...entry(live, process.pid, 203), id: "second-root" });
++    release.resolve();
++    await cleanup;
++    expect((await janitor.list()).map((item) => item.pid).sort()).toEqual([201, 203]);
++  });
++
++  it("does not terminate or remove a snapshot replaced by an owner that became live", async () => {
++    const reached = Promise.withResolvers<void>();
++    const release = Promise.withResolvers<void>();
++    const ownerId = "recovering-owner";
++    const { registry, terminated } = setup([entry(ownerId, process.pid, 301)], {
++      isRunning: async (pid) => {
++        if (pid === 301) {
++          reached.resolve();
++          await release.promise;
++        }
++        return true;
++      },
++    });
++    const janitor = registry("recovering-janitor");
++    const cleanup = janitor.cleanupStaleProcesses();
++    await reached.promise;
++    await registry(ownerId).register(entry(ownerId, process.pid, 302));
++    release.resolve();
++    await cleanup;
++    expect(terminated).toEqual([]);
++    expect((await janitor.list()).map((item) => item.pid)).toEqual([302]);
 +  });
 +});

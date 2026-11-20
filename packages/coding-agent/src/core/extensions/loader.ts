@@ -181,6 +181,7 @@ export function createExtensionRuntime(): ExtensionRuntime {
 		getSessionName: notInitialized,
 		setLabel: notInitialized,
 		getActiveTools: notInitialized,
+		isToolAllowed: notInitialized,
 		getAllTools: notInitialized,
 		getSettings: notInitialized,
 		setActiveTools: notInitialized,
@@ -430,6 +431,11 @@ function createExtensionAPI(
 		getActiveTools(): string[] {
 			assertActive();
 			return runtime.getActiveTools();
+		},
+
+		isToolAllowed(name: string): boolean {
+			assertActive();
+			return runtime.isToolAllowed(name);
 		},
 
 		getAllTools() {

@@ -25,7 +25,11 @@ describe("regression #2835: tool allowlists filter extension tools", () => {
 		}
 	});
 
-	async function createSession(allowedToolNames?: string[]) {
+	async function createSession(
+		allowedToolNames?: string[],
+		excludeTools?: string[],
+		inspectFilter?: (isToolAllowed: (name: string) => boolean, registered: string[]) => void,
+	) {
 		const settingsManager = SettingsManager.create(tempDir, agentDir);
 		const sessionManager = SessionManager.inMemory(tempDir);
 		const resourceLoader = new DefaultResourceLoader({
@@ -35,6 +39,10 @@ describe("regression #2835: tool allowlists filter extension tools", () => {
 			extensionFactories: [
 				(pi) => {
 					pi.on("session_start", () => {
+						inspectFilter?.(
+							(name) => pi.isToolAllowed(name),
+							pi.getAllTools().map((tool) => tool.name),
+						);
 						pi.registerTool({
 							name: "dynamic_tool",
 							label: "Dynamic Tool",
@@ -60,6 +68,7 @@ describe("regression #2835: tool allowlists filter extension tools", () => {
 			sessionManager,
 			resourceLoader,
 			tools: allowedToolNames,
+			excludeTools,
 		});
 		await session.bindExtensions({});
 		return session;
@@ -80,6 +89,30 @@ describe("regression #2835: tool allowlists filter extension tools", () => {
 		expect(session.systemPrompt).not.toContain("- bash:");
 		expect(session.systemPrompt).not.toContain("- edit:");
 		session.dispose();
+	});
+
+	it.each([
+		{ tools: undefined, excludes: undefined, future: true, bash: true, mcp: true },
+		{ tools: ["read", "dynamic_tool"], excludes: undefined, future: true, bash: false, mcp: true },
+		{ tools: ["read", "dynamic_tool"], excludes: ["dynamic_*", "mcp__*"], future: false, bash: false, mcp: false },
+	])("checks the effective name filter before registration ($tools, $excludes)", async (testCase) => {
+		const observations: unknown[] = [];
+		const session = await createSession(testCase.tools, testCase.excludes, (allows, registered) => {
+			observations.push({
+				registered: registered.includes("dynamic_tool"),
+				future: allows("dynamic_tool"),
+				read: allows("read"),
+				bash: allows("bash"),
+				mcp: allows("mcp__example__future"),
+			});
+		});
+		try {
+			expect(observations).toEqual([
+				{ registered: false, read: true, future: testCase.future, bash: testCase.bash, mcp: testCase.mcp },
+			]);
+		} finally {
+			session.dispose();
+		}
 	});
 
 	it("disables all tools when the allowlist is empty", async () => {
