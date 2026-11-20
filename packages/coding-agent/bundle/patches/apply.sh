@@ -6,10 +6,8 @@
 #   instead of the "Allow remote debugging?" prompt text `existing` mode gives every failure.
 # - pi-lsp-adapter.patch prevents cleanup from deleting or rewriting live owners' registrations.
 # - pi-lsp-errors.patch reports failed LSP requests as errors.
-# - pi-subagents.patch hands a child session the inline extensions that subagents.json
-#   `childInlineExtensions` names, out of the ones Pi's main() publishes on globalThis, and gives an
-#   agent whose `tools:` holds `*` the main session's own tool selection. It also keeps background
-#   resumes to the TUI and rejects foreground subagent tool calls there.
+# - pi-subagents.patch copies the active and callable tools and compiled-in extensions into children.
+# - pi-lsp-child-tools.patch skips LSP initialization when the tool filter excludes all LSP tools.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -37,3 +35,4 @@ apply_patch pi-lsp-adapter pi-lsp-errors.patch
 apply_patch pi-lsp-adapter pi-lsp-project-roots.patch
 apply_patch chrome-devtools-mcp chrome-devtools-mcp.patch
 apply_patch pi-browser-use pi-browser-use.patch
+apply_patch pi-lsp-adapter pi-lsp-child-tools.patch
