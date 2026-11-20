@@ -270,6 +270,8 @@ git push fork --tags
 
 `~/.local/bin/pi` already points at `packages/coding-agent/dist/pi`, so the new binary is live as soon as step 4 finishes; there is nothing to relink.
 
+- `packages/coding-agent/bundle/patches/pi-lsp-project-roots.patch` resolves external files to canonical projects identified by a server root marker or `.git`, including the `.git` file of a linked worktree. External roots use user-level server definitions and require an installed server. The adapter checks that the open descriptor still refers to the selected regular file before reading. Scripts with no recognized suffix use the content-based detector and reuse the same checked text. Shutdown waits for in-flight starts and prevents them from publishing a server.
+
 ### Pi-Bolt performance port
 
 `mahendra` carries the performance commits of github.com/opensec-git/Pi-Bolt (MIT, credited in `LICENSE`), cherry-picked with `-x`, so `git log --grep "cherry picked from commit" mahendra` lists each one with its Pi-Bolt digest and OpenSec as author. The selection is Pi-Bolt's `perf` commits for the TUI, tools, sessions, and streaming, plus the fixes and tests that follow them. Pi-Bolt's AOT compiler, installer, update channel, themes, and branding stay out.
