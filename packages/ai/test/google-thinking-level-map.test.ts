@@ -1,8 +1,11 @@
 import type { GenerateContentParameters } from "@google/genai";
 import { describe, expect, it } from "vitest";
+import { googleThinkingLevels } from "../catalog/families/google.ts";
 import { streamSimple as streamSimpleGoogle } from "../src/api/google-generative-ai.ts";
 import { resolveGoogleThinkingLevel } from "../src/api/google-shared.ts";
 import { streamSimple as streamSimpleVertex } from "../src/api/google-vertex.ts";
+import { MODELS } from "../src/models.generated.ts";
+import { clampThinkingLevel, getSupportedThinkingLevels } from "../src/models.ts";
 import type { Model, ThinkingBudgets, ThinkingLevel, ThinkingLevelMap } from "../src/types.ts";
 import { normalizeContext } from "../src/utils/transcript.ts";
 
@@ -242,5 +245,52 @@ describe("Google thinking level maps", () => {
 		});
 
 		expect(payload).toMatchObject({ config: { thinkingConfig: { thinkingBudget: 4321 } } });
+	});
+
+	it("drops the unsupported max level in googleThinkingLevels", () => {
+		expect(
+			googleThinkingLevels("gemini-4-neon", [{ type: "effort", values: ["low", "medium", "high", "xhigh", "max"] }]),
+		).toEqual({
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "xhigh",
+			max: null,
+		});
+		expect(googleThinkingLevels("gemini-4-neon", [{ type: "effort", values: ["max"] }])).toBeUndefined();
+	});
+
+	it("excludes unsupported Google thinkingLevelMap entries from supported levels and clamps xhigh/max to high", () => {
+		const model = googleModel("gemini-4-neon", {
+			off: null,
+			minimal: null,
+			low: "low",
+			medium: "medium",
+			high: "high",
+			xhigh: "max",
+			max: "max",
+		});
+
+		expect(getSupportedThinkingLevels(model)).toEqual(["low", "medium", "high"]);
+		expect(clampThinkingLevel(model, "xhigh")).toBe("high");
+		expect(clampThinkingLevel(model, "max")).toBe("high");
+		expect(resolveGoogleThinkingLevel(model, "high")).toBe("high");
+	});
+
+	it("resolves every supported non-off thinking level for every hydrated Google API model", () => {
+		const allModels = Object.values(MODELS).flatMap((providerModels) => Object.values(providerModels));
+		let checked = 0;
+
+		for (const model of allModels) {
+			if (model.api !== "google-generative-ai" && model.api !== "google-vertex") continue;
+			checked += 1;
+			for (const level of getSupportedThinkingLevels(model)) {
+				if (level === "off") continue;
+				expect(() => resolveGoogleThinkingLevel(model, level)).not.toThrow();
+			}
+		}
+		expect(checked).toBeGreaterThan(0);
 	});
 });

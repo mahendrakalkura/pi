@@ -339,4 +339,40 @@ describe("generated model data validation", () => {
 		);
 		expect(() => readModelDataStructure(packageRoot)).toThrow("aggregator and provider shards do not match");
 	});
+
+	it.each(["google-generative-ai", "google-vertex"] as const)(
+		"rejects unsupported Google thinkingLevelMap values for %s",
+		(api) => {
+			const fixture = createFixture();
+			const structure: ModelDataStructure = { "test-provider": { "chat:model-a": api } };
+			const model = fixture.values["chat:model-a"] as Record<string, unknown>;
+			model.api = api;
+			model.reasoning = true;
+			model.thinkingLevelMap = {
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "max",
+				max: null,
+			};
+			writeFixtureData(fixture.dataDir, structure, fixture.values, MODEL_DATA_SCHEMA_VERSION, api);
+			expect(() => validateModelDataDirectory(structure, fixture.dataDir)).toThrow(
+				"unsupported Google thinkingLevelMap.xhigh",
+			);
+
+			model.thinkingLevelMap = {
+				off: null,
+				minimal: null,
+				low: "low",
+				medium: "medium",
+				high: "high",
+				xhigh: "xhigh",
+				max: null,
+			};
+			writeFixtureData(fixture.dataDir, structure, fixture.values, MODEL_DATA_SCHEMA_VERSION, api);
+			expect(() => validateModelDataDirectory(structure, fixture.dataDir)).not.toThrow();
+		},
+	);
 });
