@@ -415,7 +415,7 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
  	) {
  		// Reload custom agents so new .pi/agents/*.md files are picked up without restart
  		this.registry.reload();
-@@ -91,6 +91,17 @@
+@@ -91,6 +91,12 @@
  		);
  		if ("error" in config) return textResult(config.error);
  
@@ -424,16 +424,11 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
 +		const runInBackground = params.resume
 +			? isTui && params.run_in_background === true
 +			: config.execution.runInBackground;
-+		if (isTui && !runInBackground) {
-+			throw new Error(params.resume
-+				? "The interactive subagent tool requires run_in_background: true for a resume."
-+				: `The interactive subagent tool requires a background launch, but agent "${config.identity.subagentType}" resolves to foreground. Use run_in_background: true with an agent that permits background launches.`);
-+		}
 +
  		// ---- Boundary extraction (after config so inheritContext is resolved) ----
  		const snapshot = this.runtime.buildSnapshot(config.execution.inheritContext);
  		const { parentSessionFile, parentSessionId } = this.runtime.getSessionInfo();
-@@ -100,16 +111,16 @@
+@@ -100,16 +106,16 @@
  		if (params.resume) {
  			const id = params.resume as string;
  			const prompt = params.prompt as string;
@@ -453,7 +448,7 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
  			return spawnBackground(
  				this.manager,
  				{ config, snapshot, parentSession, settings: this.settings },
-@@ -259,7 +270,7 @@
+@@ -259,7 +265,7 @@
  				resume: Type.Optional(
  					Type.String({
  						description:
@@ -465,7 +460,7 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
 diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 --- a/test/background-resume.test.ts
 +++ b/test/background-resume.test.ts
-@@ -0,0 +1,210 @@
+@@ -0,0 +1,225 @@
 +// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
 +// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
 +
@@ -561,12 +556,9 @@ diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 +    { locked: ["run_in_background"], runInBackground: false },
 +    { locked: ["run_in_background"] },
 +    { locked: true, runInBackground: false },
-+  ])("rejects an effective foreground launch in TUI but preserves the lock in headless modes (%j)", async (config) => {
-+    const { call, manager } = harness(config);
-+    await expect(call({ run_in_background: true }, "tui")).rejects.toThrow("resolves to foreground");
-+    expect(manager.listAgents()).toHaveLength(0);
-+
-+    for (const mode of ["print", "json", "rpc"] as const) {
++  ])("runs an effective foreground launch in the foreground in every mode (%j)", async (config) => {
++    const { call } = harness(config);
++    for (const mode of ["tui", "print", "json", "rpc"] as const) {
 +      const result = await call({ run_in_background: true }, mode);
 +      expect(result.details?.status).toBe("completed");
 +      expect(result.text).toContain("parameter was ignored");
@@ -586,24 +578,42 @@ diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 +  });
 +});
 +
-+describe("TUI resume with run_in_background", () => {
++describe("TUI resume", () => {
++  it("waits for a resume without run_in_background in the foreground", async () => {
++    const { call, getResult, manager, release, resumes } = harness();
++    const spawned = await call({ prompt: "say one", run_in_background: true });
++    const id = spawned.details?.agentId ?? "";
++    await getResult.execute("call", { agent_id: id, wait: true }, new AbortController().signal, undefined, undefined);
++    expect(manager.getRecord(id)?.result).toBe("one");
++
++    let returned = false;
++    const pending = call({ prompt: "say two", resume: id }, "tui").then((result) => {
++      returned = true;
++      return result;
++    });
++    await settle();
++    expect(resumes).toHaveLength(1);
++    expect(returned).toBe(false);
++
++    release("two");
++    const resumed = await pending;
++    expect(resumed.details).toMatchObject({ agentId: id, status: "completed" });
++    expect(resumed.text).toContain("two");
++  });
++
 +  it("returns at once with the agent ID and announces the resumed run when it ends", async () => {
-+    const { call, getResult, manager, notifications, release, resumes } = harness();
++    const { call, getResult, manager, notifications, release } = harness();
 +    const spawned = await call({ prompt: "say one", run_in_background: true });
 +    const id = spawned.details?.agentId ?? "";
 +    await getResult.execute("call", { agent_id: id, wait: true }, new AbortController().signal, undefined, undefined);
 +    expect(manager.getRecord(id)?.result).toBe("one");
 +    const before = notifications().length;
 +
-+    await expect(call({ prompt: "say two", resume: id }, "tui")).rejects.toThrow("requires run_in_background: true for a resume");
-+    expect(resumes).toHaveLength(0);
-+
 +    const resumed = await call({ prompt: "say two", resume: id, run_in_background: true }, "tui");
 +    expect(resumed.text).toContain("Agent resumed in background.");
 +    expect(resumed.text).toContain(`Agent ID: ${id}`);
 +    expect(resumed.text).toContain("You will be notified when this agent completes.");
 +    expect(resumed.details).toMatchObject({ agentId: id, status: "background" });
-+    expect(resumes).toHaveLength(1);
 +    expect(manager.getRecord(id)?.status).toBe("running");
 +    expect(notifications()).toHaveLength(before);
 +
