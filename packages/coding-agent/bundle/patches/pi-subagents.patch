@@ -9,20 +9,26 @@ diff -ruN a/src/index.ts b/src/index.ts
  import { detectEnv } from "#src/session/env";
  import { resolveModel } from "#src/session/model-resolver";
  import { createExcludedPackagesStorage } from "#src/session/package-exclusions";
-@@ -117,7 +118,16 @@
+@@ -73,7 +74,7 @@
+   const registry = new AgentTypeRegistry(() => loadCustomAgents(process.cwd()));
+ 
+   // ---- Runtime: all mutable extension state in one place ----
+-  const runtime = createSubagentRuntime();
++  const runtime = createSubagentRuntime(() => pi.getActiveTools(), () => pi.getCallableToolNames());
+ 
+   // ---- Notification system ----
+   // Owns completion nudges and live-activity cleanup. The widget detects finished
+@@ -117,7 +118,13 @@
      io: {
        detectEnv,
        getAgentDir,
 -      createResourceLoader: (opts) => new DefaultResourceLoader(opts),
 +      // The parent's inline extensions reach a child only through this list;
 +      // the child's loader cannot discover them on disk.
-+      createResourceLoader: ({ toolNames, extensionFactories = [], ...opts }) =>
++      createResourceLoader: ({ extensionFactories = [], loadUnselectedMcp, ...opts }) =>
 +        new DefaultResourceLoader({
 +          ...opts,
-+          extensionFactories: [
-+            ...extensionFactories,
-+            ...childInlineExtensions(settings.childInlineExtensions, toolNames, extensionFactories),
-+          ],
++          extensionFactories: [...extensionFactories, ...childInlineExtensions(extensionFactories, loadUnselectedMcp)],
 +        }),
        deriveSessionDir: deriveSubagentSessionDir,
        createSessionManager: (cwd, dir) => SessionManager.create(cwd, dir),
@@ -34,20 +40,28 @@ diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-suba
  import { AskParentTool, type QuestionRecorder } from "#src/session/ask-parent-tool";
  import { builtinExtensionsFor } from "#src/session/builtin-extensions";
  import type { EnvInfo } from "#src/session/env";
-+import { childToolAllowlist } from "#src/session/main-session-tools";
++import { childToolAllowlist, hasMainSessionTools, RECURSION_GUARD_TOOLS } from "#src/session/main-session-tools";
  import { expandMcpToolPatterns } from "#src/session/mcp-tool-patterns";
  import type { ModelRegistry } from "#src/session/model-resolver";
  import { NotifyParentTool, type UpdateAnnouncer } from "#src/session/notify-parent-tool";
-@@ -77,6 +78,8 @@
+@@ -47,7 +48,7 @@
+  * child extension registering a tool of its own. Filtering the active set once
+  * after `bindExtensions` would be undone by that rebuild (#725).
+  */
+-const EXCLUDED_TOOL_NAMES = ["subagent", "get_subagent_result", "steer_subagent"];
++const EXCLUDED_TOOL_NAMES = [...RECURSION_GUARD_TOOLS];
+ 
+ // ── IO boundary ───────────────────────────────────────────────────────────────
+ 
+@@ -77,6 +78,7 @@
    appendSystemPromptOverride?: (base: string[]) => string[];
    /** Extensions supplied as code; `builtin` entries are Pi's built-ins, resolved as `builtin:<name>`. */
    extensionFactories?: InlineExtension[];
-+  /** The agent's tool allowlist, which decides whether the parent's inline extensions load in the child. */
-+  toolNames?: readonly string[];
++  loadUnselectedMcp?: boolean;
  }
  
  /** Options passed to SessionFactoryIO.createSession. */
-@@ -87,8 +90,11 @@
+@@ -87,8 +89,12 @@
    settingsManager: SettingsManager;
    modelRegistry: ModelRegistry;
    model?: Model<any>;
@@ -58,185 +72,337 @@ diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-suba
 +   * session selects its tools the way a main Pi session does.
 +   */
 +  tools?: string[];
++  initialActiveTools?: string[];
    /**
     * Tool definitions supplied directly rather than by an extension. The SDK
     * filters these through `tools` too, so every name here must also be listed
-@@ -274,6 +280,7 @@
+@@ -228,6 +234,7 @@
+     {
+       cwd: snapshot.cwd,
+       parentSystemPrompt: snapshot.systemPrompt,
++      parentActiveTools: snapshot.activeToolNames,
+       parentPortablePrompt: snapshot.portablePrompt,
+       parentModel: snapshot.model,
+       modelRegistry: snapshot.modelRegistry,
+@@ -255,6 +262,19 @@
+   const sessionSettings = deps.io.createSettingsManager(cfg.effectiveCwd, agentDir);
+   const loaderSettings = deps.io.createLoaderSettingsManager(sessionSettings);
+ 
++  const childTools = buildChildTools(params);
++  const parentTools = [...(snapshot.activeToolNames ?? []), ...(snapshot.callableToolNames ?? [])];
++  const allowlist = childToolAllowlist(toolNames, parentTools, childTools.map((tool) => tool.name));
++  // Pi implicitly permits MCP tools when the list names none. For * the parent's
++  // actual selection is authoritative, including when it selected no MCP tools.
++  const excludeTools = [...EXCLUDED_TOOL_NAMES];
++  if (hasMainSessionTools(toolNames) && !allowlist.some((name) => name.startsWith("mcp__"))) {
++    excludeTools.push("mcp__*");
++    for (const name of ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]) {
++      if (!allowlist.includes(name)) excludeTools.push(name);
++    }
++  }
++
+   // Children inherit the parent's skills and every extension the composition
+   // root did not exclude (#696), plus the Pi built-ins their tools call for —
+   // Pi supplies those to its own CLI session only.
+@@ -273,7 +293,8 @@
+     noContextFiles: true,
      systemPromptOverride: () => cfg.systemPrompt,
      appendSystemPromptOverride: () => [],
-     extensionFactories: builtinExtensionsFor(toolNames),
-+    toolNames,
+-    extensionFactories: builtinExtensionsFor(toolNames),
++    extensionFactories: builtinExtensionsFor(allowlist),
++    loadUnselectedMcp: hasMainSessionTools(toolNames),
    });
    await loader.reload();
  
-@@ -293,7 +300,7 @@
+@@ -285,7 +306,6 @@
+   sessionManager.newSession({ parentSession: params.parentSession?.parentSessionId });
+   const sessionId = sessionManager.getSessionId();
+ 
+-  const childTools = buildChildTools(params);
+   const { session } = await deps.io.createSession({
+     cwd: cfg.effectiveCwd,
+     agentDir,
+@@ -293,9 +313,12 @@
      settingsManager: sessionSettings,
      modelRegistry: snapshot.modelRegistry,
      model: cfg.model,
 -    tools: [...toolNames, ...childTools.map((tool) => tool.name)],
-+    tools: childToolAllowlist(toolNames, childTools.map((tool) => tool.name)),
++    tools: allowlist,
++    initialActiveTools: hasMainSessionTools(toolNames)
++      ? childToolAllowlist(toolNames, snapshot.activeToolNames ?? [], childTools.map((tool) => tool.name))
++      : undefined,
      customTools: childTools,
-     excludeTools: EXCLUDED_TOOL_NAMES,
+-    excludeTools: EXCLUDED_TOOL_NAMES,
++    excludeTools,
      resourceLoader: loader,
+     thinkingLevel: cfg.thinkingLevel,
+   });
+diff -ruN a/src/lifecycle/parent-snapshot.ts b/src/lifecycle/parent-snapshot.ts
+--- a/src/lifecycle/parent-snapshot.ts
++++ b/src/lifecycle/parent-snapshot.ts
+@@ -38,6 +38,10 @@
+   cwd: string;
+   /** Parent's effective system prompt (for append-mode agents). */
+   systemPrompt: string;
++  /** Effective tool selection at the time the parent requested the child. */
++  activeToolNames?: readonly string[];
++  /** Callable tools, including codemode and deferred tools not declared to the model. */
++  callableToolNames?: readonly string[];
+   /** Parent's current model instance (fallback when agent config has no model). */
+   model: Model<any> | undefined;
+   /** Model registry for resolving config.model strings and creating sessions. */
+diff -ruN a/src/runtime.ts b/src/runtime.ts
+--- a/src/runtime.ts
++++ b/src/runtime.ts
+@@ -42,6 +42,11 @@
+    */
+   private lastPromptOptions: ParentPromptOptions | undefined = undefined;
+ 
++  constructor(
++    private readonly listActiveTools: () => readonly string[] = () => [],
++    private readonly listCallableTools: () => readonly string[] = () => [],
++  ) {}
++
+   // ── Session-context methods ──────────────────────────────────────────────
+ 
+   /** Store the active Pi session context (called from session_start). */
+@@ -71,7 +76,11 @@
+    */
+   buildSnapshot(inheritContext: boolean): ParentSnapshot {
+ 
+-    return buildParentSnapshot(this.currentCtx!, inheritContext, this.lastPromptOptions);
++    return {
++      ...buildParentSnapshot(this.currentCtx!, inheritContext, this.lastPromptOptions),
++      activeToolNames: [...this.listActiveTools()],
++      callableToolNames: [...this.listCallableTools()],
++    };
+   }
+ 
+   /** Extract model info from the current session context. */
+@@ -96,6 +105,9 @@
+  *
+  * Call once at extension startup; pass the result to factories and handlers.
+  */
+-export function createSubagentRuntime(): SubagentRuntime {
+-  return new SubagentRuntime();
++export function createSubagentRuntime(
++  listActiveTools?: () => readonly string[],
++  listCallableTools?: () => readonly string[],
++): SubagentRuntime {
++  return new SubagentRuntime(listActiveTools, listCallableTools);
+ }
 diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-extensions.ts
 --- a/src/session/child-inline-extensions.ts
 +++ b/src/session/child-inline-extensions.ts
-@@ -0,0 +1,47 @@
+@@ -0,0 +1,42 @@
 +/**
-+ * child-inline-extensions.ts - Hand a child the parent's inline extensions it needs.
++ * child-inline-extensions.ts - Hand a child every inline extension its parent loaded.
 + *
 + * Pi loads extensions compiled into its binary as inline factories, which a
 + * child's own `DefaultResourceLoader` never discovers on disk. The Pi fork's
-+ * `main()` publishes those factories under `Symbol.for("pi:inline-extensions")`;
-+ * `subagents.json` `childInlineExtensions` names the ones a child may load.
++ * `main()` publishes those factories under `Symbol.for("pi:inline-extensions")`,
++ * and a child loads all of them, so it runs the same extensions as its parent.
 + *
-+ * They load only in a child whose `tools:` names a tool outside the seven
-+ * built-ins, `*` included. The allowlist would drop their tools anyway, but
-+ * their `session_start` and `session_shutdown` handlers would still run in
-+ * every child for nothing.
++ * Narrow children load the MCP built-in only if their tool list needs it.
++ * pi-subagents itself is excluded: its copy in a child would replace
++ * and then delete the parent's service on `globalThis`. The recursion guard
++ * keeps a child from spawning agents either way.
 + */
 +
 +import type { InlineExtension } from "@earendil-works/pi-coding-agent";
-+import { BUILTIN_TOOL_NAMES } from "#src/config/agent-types";
 +
 +/** Global key the Pi fork's `main()` publishes its inline extensions under. */
 +const INLINE_EXTENSIONS_KEY = Symbol.for("pi:inline-extensions");
 +
-+/**
-+ * The published inline extensions named in `names`, or none when the agent
-+ * lists only built-in tools. A name `loaded` already holds is skipped, so a Pi
-+ * built-in the core selected for the child's tools never loads twice.
-+ */
-+export function childInlineExtensions(
-+  names: readonly string[],
-+  toolNames: readonly string[] | undefined,
-+  loaded: readonly InlineExtension[] = [],
-+): InlineExtension[] {
-+  // Nothing is configured, or the agent asks for no extension tool.
-+  if (names.length === 0) return [];
-+  if (!toolNames?.some((name) => !BUILTIN_TOOL_NAMES.includes(name))) return [];
++/** The name this package carries among the published inline extensions. */
++export const SUBAGENTS_EXTENSION = "@gotgenes/pi-subagents";
 +
++/**
++ * Every published inline extension except pi-subagents. A name `loaded`
++ * already holds is skipped, so a Pi built-in the core selected for the child's
++ * tools never loads twice.
++ */
++export function childInlineExtensions(loaded: readonly InlineExtension[] = [], loadUnselectedMcp = false): InlineExtension[] {
 +  // A Pi build that publishes nothing leaves the child as it was.
 +  const published = (globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY];
 +  if (!Array.isArray(published)) return [];
 +
-+  // Only named extensions can be picked; a bare factory has no name to match.
-+  const wanted = new Set(names);
++  // Only named extensions can be handed over; a bare factory has no name to check.
++  const skipped = new Set([SUBAGENTS_EXTENSION]);
 +  for (const input of loaded) {
-+    if (typeof input !== "function") wanted.delete(input.name);
++    if (typeof input !== "function") skipped.add(input.name);
 +  }
 +  return (published as InlineExtension[]).filter(
-+    (input) => typeof input !== "function" && wanted.has(input.name),
++    (input) => typeof input !== "function" && !skipped.has(input.name) &&
++      (loadUnselectedMcp || input.name !== "mcp" || input.builtin !== true),
 +  );
 +}
 diff -ruN a/src/session/main-session-tools.ts b/src/session/main-session-tools.ts
 --- a/src/session/main-session-tools.ts
 +++ b/src/session/main-session-tools.ts
-@@ -0,0 +1,26 @@
-+/**
-+ * main-session-tools.ts - Give an agent exactly the tools a main Pi session holds.
-+ *
-+ * An agent's `tools:` list is an allowlist, and Pi activates every registered
-+ * tool an allowlist matches on every tool-registry rebuild. A plain `*` pattern
-+ * would therefore also activate tools a main session leaves inactive: `grep`,
-+ * `find`, `ls`, and any tool an extension deactivates at session start.
-+ *
-+ * `tools: *` instead passes no allowlist at all, so the child selects its tools
-+ * the way a main session does: the `defaultTools` setting plus every extension
-+ * tool that activates when it registers. The recursion guard still applies,
-+ * because it is a denylist, and the child's protocol tools still register,
-+ * because nothing filters them.
-+ */
-+
-+/** The `tools:` entry that gives an agent the main session's own tool selection. */
+@@ -0,0 +1,19 @@
++/** The `tools:` entry that copies the parent's active selection at spawn. */
 +export const MAIN_SESSION_TOOLS = "*";
 +
-+/** The child's tool allowlist, or none when the agent asks for the main session's selection. */
++/** A child cannot use these tools to spawn or control another child. */
++export const RECURSION_GUARD_TOOLS: readonly string[] = ["subagent", "get_subagent_result", "steer_subagent"];
++
++export function hasMainSessionTools(toolNames: readonly string[]): boolean {
++  return toolNames.includes(MAIN_SESSION_TOOLS);
++}
++
++/** Copy the effective parent loadout for `*`; keep all other allowlists as configured. */
 +export function childToolAllowlist(
 +  toolNames: readonly string[],
++  parentTools: readonly string[],
 +  protocolTools: readonly string[],
-+): string[] | undefined {
-+  if (toolNames.includes(MAIN_SESSION_TOOLS)) return undefined;
-+  return [...toolNames, ...protocolTools];
++): string[] {
++  if (!hasMainSessionTools(toolNames)) return [...toolNames, ...protocolTools];
++  return [...new Set([...parentTools.filter((name) => !RECURSION_GUARD_TOOLS.includes(name)), ...protocolTools])];
 +}
-diff -ruN a/src/settings.ts b/src/settings.ts
---- a/src/settings.ts
-+++ b/src/settings.ts
-@@ -44,6 +44,12 @@
+diff -ruN a/src/session/prompts.ts b/src/session/prompts.ts
+--- a/src/session/prompts.ts
++++ b/src/session/prompts.ts
+@@ -3,6 +3,7 @@
+  */
+ 
+ import type { EnvInfo } from "#src/session/env";
++import { RECURSION_GUARD_TOOLS } from "#src/session/main-session-tools";
+ import type { ProjectContextLoader } from "#src/session/project-context";
+ import type { AgentPromptConfig, PromptInheritance } from "#src/types";
+ 
+@@ -24,6 +25,12 @@
+    * such parts.
     */
-   excludedExtensionPackages?: string[];
-   /**
-+   * Names of the parent's inline extensions (the factories Pi publishes under
-+   * `Symbol.for("pi:inline-extensions")`) that load in a child whose `tools:`
-+   * names a tool outside the seven built-ins.
-+   */
-+  childInlineExtensions?: string[];
+   portablePrompt?: string;
 +  /**
-    * Prompt-inheritance strategy per provider, keyed by the provider id of the
-    * child's resolved model. Every provider not listed inherits `"full"`.
-    * The key is the provider rather than the agent because re-homing is a
-@@ -73,6 +79,8 @@
-    */
-   excludedExtensionPackages?: string[];
-   /** Present only when non-empty, and round-tripped for the same reason. */
-+  childInlineExtensions?: string[];
-+  /** Present only when non-empty, and round-tripped for the same reason. */
-   promptInheritance?: Record<string, PromptInheritance>;
++   * Keep the parent's `<tools>` and `<rules>` sections, for a child that
++   * holds the main session's own tool selection (`tools: *`). Absent strips
++   * them, as for every child with a narrower tool list.
++   */
++  toolSurface?: readonly string[];
  }
  
-@@ -100,6 +108,7 @@
-   private _abortAllOnInterrupt: boolean = DEFAULT_ABORT_ALL_ON_INTERRUPT;
-   private _midRunUpdates: boolean = DEFAULT_MID_RUN_UPDATES;
-   private _excludedExtensionPackages: string[] = [];
-+  private _childInlineExtensions: string[] = [];
-   private _promptInheritance: Record<string, PromptInheritance> = {};
- 
-   private readonly emit: SettingsEmit;
-@@ -178,6 +187,12 @@
-     return this._excludedExtensionPackages;
+ /**
+@@ -134,6 +141,7 @@
+       inherited.systemPrompt,
+       inherited.cwd,
+       cwd !== inherited.cwd,
++      inherited.toolSurface,
+     );
    }
+   // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- || intentional: a whitespace-only capture must fall back too, which ?? would not do
+@@ -231,6 +239,8 @@
+  * They are as session-resolved as the catalogue, so they are excised rather
+  * than inherited (ADR 0011); the shared prefix then ends at the preamble for a
+  * parent that renders them, and is unchanged for one that does not.
++ * `toolSurface` keeps both for a child that holds the parent's own tool
++ * selection, minus the recursion-guard tools it never holds.
+  *
+  * A prompt carrying no such layer is returned unchanged.
+  *
+@@ -243,16 +253,38 @@
+   prompt: string,
+   parentCwd: string,
+   cutProjectContext: boolean,
++  toolSurface?: readonly string[],
+ ): string {
+   const lines = prompt.split("\n");
+   const tail = sessionResolvedTailStart(lines, parentCwd, cutProjectContext);
+-  if (tail.at === -1) return prompt;
+-  const head = lines.slice(0, tail.at);
+-  const kept = tail.shape === "section" ? withoutToolSurface(head) : head;
++  const head = tail.at === -1 ? lines : lines.slice(0, tail.at);
++  const kept = toolSurface === undefined
++    ? withoutToolSurface(head)
++    : withActiveToolSurface(head, toolSurface);
++  if (kept === lines) return prompt;
+   return kept.join("\n").trimEnd();
+ }
  
-+  // -- childInlineExtensions: hand-edited only; no /subagents:settings affordance --
+ /**
++ * The head with Pi's `<tools>` lines limited to the parent's active selection
++ * minus the recursion guard. The prompt may predate a change in that selection.
++ *
++ * Located the same way `withoutToolSurface` locates the section: above every
++ * later section Pi renders, so a `<tools>` block quoted below is left alone.
++ */
++function withActiveToolSurface(head: readonly string[], toolSurface: readonly string[]): readonly string[] {
++  const span = toolSurfaceSpan(head);
++  if (!span) return head;
++  const allowed = new Set(toolSurface);
++  for (const name of RECURSION_GUARD_TOOLS) allowed.delete(name);
++  return head.filter((line, at) => {
++    if (at <= span.toolsAt || at >= span.toolsCloseAt) return true;
++    const name = /^- ([^:]+): /.exec(line)?.[1];
++    return name === undefined || allowed.has(name);
++  });
++}
 +
-+  get childInlineExtensions(): readonly string[] {
-+    return this._childInlineExtensions;
-+  }
++/**
+  * The head with Pi's `<tools>` and `<rules>` sections excised, or the
+  * head unchanged when Pi wrote neither there.
+  *
+@@ -268,19 +300,26 @@
+  * without them.
+  */
+ function withoutToolSurface(head: readonly string[]): readonly string[] {
++  const span = toolSurfaceSpan(head);
++  if (!span) return head;
++  const { toolsAt, rulesCloseAt } = span;
++  const spanEnd = head[rulesCloseAt + 1] === "" ? rulesCloseAt + 2 : rulesCloseAt + 1;
++  return [...head.slice(0, toolsAt), ...head.slice(spanEnd)];
++}
 +
-   // ── promptInheritance: hand-edited only; no /subagents:settings affordance ──
++function toolSurfaceSpan(head: readonly string[]) {
+   const bound = laterSectionStart(head);
+   const toolsAt = head.indexOf(TOOLS_SECTION_OPEN);
+-  if (toolsAt === -1 || toolsAt >= bound) return head;
++  if (toolsAt === -1 || toolsAt >= bound) return undefined;
+   const toolsCloseAt = head.indexOf(TOOLS_SECTION_CLOSE, toolsAt);
+-  if (toolsCloseAt === -1 || toolsCloseAt >= bound) return head;
++  if (toolsCloseAt === -1 || toolsCloseAt >= bound) return undefined;
+   const rulesAt = toolsCloseAt + 2;
+   if (head[toolsCloseAt + 1] !== "" || head[rulesAt] !== RULES_SECTION_OPEN) {
+-    return head;
++    return undefined;
+   }
+   const rulesCloseAt = head.indexOf(RULES_SECTION_CLOSE, rulesAt);
+-  if (rulesCloseAt === -1 || rulesCloseAt >= bound) return head;
+-  const spanEnd = head[rulesCloseAt + 1] === "" ? rulesCloseAt + 2 : rulesCloseAt + 1;
+-  return [...head.slice(0, toolsAt), ...head.slice(spanEnd)];
++  if (rulesCloseAt === -1 || rulesCloseAt >= bound) return undefined;
++  return { toolsAt, toolsCloseAt, rulesCloseAt };
+ }
  
+ /**
+diff -ruN a/src/session/session-config.ts b/src/session/session-config.ts
+--- a/src/session/session-config.ts
++++ b/src/session/session-config.ts
+@@ -13,6 +13,7 @@
+ import type { Model } from "@earendil-works/pi-ai";
+ import type { AgentConfigLookup } from "#src/config/agent-types";
+ import type { EnvInfo } from "#src/session/env";
++import { hasMainSessionTools } from "#src/session/main-session-tools";
+ import type { ModelRegistry } from "#src/session/model-resolver";
+ import type { ProjectContextLoader } from "#src/session/project-context";
+ import type { InheritedPrompt } from "#src/session/prompts";
+@@ -62,6 +63,7 @@
+   cwd: string;
+   /** Parent's effective system prompt (for append-mode agents). */
+   parentSystemPrompt: string;
++  parentActiveTools?: readonly string[];
+   /** Parent's operator-authored parts, for a child on a re-homing provider. */
+   parentPortablePrompt?: string;
    /**
-@@ -213,6 +228,7 @@
-     if (typeof settings.midRunUpdates === "boolean") this._midRunUpdates = settings.midRunUpdates;
-     // Assigned unconditionally: removing the key from disk must clear the value.
-     this._excludedExtensionPackages = [...(settings.excludedExtensionPackages ?? [])];
-+    this._childInlineExtensions = [...(settings.childInlineExtensions ?? [])];
-     this._promptInheritance = { ...settings.promptInheritance };
-     this.emit("subagents:settings_loaded", { settings });
-     return settings;
-@@ -235,6 +251,9 @@
-     if (this._excludedExtensionPackages.length > 0) {
-       snapshot.excludedExtensionPackages = [...this._excludedExtensionPackages];
-     }
-+    if (this._childInlineExtensions.length > 0) {
-+      snapshot.childInlineExtensions = [...this._childInlineExtensions];
-+    }
-     if (Object.keys(this._promptInheritance).length > 0) {
-       snapshot.promptInheritance = { ...this._promptInheritance };
-     }
-@@ -403,6 +422,13 @@
-       .filter(Boolean);
-     out.excludedExtensionPackages = [...new Set(sources)];
-   }
-+  if (Array.isArray(r.childInlineExtensions)) {
-+    const names = r.childInlineExtensions
-+      .filter((value): value is string => typeof value === "string")
-+      .map((value) => value.trim())
-+      .filter(Boolean);
-+    out.childInlineExtensions = [...new Set(names)];
-+  }
-   const promptInheritance = sanitizePromptInheritance(r.promptInheritance);
-   if (promptInheritance) {
-     out.promptInheritance = promptInheritance;
+@@ -195,6 +197,7 @@
+       cwd: ctx.cwd,
+       strategy: ctx.resolvePromptInheritance?.(model?.provider) ?? "full",
+       portablePrompt: ctx.parentPortablePrompt,
++      toolSurface: hasMainSessionTools(toolNames) ? (ctx.parentActiveTools ?? []) : undefined,
+     },
+     io.loadProjectContext,
+   );
 diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
 --- a/src/tools/agent-tool.ts
 +++ b/src/tools/agent-tool.ts
@@ -513,23 +679,23 @@ diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.test.ts
 --- a/test/child-inline-extensions.test.ts
 +++ b/test/child-inline-extensions.test.ts
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,84 @@
 +// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
 +// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
 +
 +import { afterEach, describe, expect, it } from "bun:test";
-+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-+import { tmpdir } from "node:os";
-+import { join } from "node:path";
-+import { childInlineExtensions } from "#src/session/child-inline-extensions";
-+import { loadSettings } from "#src/settings";
++import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
++import { childInlineExtensions, SUBAGENTS_EXTENSION } from "#src/session/child-inline-extensions";
 +
-+const BROWSER_NAMES = ["browser", "browser-use"];
-+const BUILTIN_TOOLS = ["read", "bash", "edit", "write", "grep", "find", "ls"];
 +const INLINE_EXTENSIONS_KEY = Symbol.for("pi:inline-extensions");
 +
 +// factory stands in for an extension factory; the filter never calls it.
 +const factory = () => {};
++
++// names lists the names of the given inline extensions, "" for a bare factory.
++function names(inputs: readonly InlineExtension[]): string[] {
++  return inputs.map((input) => (typeof input === "function" ? "" : input.name));
++}
 +
 +// publish sets what the Pi fork's main() would publish.
 +function publish(value: unknown): void {
@@ -541,29 +707,16 @@ diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.
 +    delete (globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY];
 +  });
 +
-+  it("gives an agent that lists browser_* the named extensions only", () => {
++  it("gives a child every published extension except pi-subagents", () => {
 +    publish([
-+      factory,
++      { factory, name: "llama.cpp", builtin: true },
++      { factory, name: "codemode", builtin: true },
++      { factory, name: SUBAGENTS_EXTENSION },
++      { factory, name: "pi-lsp-adapter" },
 +      { factory, name: "browser" },
-+      { factory, name: "browser-use" },
 +      { factory, name: "status" },
 +    ]);
-+    const names = childInlineExtensions(BROWSER_NAMES, [...BUILTIN_TOOLS, "browser_*"]).map(
-+      (input) => (typeof input === "function" ? "" : input.name),
-+    );
-+    expect(names).toEqual(["browser", "browser-use"]);
-+  });
-+
-+  it("gives an agent that lists * the named extensions only", () => {
-+    publish([
-+      { factory, name: "browser" },
-+      { factory, name: "@gotgenes/pi-subagents" },
-+      { factory, name: "codemode", builtin: true },
-+    ]);
-+    const names = childInlineExtensions(["browser", "codemode"], ["*"]).map((input) =>
-+      typeof input === "function" ? "" : input.name,
-+    );
-+    expect(names).toEqual(["browser", "codemode"]);
++    expect(names(childInlineExtensions())).toEqual(["llama.cpp", "codemode", "pi-lsp-adapter", "browser", "status"]);
 +  });
 +
 +  it("skips a name the core already loads for the child's tools", () => {
@@ -572,61 +725,49 @@ diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.
 +      { factory, name: "codemode", builtin: true },
 +    ]);
 +    const loaded = [{ factory, name: "codemode", builtin: true }];
-+    const names = childInlineExtensions(["browser", "codemode"], ["codemode", "browser_*"], loaded).map((input) =>
-+      typeof input === "function" ? "" : input.name,
-+    );
-+    expect(names).toEqual(["browser"]);
++    expect(names(childInlineExtensions(loaded))).toEqual(["browser"]);
 +  });
 +
-+  it("gives nothing to an agent that lists only built-in tools", () => {
-+    publish([{ factory, name: "browser" }]);
-+    expect(childInlineExtensions(BROWSER_NAMES, BUILTIN_TOOLS)).toEqual([]);
-+    expect(childInlineExtensions(BROWSER_NAMES, undefined)).toEqual([]);
++  it("skips a bare factory, which has no name to check", () => {
++    publish([factory, { factory, name: "browser" }]);
++    expect(names(childInlineExtensions())).toEqual(["browser"]);
++  });
++
++  it("does not start the fake MCP connector for a narrow child without MCP tools", () => {
++    let connects = 0;
++    const connect = () => { connects++; };
++    const mcp = { name: "mcp", builtin: true, factory: (pi: ExtensionAPI) => pi.on("session_start", connect) };
++    const ordinary = { name: "ordinary", factory };
++    const events: Array<() => void> = [];
++    const api = { on: (_name: string, fn: () => void) => events.push(fn) } as unknown as ExtensionAPI;
++    const start = (selected: readonly InlineExtension[]) => {
++      for (const entry of selected) if (typeof entry !== "function") entry.factory(api);
++      for (const event of events.splice(0)) event();
++    };
++    publish([mcp, ordinary]);
++
++    const readOnly = childInlineExtensions();
++    expect(names(readOnly)).toEqual(["ordinary"]);
++    start(readOnly);
++    expect(connects).toBe(0);
++
++    start([mcp, ...childInlineExtensions([mcp])]);
++    expect(connects).toBe(1);
++
++    start(childInlineExtensions([], true));
++    expect(connects).toBe(2);
 +  });
 +
 +  it("gives nothing when Pi published nothing", () => {
-+    expect(childInlineExtensions(BROWSER_NAMES, ["browser_*"])).toEqual([]);
++    expect(childInlineExtensions()).toEqual([]);
 +    publish("not a list");
-+    expect(childInlineExtensions(BROWSER_NAMES, ["browser_*"])).toEqual([]);
-+  });
-+
-+  it("gives nothing when no names are configured", () => {
-+    publish([{ factory, name: "browser" }]);
-+    expect(childInlineExtensions([], ["browser_*"])).toEqual([]);
-+  });
-+});
-+
-+describe("childInlineExtensions setting", () => {
-+  const dirs: string[] = [];
-+
-+  afterEach(() => {
-+    for (const dir of dirs.splice(0)) rmSync(dir, { force: true, recursive: true });
-+  });
-+
-+  // load reads a global subagents.json holding the given value under childInlineExtensions.
-+  function load(value: unknown) {
-+    const agentDir = mkdtempSync(join(tmpdir(), "pi-subagents-agent-"));
-+    const cwd = mkdtempSync(join(tmpdir(), "pi-subagents-cwd-"));
-+    dirs.push(agentDir, cwd);
-+    writeFileSync(join(agentDir, "subagents.json"), JSON.stringify({ childInlineExtensions: value }));
-+    return loadSettings(agentDir, cwd);
-+  }
-+
-+  it("trims names, drops duplicates, blanks, and non-strings", () => {
-+    expect(load([" browser ", "browser", "", 7, null, "browser-use"]).childInlineExtensions).toEqual([
-+      "browser",
-+      "browser-use",
-+    ]);
-+  });
-+
-+  it("drops a value that is not a list", () => {
-+    expect(load("browser").childInlineExtensions).toBeUndefined();
++    expect(childInlineExtensions()).toEqual([]);
 +  });
 +});
 diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
 --- a/test/main-session-tools.test.ts
 +++ b/test/main-session-tools.test.ts
-@@ -0,0 +1,101 @@
+@@ -0,0 +1,209 @@
 +// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
 +// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
 +
@@ -640,29 +781,122 @@ diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
 +} from "#src/lifecycle/create-subagent-session";
 +import type { ParentSnapshot } from "#src/lifecycle/parent-snapshot";
 +import { childToolAllowlist, MAIN_SESSION_TOOLS } from "#src/session/main-session-tools";
++import { buildAgentPrompt } from "#src/session/prompts";
++import { assembleSessionConfig } from "#src/session/session-config";
 +
 +const PROTOCOL_TOOLS = ["ask_parent", "notify_parent"];
 +const RECURSION_GUARD = ["subagent", "get_subagent_result", "steer_subagent"];
 +
-+describe("childToolAllowlist", () => {
-+  it("passes no allowlist for an agent that lists *", () => {
-+    expect(childToolAllowlist([MAIN_SESSION_TOOLS], PROTOCOL_TOOLS)).toBeUndefined();
-+    expect(childToolAllowlist(["read", MAIN_SESSION_TOOLS], PROTOCOL_TOOLS)).toBeUndefined();
++const ENV = { branch: "", isGitRepo: false, platform: "linux" };
++const PARENT_CWD = "/work";
++
++// PARENT_PROMPT is a main session's prompt as Pi renders it, with the subagent tools listed.
++const PARENT_PROMPT = [
++  "You are a coding assistant running inside pi.",
++  "",
++  "<tools>",
++  "- read: Read file contents",
++  "- subagent: Launch a specialized agent.",
++  "- get_subagent_result: Check a background agent.",
++  "- steer_subagent: Redirect a running agent.",
++  "- browser_click: Clicks on the provided element",
++  "- edit: Stale prompt entry the parent deactivated",
++  "",
++  "Additional tools may be available.",
++  "</tools>",
++  "",
++  "<rules>",
++  "- Use ast_grep for syntax-aware code searches",
++  "- Be concise in your responses",
++  "</rules>",
++  "",
++  "<project_context>",
++  "Project-specific instructions and guidelines:",
++  "Follow AGENTS.md.",
++  "</project_context>",
++  "",
++  "<skills>",
++  "The following skills provide specialized instructions for specific tasks.",
++  "<available_skills>",
++  "</available_skills>",
++  "</skills>",
++  "",
++  "<cwd>",
++  PARENT_CWD,
++  "</cwd>",
++].join("\n");
++
++// childPrompt assembles the prompt of an append-mode child with the given tools: list.
++function childPrompt(toolNames: string[], parentPrompt = PARENT_PROMPT): string {
++  const registry: AgentConfigLookup = {
++    getToolNamesForType: () => toolNames,
++    resolveAgentConfig: (type) => ({ description: type, name: type, promptMode: "append", systemPrompt: "", toolNames }),
++  };
++  return assembleSessionConfig(
++    "general-purpose",
++    { cwd: PARENT_CWD, modelRegistry: { find: () => undefined } as never, parentSystemPrompt: parentPrompt, parentActiveTools: ["read", "browser_click", ...RECURSION_GUARD] },
++    {},
++    ENV,
++    registry,
++    { buildAgentPrompt, loadProjectContext: () => undefined },
++  ).systemPrompt;
++}
++
++describe("child prompt tool surface", () => {
++  it("keeps the parent's <tools> and <rules> for an agent that lists *, without the guarded tools", () => {
++    const prompt = childPrompt([MAIN_SESSION_TOOLS]);
++    expect(prompt).toContain("<tools>\n- read: Read file contents\n- browser_click: Clicks on the provided element\n");
++    expect(prompt).toContain("<rules>\n- Use ast_grep for syntax-aware code searches\n- Be concise in your responses\n</rules>");
++    expect(prompt).toContain("<project_context>");
++    expect(prompt).not.toContain("- edit:");
++    for (const name of RECURSION_GUARD) expect(prompt).not.toContain(`- ${name}: `);
++    expect(prompt).not.toContain("<skills>");
++    expect(prompt).not.toContain("<cwd>");
 +  });
 +
-+  it("appends the protocol tools to any other list", () => {
-+    expect(childToolAllowlist(["read", "browser_*"], PROTOCOL_TOOLS)).toEqual([
-+      "read",
-+      "browser_*",
-+      ...PROTOCOL_TOOLS,
++  it("strips <tools> and <rules> for an agent that names its tools", () => {
++    const prompt = childPrompt(["read"]);
++    expect(prompt).not.toContain("<tools>");
++    expect(prompt).not.toContain("<rules>");
++    expect(prompt).toContain("<project_context>");
++  });
++});
++
++describe("missing <cwd> anchor", () => {
++  const prompt = PARENT_PROMPT.split("\n<skills>")[0]!;
++  it("filters stale and recursion tools without cutting project context", () => {
++    const inherited = childPrompt([MAIN_SESSION_TOOLS], prompt);
++    expect(inherited).toContain("<tools>\n- read:");
++    expect(inherited).toContain("<rules>");
++    expect(inherited).not.toContain("- subagent:");
++    expect(inherited).not.toContain("- edit:");
++    expect(inherited).toContain("Follow AGENTS.md.");
++  });
++  it("still strips the tool list and rules for narrow agents", () => {
++    const inherited = childPrompt(["read"], prompt);
++    expect(inherited).not.toContain("<tools>");
++    expect(inherited).not.toContain("<rules>");
++    expect(inherited).toContain("Follow AGENTS.md.");
++  });
++});
++
++describe("childToolAllowlist", () => {
++  it("uses the parent's selected tools and excludes the recursion guard for *", () => {
++    expect(childToolAllowlist([MAIN_SESSION_TOOLS], ["read", "codemode", ...RECURSION_GUARD], PROTOCOL_TOOLS))
++      .toEqual(["read", "codemode", ...PROTOCOL_TOOLS]);
++    expect(childToolAllowlist([MAIN_SESSION_TOOLS], [], PROTOCOL_TOOLS)).toEqual(PROTOCOL_TOOLS);
++  });
++
++  it("appends protocol tools to a narrower list without intersecting it with the parent", () => {
++    expect(childToolAllowlist(["read", "browser_*"], ["edit"], PROTOCOL_TOOLS)).toEqual([
++      "read", "browser_*", ...PROTOCOL_TOOLS,
 +    ]);
-+    expect(childToolAllowlist([], [])).toEqual([]);
 +  });
 +});
 +
 +describe("createSubagentSession tool selection", () => {
 +  // spawn creates a child of an agent with the given tools: list and returns what reached createSession.
-+  async function spawn(toolNames: string[]): Promise<CreateSessionOptions> {
++  async function spawn(toolNames: string[], activeToolNames: string[] = ["read", "codemode", ...RECURSION_GUARD], callableToolNames: string[] = []): Promise<CreateSessionOptions> {
 +    let captured: CreateSessionOptions | undefined;
 +    const session = {
 +      bindExtensions: async () => {},
@@ -705,6 +939,8 @@ diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
 +      resolvePromptInheritance: () => "full",
 +    };
 +    const snapshot: ParentSnapshot = {
++      activeToolNames,
++      callableToolNames,
 +      cwd: "/tmp",
 +      model: undefined,
 +      modelRegistry: { find: () => undefined } as never,
@@ -717,9 +953,22 @@ diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
 +
 +  it("gives an agent that lists * the main session's selection, the guard, and ask_parent", async () => {
 +    const options = await spawn([MAIN_SESSION_TOOLS]);
-+    expect(options.tools).toBeUndefined();
-+    expect(options.excludeTools).toEqual(RECURSION_GUARD);
++    expect(options.tools).toEqual(["read", "codemode", "ask_parent"]);
++    expect(options.excludeTools).toEqual([...RECURSION_GUARD, "mcp__*", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]);
 +    expect(options.customTools?.map((tool) => tool.name)).toEqual(["ask_parent"]);
++  });
++
++  it("keeps codemode-only and deferred tool names without copying guarded tools", async () => {
++    const result = await spawn([MAIN_SESSION_TOOLS], ["read"], ["via_codemode", "via_deferred", "subagent"]);
++    expect(result.tools).toEqual(["read", "via_codemode", "via_deferred", "ask_parent"]);
++    expect(result.initialActiveTools).toEqual(["read", "ask_parent"]);
++    expect(result.excludeTools).toContain("subagent");
++  });
++
++  it("carries selected MCP names without letting any others through", async () => {
++    const options = await spawn([MAIN_SESSION_TOOLS], ["mcp__server__selected"]);
++    expect(options.tools).toEqual(["mcp__server__selected", "ask_parent"]);
++    expect(options.excludeTools).toEqual(RECURSION_GUARD);
 +  });
 +
 +  it("keeps the allowlist of an agent that names its tools", async () => {
