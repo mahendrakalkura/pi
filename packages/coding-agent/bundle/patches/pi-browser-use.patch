@@ -1,0 +1,93 @@
+diff -ruN a/dist/client.d.ts b/dist/client.d.ts
+--- a/dist/client.d.ts
++++ b/dist/client.d.ts
+@@ -1,4 +1,5 @@
+ import { type BrowserUseConfig } from './config.js';
++export declare const TOOL_CALL_TIMEOUT_MESSAGE: string;
+ export declare class DevToolsClient {
+     private client;
+     private config;
+diff -ruN a/dist/client.js b/dist/client.js
+--- a/dist/client.js
++++ b/dist/client.js
+@@ -5,6 +5,10 @@
+ const MCP_HEALTH_TIMEOUT_MS = 5_000;
+ const MCP_HEALTH_CHECK_INTERVAL_MS = 10_000;
+ const MCP_STDERR_LIMIT = 4_096;
++// The MCP SDK rejects a request that outlives its timeout with this error code (ErrorCode.RequestTimeout).
++const MCP_REQUEST_TIMEOUT_CODE = -32001;
++// A timed-out call reached Chrome, so the connection works; the page is busy instead.
++export const TOOL_CALL_TIMEOUT_MESSAGE = `Browser tool call timed out after ${MCP_TIMEOUT_MS / 1000} s; the page script may still be running. Calls on the same page wait behind it, so keep each script short.`;
+ const MCP_SYSTEM_ERROR_CODE_PATTERN = /^(?:EACCES|EADDRINUSE|ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENOENT|ENOTEMPTY|ENOTFOUND|EPERM|ETIMEDOUT)$/;
+ const require = createRequire(import.meta.url);
+ const chromeDevToolsMcpPackagePath = require.resolve('chrome-devtools-mcp/package.json');
+@@ -200,6 +204,9 @@
+             }
+             const errorName = error instanceof Error ? error.name : 'UnknownError';
+             console.error(`[pi-browser-use] upstream tool call failed (${errorName})`);
++            if (error?.code === MCP_REQUEST_TIMEOUT_CODE) {
++                throw new Error(TOOL_CALL_TIMEOUT_MESSAGE);
++            }
+             if (this.config.sessionMode === 'existing') {
+                 throw new Error('Browser tool call failed. If Chrome is showing an "Allow remote debugging?" prompt, click Allow and retry.');
+             }
+diff -ruN a/test/tool-call-timeout.test.ts b/test/tool-call-timeout.test.ts
+--- a/test/tool-call-timeout.test.ts
++++ b/test/tool-call-timeout.test.ts
+@@ -0,0 +1,56 @@
++// Tests for the Pi fork's pi-browser-use patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/pi-browser-use && bun test ./test
++
++import { afterEach, describe, expect, it, spyOn } from "bun:test";
++import { ErrorCode, McpError } from "@modelcontextprotocol/sdk/types.js";
++import { DevToolsClient, TOOL_CALL_TIMEOUT_MESSAGE } from "../dist/client.js";
++
++const POPUP_MESSAGE = 'Browser tool call failed. If Chrome is showing an "Allow remote debugging?" prompt, click Allow and retry.';
++
++// readyClient returns a client in the given mode whose upstream call rejects with error.
++function readyClient(mode: "existing" | "fresh", error: unknown): DevToolsClient {
++	const client = new DevToolsClient({ mode });
++	const state = client as unknown as Record<string, unknown>;
++	state.client = {
++		callTool: () => Promise.reject(error),
++		close: async () => {},
++		ping: async () => ({}),
++	};
++	state.lastHealthCheckAt = Date.now();
++	state.state = "ready";
++	return client;
++}
++
++describe("DevToolsClient.callTool failures", () => {
++	const quiet = spyOn(console, "error").mockImplementation(() => {});
++
++	afterEach(() => quiet.mockClear());
++
++	it("reports a timeout as a timeout in existing mode", async () => {
++		const timeout = new McpError(ErrorCode.RequestTimeout, "Request timed out", { timeout: 60_000 });
++		await expect(readyClient("existing", timeout).callTool("evaluate_script", {})).rejects.toThrow(TOOL_CALL_TIMEOUT_MESSAGE);
++		expect(TOOL_CALL_TIMEOUT_MESSAGE).toStartWith("Browser tool call timed out after 60 s; the page script may still be running.");
++	});
++
++	it("reports a timeout as a timeout in other modes", async () => {
++		const timeout = new McpError(ErrorCode.RequestTimeout, "Request timed out", { timeout: 60_000 });
++		await expect(readyClient("fresh", timeout).callTool("evaluate_script", {})).rejects.toThrow(TOOL_CALL_TIMEOUT_MESSAGE);
++	});
++
++	it("keeps the connection message for any other failure in existing mode", async () => {
++		const closed = new McpError(ErrorCode.ConnectionClosed, "Connection closed");
++		await expect(readyClient("existing", closed).callTool("list_pages", {})).rejects.toThrow(POPUP_MESSAGE);
++		await expect(readyClient("existing", new Error("boom")).callTool("list_pages", {})).rejects.toThrow(POPUP_MESSAGE);
++	});
++
++	it("reports a dropped connection as lost", async () => {
++		const client = readyClient("existing", new McpError(ErrorCode.RequestTimeout, "Request timed out"));
++		const state = client as unknown as Record<string, unknown>;
++		const upstream = state.client as { callTool: () => Promise<unknown> };
++		upstream.callTool = () => {
++			state.state = "disconnected";
++			return Promise.reject(new McpError(ErrorCode.ConnectionClosed, "Connection closed"));
++		};
++		await expect(client.callTool("list_pages", {})).rejects.toThrow("Browser connection lost; retry the tool.");
++	});
++});
