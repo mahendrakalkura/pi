@@ -314,19 +314,53 @@ describe("subagent example extension", () => {
 		it("escalates SIGTERM to SIGKILL based on close state and preserves partial details", async () => {
 			const pidFile = join(tempDir, "ignores-sigterm.pid");
 			const controller = new AbortController();
+			const partialMessage = Promise.withResolvers<void>();
 			const execution = captureSettlement(
-				executeSubagent(singleTask(fixtureScenario.ignoreSigterm(pidFile)), { signal: controller.signal }),
+				executeSubagent(singleTask(fixtureScenario.ignoreSigterm(pidFile)), {
+					signal: controller.signal,
+					onUpdate: (update) => {
+						if (detailsOf(update).results[0].messages.length > 0) partialMessage.resolve();
+					},
+				}),
 			);
 
-			await waitFor(() => existsSync(pidFile));
-			const pid = Number(readFileSync(pidFile, "utf8"));
-			vi.useFakeTimers();
-			controller.abort();
-			await vi.advanceTimersByTimeAsync(5000);
-			vi.useRealTimers();
-			const exitedAfterEscalation = await waitForProcessExit(pid);
-			if (!exitedAfterEscalation) process.kill(pid, "SIGKILL");
-			const settled = await execution;
+			const readinessTimeoutMs = 5000;
+			const readinessTimer = setTimeout(() => {
+				partialMessage.reject(new Error(`No partial subagent message after ${readinessTimeoutMs}ms`));
+			}, readinessTimeoutMs);
+			let pid: number | undefined;
+			let exitedAfterEscalation = false;
+			let settled: Awaited<typeof execution>;
+			try {
+				// The PID exists before the child installs its SIGTERM handler or emits the message.
+				await Promise.race([
+					partialMessage.promise,
+					execution.then((outcome) => {
+						throw new Error("Subagent execution settled before emitting a partial message", {
+							cause: outcome.status === "rejected" ? outcome.error : undefined,
+						});
+					}),
+				]).finally(() => clearTimeout(readinessTimer));
+				pid = Number(readFileSync(pidFile, "utf8"));
+				vi.useFakeTimers();
+				controller.abort();
+				await vi.advanceTimersByTimeAsync(5000);
+				vi.useRealTimers();
+				exitedAfterEscalation = await waitForProcessExit(pid);
+			} finally {
+				vi.useRealTimers();
+				controller.abort();
+				// A SIGKILL timer scheduled under fake time cannot run after restoring real timers.
+				if (!exitedAfterEscalation && pid !== undefined && isProcessAlive(pid)) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch (error) {
+						// The child can exit between the liveness check and the signal.
+						expect(error).toHaveProperty("code", "ESRCH");
+					}
+				}
+				settled = await execution;
+			}
 
 			expect(exitedAfterEscalation).toBe(true);
 			expect(settled.status).toBe("fulfilled");
