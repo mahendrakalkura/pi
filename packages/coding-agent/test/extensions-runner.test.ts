@@ -88,6 +88,7 @@ describe("ExtensionRunner", () => {
 		getSessionName: () => undefined,
 		setLabel: () => {},
 		getActiveTools: () => [],
+		isToolAllowed: () => true,
 		getAllTools: () => [],
 		getSettings: () => ({}),
 		setActiveTools: () => {},

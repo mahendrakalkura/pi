@@ -439,6 +439,7 @@ export class ExtensionRunner {
 		this.runtime.getSessionName = actions.getSessionName;
 		this.runtime.setLabel = actions.setLabel;
 		this.runtime.getActiveTools = actions.getActiveTools;
+		this.runtime.isToolAllowed = actions.isToolAllowed;
 		this.runtime.getAllTools = actions.getAllTools;
 		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;

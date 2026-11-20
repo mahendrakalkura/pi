@@ -1939,6 +1939,10 @@ Typical `sourceInfo` values:
 
 `pi.setActiveTools()` ignores unknown and `hidden` tools. Tools with `codemode` or `deferred` exposure stay callable from codemode scripts whether active or not.
 
+### pi.isToolAllowed(name)
+
+`pi.isToolAllowed(name)` checks the session's tool-name filter, including `--tools` and `--exclude-tools`. The check works during `session_start`, before the named tool registers. It does not register or activate a tool, and a `true` result does not guarantee the tool exists, is active, or will pass execution hooks. Like `pi.getActiveTools()`, this method throws if called during extension loading before the session binds.
+
 ### pi.setModel(model)
 
 Set the model for the current session. The change is recorded in session history and restored when that session is resumed, but it does not change the configured `defaultProvider` or `defaultModel` used by new sessions. Returns `false` if authentication is not configured for the model's provider. See [models.md](models.md) for configuring custom models.

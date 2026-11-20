@@ -1827,6 +1827,9 @@ export interface ExtensionAPI {
 	/** Get the names of the active tools, which are the tools declared to the model. */
 	getActiveTools(): string[];
 
+	/** Check the session's tool-name filter, even before the tool registers. Available after session binding. */
+	isToolAllowed(name: string): boolean;
+
 	/** Get all configured tools with parameter schema, prompt guidelines, exposure, and source metadata. */
 	getAllTools(): ToolInfo[];
 
@@ -2261,6 +2264,7 @@ export interface ExtensionActions {
 	getSessionName: GetSessionNameHandler;
 	setLabel: SetLabelHandler;
 	getActiveTools: GetActiveToolsHandler;
+	isToolAllowed: (name: string) => boolean;
 	getAllTools: GetAllToolsHandler;
 	getSettings: GetSettingsHandler;
 	setActiveTools: SetActiveToolsHandler;
