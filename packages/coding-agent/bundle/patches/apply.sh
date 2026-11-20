@@ -1,4 +1,5 @@
 # Applies every patch below to node_modules after every `npm install` in packages/coding-agent/bundle.
+# - pi-lsp-project-roots.patch resolves canonical external worktrees with installed servers.
 # - chrome-devtools-mcp.patch makes chrome-devtools-mcp name the CDP target of every page it lists, so
 #   the browser guard in the dotfiles knows which window holds each page.
 # - pi-browser-use.patch reports a browser tool call that outlives its 60 s timeout as a timeout,
@@ -33,5 +34,6 @@ apply_patch() {
 apply_patch "@gotgenes/pi-subagents" pi-subagents.patch
 apply_patch pi-lsp-adapter pi-lsp-adapter.patch
 apply_patch pi-lsp-adapter pi-lsp-errors.patch
+apply_patch pi-lsp-adapter pi-lsp-project-roots.patch
 apply_patch chrome-devtools-mcp chrome-devtools-mcp.patch
 apply_patch pi-browser-use pi-browser-use.patch
