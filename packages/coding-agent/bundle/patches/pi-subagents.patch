@@ -457,34 +457,6 @@ diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
  					}),
  				),
  				inherit_context: Type.Optional(
-diff -ruN a/src/ui/display.ts b/src/ui/display.ts
---- a/src/ui/display.ts
-+++ b/src/ui/display.ts
-@@ -18,6 +18,8 @@
- export interface ModelIdentity {
-   readonly provider: string;
-   readonly id: string;
-+  /** Human-friendly catalog name (`Model.name`); absent on the narrow callers that build this by hand. */
-+  readonly name?: string;
- }
- 
- export type Theme = {
-diff -ruN a/src/ui/widget-renderer.ts b/src/ui/widget-renderer.ts
---- a/src/ui/widget-renderer.ts
-+++ b/src/ui/widget-renderer.ts
-@@ -132,9 +132,10 @@
- 	return budget.phase === "warned" ? theme.fg("warning", turns) : turns;
- }
- 
--/** ` [provider/id]` after the agent's name, or nothing while the model is unknown. */
-+/** ` [name]` after the agent's name - the friendly catalog name, or `provider/id`; nothing while the model is unknown. */
- function modelTag(agent: WidgetAgent, theme: Theme): string {
--	return agent.model ? ` ${theme.fg("dim", `[${formatModel(agent.model)}]`)}` : "";
-+	const label = agent.model ? (agent.model.name || formatModel(agent.model)) : "";
-+	return label ? ` ${theme.fg("dim", `[${label}]`)}` : "";
- }
- 
- // ── Full widget rendering ────────────────────────────────────────────────────
 diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
 --- a/test/background-resume.test.ts
 +++ b/test/background-resume.test.ts
@@ -1015,12 +987,12 @@ diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
 +    expect(options.excludeTools).toEqual(RECURSION_GUARD);
 +  });
 +});
-diff -ruN a/test/model-name.test.ts b/test/model-name.test.ts
---- a/test/model-name.test.ts
-+++ b/test/model-name.test.ts
-@@ -0,0 +1,70 @@
-+// Tests for the Pi fork's pi-subagents patch: the agents widget renders the friendly
-+// model name when the model carries one, and falls back to provider/id.
+diff -ruN a/test/model-tag.test.ts b/test/model-tag.test.ts
+--- a/test/model-tag.test.ts
++++ b/test/model-tag.test.ts
+@@ -0,0 +1,59 @@
++// Tests for the Pi fork's pi-subagents patch: the agents widget tags each agent with its
++// model as provider/id, even when the model carries a catalog display name.
 +// Run: cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
 +
 +import { describe, expect, it } from "bun:test";
@@ -1035,6 +1007,9 @@ diff -ruN a/test/model-name.test.ts b/test/model-name.test.ts
 +  systemPrompt: "",
 +  promptMode: "append",
 +}]]));
++
++// A live agent's model is the full catalog Model, which carries `name` beside provider and id.
++const OPUS = { provider: "jg-anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5" };
 +
 +function widgetAgent(model: WidgetAgent["model"]): WidgetAgent {
 +  return {
@@ -1054,38 +1029,24 @@ diff -ruN a/test/model-name.test.ts b/test/model-name.test.ts
 +}
 +
 +describe("agents widget model tag", () => {
-+  it("renders the friendly name alone when the model carries one", () => {
-+    const [header] = renderRunningLines(
-+      widgetAgent({ provider: "mk-deepseek", id: "deepseek-v4-pro", name: "DeepSeek V4 Pro" }),
-+      REGISTRY,
-+      0,
-+      THEME,
-+    );
-+    expect(header).toContain("[DeepSeek V4 Pro]");
-+    expect(header).not.toContain("mk-deepseek/deepseek-v4-pro");
++  it("renders provider/id on a running line, never the catalog name", () => {
++    const [header] = renderRunningLines(widgetAgent(OPUS), REGISTRY, 0, THEME);
++    expect(header).toContain("[jg-anthropic/claude-opus-5-5]");
++    expect(header).not.toContain("Claude Opus 5.5");
 +  });
 +
-+  it("falls back to provider/id when the name is absent", () => {
-+    const [header] = renderRunningLines(
-+      widgetAgent({ provider: "mk-deepseek", id: "deepseek-v4-pro" }),
++  it("renders provider/id on a finished line, never the catalog name", () => {
++    const line = renderFinishedLine(
++      { ...widgetAgent(OPUS), status: "completed", completedAt: 5000 },
 +      REGISTRY,
-+      0,
 +      THEME,
 +    );
-+    expect(header).toContain("[mk-deepseek/deepseek-v4-pro]");
++    expect(line).toContain("[jg-anthropic/claude-opus-5-5]");
++    expect(line).not.toContain("Claude Opus 5.5");
 +  });
 +
 +  it("renders no tag when the model is unknown", () => {
 +    const [header] = renderRunningLines(widgetAgent(undefined), REGISTRY, 0, THEME);
 +    expect(header).not.toContain("[");
-+  });
-+
-+  it("uses the friendly name on a finished line too", () => {
-+    const line = renderFinishedLine(
-+      { ...widgetAgent({ provider: "anthropic", id: "claude-sonnet-4-5", name: "Claude Sonnet 4.5" }), status: "completed", completedAt: 5000 },
-+      REGISTRY,
-+      THEME,
-+    );
-+    expect(line).toContain("[Claude Sonnet 4.5]");
 +  });
 +});
