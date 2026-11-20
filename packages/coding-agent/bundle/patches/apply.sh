@@ -3,8 +3,7 @@
 #   the browser guard in the dotfiles knows which window holds each page.
 # - pi-browser-use.patch reports a browser tool call that outlives its 60 s timeout as a timeout,
 #   instead of the "Allow remote debugging?" prompt text `existing` mode gives every failure.
-# - pi-lsp-adapter.patch keeps the language servers of every live owner in this process, so a
-#   subagent child's startup cleanup never terminates its parent's servers.
+# - pi-lsp-adapter.patch prevents cleanup from deleting or rewriting live owners' registrations.
 # - pi-lsp-errors.patch reports failed LSP requests as errors.
 # - pi-subagents.patch hands a child session the inline extensions that subagents.json
 #   `childInlineExtensions` names, out of the ones Pi's main() publishes on globalThis, and gives an
