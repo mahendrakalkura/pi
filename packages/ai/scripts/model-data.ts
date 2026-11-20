@@ -196,6 +196,18 @@ function validateModelValue(
 			}
 		}
 	}
+	if (
+		(expectedApi === "google-generative-ai" || expectedApi === "google-vertex") &&
+		isRecord(value.thinkingLevelMap)
+	) {
+		const supported = new Set(["minimal", "low", "medium", "high"]);
+		for (const [level, mapped] of Object.entries(value.thinkingLevelMap)) {
+			if (level === "off" || mapped === null || mapped === undefined) continue;
+			if (typeof mapped !== "string" || !supported.has(mapped.toLowerCase())) {
+				errors.push(`${label} has unsupported Google thinkingLevelMap.${level} ${JSON.stringify(mapped)}`);
+			}
+		}
+	}
 }
 
 function throwValidationErrors(errors: string[]): never {

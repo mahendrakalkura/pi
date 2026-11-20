@@ -1313,14 +1313,23 @@ export function calculateCost(model: AnyModel, usage: Usage): Usage["cost"] {
 }
 
 const EXTENDED_THINKING_LEVELS: ModelThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+const GOOGLE_SUPPORTED_THINKING_LEVELS = new Set(["minimal", "low", "medium", "high"]);
 
 export function getSupportedThinkingLevels<TApi extends Api>(model: Model<TApi>): ModelThinkingLevel[] {
 	if (!model.reasoning) return ["off"];
 
+	const isGoogleApi = model.api === "google-generative-ai" || model.api === "google-vertex";
 	return EXTENDED_THINKING_LEVELS.filter((level) => {
 		const mapped = model.thinkingLevelMap?.[level];
 		if (mapped === null) return false;
-		if (level === "xhigh" || level === "max") return mapped !== undefined;
+		if (level === "xhigh" || level === "max") {
+			if (mapped === undefined) return false;
+			if (isGoogleApi) return GOOGLE_SUPPORTED_THINKING_LEVELS.has(mapped.toLowerCase());
+			return true;
+		}
+		if (isGoogleApi && level !== "off" && mapped !== undefined) {
+			return GOOGLE_SUPPORTED_THINKING_LEVELS.has(mapped.toLowerCase());
+		}
 		return true;
 	});
 }
