@@ -5,6 +5,7 @@ import {
 	type McpAuthRequiredError,
 	McpClient,
 	type McpFetch,
+	McpHttpError,
 	McpSessionExpiredError,
 	StreamableHttpTransport,
 } from "../src/index.ts";
@@ -103,6 +104,72 @@ describe("consumeSseStream", () => {
 		expect(events).toEqual([{ id: "7", data: '{"one":\n1}' }]);
 	});
 
+	it("recognizes CR, LF, and CRLF line endings, including CRLF split across chunks", async () => {
+		const encoder = new TextEncoder();
+		const parse = async (chunks: string[]) => {
+			const stream = new ReadableStream<Uint8Array>({
+				start(controller) {
+					for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+					controller.close();
+				},
+			});
+			const events: SseEvent[] = [];
+			await consumeSseStream(stream, { onEvent: (event) => events.push(event) });
+			return events;
+		};
+		const expected = [{ id: "1", data: "a\nb" }, { data: "c" }];
+		for (const separator of ["\n", "\r\n", "\r"]) {
+			const text = ["id: 1", "data: a", "data: b", "", "data: c", "", ""].join(separator);
+			expect(await parse([text])).toEqual(expected);
+			// One character per chunk splits every CRLF between chunks.
+			expect(await parse([...text])).toEqual(expected);
+		}
+		expect(await parse(["id: 1\rdata: a\r\ndata: b\n\r", "\ndata: c\r\r"])).toEqual(expected);
+	});
+
+	// Regression test for #12224: a large event split across many chunks is measured and scanned once.
+	it("reads a large event split across many chunks in linear time", async () => {
+		const encoder = new TextEncoder();
+		const text = `data: ${"x".repeat(1024 * 1024)}\n\n`;
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (let i = 0; i < text.length; i += 4096) controller.enqueue(encoder.encode(text.slice(i, i + 4096)));
+				controller.close();
+			},
+		});
+		let measured = 0;
+		const byteLength = Buffer.byteLength;
+		const spy = vi.spyOn(Buffer, "byteLength").mockImplementation((value, encoding) => {
+			if (typeof value === "string") measured += value.length;
+			return byteLength(value, encoding);
+		});
+		const events: SseEvent[] = [];
+		try {
+			await consumeSseStream(stream, { onEvent: (event) => events.push(event) });
+		} finally {
+			spy.mockRestore();
+		}
+		expect(events).toEqual([{ data: "x".repeat(1024 * 1024) }]);
+		// Each chunk once, then the complete data line once.
+		expect(measured).toBeLessThanOrEqual(2 * text.length);
+	});
+
+	it("dispatches CR-terminated events while the stream stays open", async () => {
+		const encoder = new TextEncoder();
+		let controller!: ReadableStreamDefaultController<Uint8Array>;
+		const stream = new ReadableStream<Uint8Array>({
+			start(c) {
+				controller = c;
+			},
+		});
+		const received = new Promise<SseEvent>((resolve) => {
+			void consumeSseStream(stream, { onEvent: resolve }).catch(() => {});
+		});
+		controller.enqueue(encoder.encode("data: first\r\r"));
+		expect(await received).toEqual({ data: "first" });
+		controller.close();
+	});
+
 	it("rejects events whose data lines exceed the limit without a blank line", async () => {
 		const encoder = new TextEncoder();
 		let sent = 0;
@@ -117,6 +184,41 @@ describe("consumeSseStream", () => {
 			"MCP SSE event exceeds 256 bytes",
 		);
 		expect(sent).toBeLessThan(100);
+	});
+
+	it("rejects a line that exceeds the limit before its line ending arrives", async () => {
+		const encoder = new TextEncoder();
+		let sent = 0;
+		const stream = new ReadableStream<Uint8Array>({
+			pull(controller) {
+				// One data line that never ends.
+				if (sent++ > 1000) controller.close();
+				else controller.enqueue(encoder.encode(sent === 1 ? "data: " : "xxxxxxxxxxxxxxxx"));
+			},
+		});
+		await expect(consumeSseStream(stream, { maxEventBytes: 256, onEvent: () => {} })).rejects.toThrow(
+			"MCP SSE event exceeds 256 bytes",
+		);
+		expect(sent).toBeLessThan(100);
+	});
+
+	// Regression test for #11729: a failed stream must be cancelled, not left open.
+	it("cancels the stream when an event exceeds the limit", async () => {
+		const encoder = new TextEncoder();
+		let cancelled = false;
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				// The server keeps the response open after the oversized event.
+				controller.enqueue(encoder.encode(`data: ${"x".repeat(512)}\n\n`));
+			},
+			cancel() {
+				cancelled = true;
+			},
+		});
+		await expect(consumeSseStream(stream, { maxEventBytes: 128, onEvent: () => {} })).rejects.toThrow(
+			"MCP SSE event exceeds 128 bytes",
+		);
+		expect(cancelled).toBe(true);
 	});
 });
 
@@ -233,6 +335,29 @@ describe("StreamableHttpTransport", () => {
 		await client.close();
 	});
 
+	it("matches a streamed response that echoes the request id as a string", async () => {
+		const { url, requests } = await startServer(async (request, response, requests) => {
+			if (request.method !== "POST") return protocolHandler(request, response, requests);
+			const message = JSON.parse(await readBody(request)) as Record<string, unknown>;
+			if (message.method !== "tools/call") return protocolHandler(request, response, requests, message);
+			response.writeHead(200, { "content-type": "text/event-stream" });
+			response.end(
+				`id: e1\nretry: 5\ndata: ${JSON.stringify({ jsonrpc: "2.0", id: String(message.id), result: { content: [{ type: "text", text: "hello" }] } })}\n\n`,
+			);
+		});
+		const client = new McpClient({ name: "http-test", version: "1.0.0" });
+		const errors: Error[] = [];
+		client.onError((error) => errors.push(error));
+		await client.connect(new StreamableHttpTransport({ url, openGetStream: false }));
+		expect(await client.callTool("echo", {}, { timeoutMs: 2_000 })).toEqual({
+			content: [{ type: "text", text: "hello" }],
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		expect(errors).toEqual([]);
+		expect(requests.some((entry) => entry.method === "GET")).toBe(false);
+		await client.close();
+	});
+
 	it("fails a request whose response stream ends without an answer", async () => {
 		const { url } = await startServer(async (request, response, requests) => {
 			if (request.method !== "POST") return protocolHandler(request, response, requests);
@@ -289,6 +414,80 @@ describe("StreamableHttpTransport", () => {
 		await client.connect(new StreamableHttpTransport({ url, openGetStream: false }));
 		await expect(client.callTool("echo")).rejects.toThrow("without a response");
 		await client.close();
+	});
+
+	// #11335
+	it("applies maxMessageBytes to JSON responses", async () => {
+		const send = async (descriptionBytes: number) => {
+			const body = JSON.stringify({
+				jsonrpc: "2.0",
+				id: 1,
+				result: { tools: [{ name: "echo", description: "x".repeat(descriptionBytes), inputSchema: {} }] },
+			});
+			const transport = new StreamableHttpTransport({
+				url: "http://127.0.0.1/mcp",
+				maxMessageBytes: 512,
+				openGetStream: false,
+				fetch: async () => new Response(body, { headers: { "content-type": "application/json" } }),
+			});
+			const messages: unknown[] = [];
+			transport.onMessage((message) => messages.push(message));
+			await transport.start();
+			try {
+				await transport.send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+				return messages;
+			} finally {
+				await transport.close();
+			}
+		};
+
+		expect(await send(32)).toHaveLength(1);
+		await expect(send(2048)).rejects.toThrow("MCP JSON response exceeds 512 bytes");
+	});
+
+	it("decodes JSON responses split inside a BOM and a multi-byte character", async () => {
+		const bytes = new TextEncoder().encode(
+			`\uFEFF${JSON.stringify({ jsonrpc: "2.0", id: 1, result: { text: "é€" } })}`,
+		);
+		const body = new ReadableStream<Uint8Array>({
+			start(controller) {
+				for (const byte of bytes) controller.enqueue(new Uint8Array([byte]));
+				controller.close();
+			},
+		});
+		const transport = new StreamableHttpTransport({
+			url: "http://127.0.0.1/mcp",
+			openGetStream: false,
+			fetch: async () => new Response(body, { headers: { "content-type": "application/json" } }),
+		});
+		const messages: unknown[] = [];
+		transport.onMessage((message) => messages.push(message));
+		await transport.start();
+		await transport.send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+		await transport.close();
+		expect(messages).toEqual([{ jsonrpc: "2.0", id: 1, result: { text: "é€" } }]);
+	});
+
+	it("reads only an excerpt of HTTP error bodies and cancels the rest", async () => {
+		let cancelled = false;
+		// An endless error body: reading it whole would never finish.
+		const body = new ReadableStream<Uint8Array>({
+			pull: (controller) => controller.enqueue(new TextEncoder().encode("x".repeat(1024))),
+			cancel: () => {
+				cancelled = true;
+			},
+		});
+		const transport = new StreamableHttpTransport({
+			url: "http://127.0.0.1/mcp",
+			openGetStream: false,
+			fetch: async () => new Response(body, { status: 500 }),
+		});
+		await transport.start();
+		const error = await transport.send({ jsonrpc: "2.0", id: 1, method: "tools/list" }).catch((e: unknown) => e);
+		await transport.close();
+		expect(error).toBeInstanceOf(McpHttpError);
+		expect((error as McpHttpError).body).toHaveLength(8 * 1024);
+		expect(cancelled).toBe(true);
 	});
 
 	it("includes the response body in HTTP errors", async () => {

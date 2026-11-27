@@ -1,4 +1,4 @@
-import type { JsonValue } from "@earendil-works/chord";
+import type { JsonValue } from "@earendil-works/chord/json";
 import { describe, expect, it } from "vitest";
 import { idFromNumber } from "../src/ids.ts";
 import { CachedStorage } from "../src/session/cached-storage.ts";
@@ -90,7 +90,10 @@ describe("cached storage", () => {
 		]);
 		const batch: StorageWrite[] = [{ type: "task", value: task(2, "running") }];
 		const receipts: number[] = [];
-		expect(await storage.commit([batch], (index) => receipts.push(index), context)).toEqual({ stored: 1 });
+		expect(await storage.commit([batch], (index) => receipts.push(index), context)).toEqual({
+			kind: "stored",
+			stored: 1,
+		});
 		expect(receipts).toEqual([0]);
 		// Stored, not yet published: the cache still shows what was published.
 		expect((await storage.task(idFromNumber<TaskId>(2), context))?.state.status).toBe("pending");

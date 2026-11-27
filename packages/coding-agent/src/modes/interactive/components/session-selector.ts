@@ -12,6 +12,7 @@ import {
 	truncateToWidth,
 	visibleWidth,
 } from "@earendil-works/pi-tui";
+import { formatSkillInvocation } from "../../../core/agent-session.ts";
 import { KeybindingsManager } from "../../../core/keybindings.ts";
 import type { SessionInfo, SessionListProgress } from "../../../core/session-manager.ts";
 import { canonicalizePath, getPathComparisonKey, shortenHomePath } from "../../../utils/paths.ts";
@@ -279,6 +280,8 @@ class SessionList implements Component, Focusable {
 	private filteredSessions: FlatSessionNode[] = [];
 	private selectedIndex: number = 0;
 	private selectionTouched = false;
+	// Session to select once it appears, while a progressive reload has not yet delivered it
+	private pendingSelectedPath?: string;
 	private searchInput: Input;
 	private showCwd = false;
 	private sortMode: SortMode = "threaded";
@@ -349,8 +352,13 @@ class SessionList implements Component, Focusable {
 		this.filterSessions(this.searchInput.getValue());
 	}
 
-	setSessions(sessions: SessionInfo[], showCwd: boolean): void {
-		const selectedPath = this.selectionTouched ? this.getSelectedSessionPath() : undefined;
+	/**
+	 * @param partial true when more sessions are still loading; a selected session missing from a
+	 * partial list stays the selection target until it arrives
+	 */
+	setSessions(sessions: SessionInfo[], showCwd: boolean, partial = false): void {
+		const pendingPath = this.selectionTouched ? this.pendingSelectedPath : undefined;
+		const selectedPath = this.selectionTouched ? (pendingPath ?? this.getSelectedSessionPath()) : undefined;
 		this.allSessions = sessions;
 		this.showCwd = showCwd;
 		this.filterSessions(this.searchInput.getValue());
@@ -358,7 +366,16 @@ class SessionList implements Component, Focusable {
 			this.selectedIndex = 0;
 		} else if (selectedPath) {
 			const selectedIndex = this.filteredSessions.findIndex((node) => node.session.path === selectedPath);
-			if (selectedIndex >= 0) this.selectedIndex = selectedIndex;
+			if (selectedIndex >= 0) {
+				this.selectedIndex = selectedIndex;
+				this.pendingSelectedPath = undefined;
+			} else if (partial) {
+				// The selected session may not have loaded yet: keep it as the target instead of
+				// adopting whichever session the index now points to.
+				this.pendingSelectedPath = selectedPath;
+			} else {
+				this.pendingSelectedPath = undefined;
+			}
 		}
 	}
 
@@ -423,14 +440,14 @@ class SessionList implements Component, Focusable {
 				if (this.showCwd) {
 					emptyMessage = `  No named sessions found. Press ${toggleKey} to show all.`;
 				} else {
-					emptyMessage = `  No named sessions in current folder. Press ${toggleKey} to show all, or Tab to view all.`;
+					emptyMessage = `  No named sessions in current folder. Press ${toggleKey} to show all, or ${keyText("tui.input.tab")} to view all.`;
 				}
 			} else if (this.showCwd) {
 				// "All" scope - no sessions anywhere that match filter
 				emptyMessage = "  No sessions found";
 			} else {
 				// "Current folder" scope - hint to try "all"
-				emptyMessage = "  No sessions in current folder. Press Tab to view all.";
+				emptyMessage = `  No sessions in current folder. Press ${keyText("tui.input.tab")} to view all.`;
 			}
 			lines.push(theme.fg("muted", truncateToWidth(emptyMessage, width, "…")));
 			return lines;
@@ -456,7 +473,7 @@ class SessionList implements Component, Focusable {
 
 			// Session display text (name or first message)
 			const hasName = !!session.name;
-			const displayText = session.name ?? session.firstMessage;
+			const displayText = session.name ?? formatSkillInvocation(session.firstMessage);
 			const normalizedMessage = displayText.replace(/[\x00-\x1f\x7f]/g, " ").trim();
 
 			// Right side: message count and age
@@ -589,8 +606,7 @@ class SessionList implements Component, Focusable {
 		// Only triggers deletion when the query is empty; otherwise it is forwarded to the input
 		if (kb.matches(keyData, "app.session.deleteNoninvasive")) {
 			if (this.searchInput.getValue().length > 0) {
-				this.searchInput.handleInput(keyData);
-				this.filterSessions(this.searchInput.getValue());
+				this.handleSearchInput(keyData);
 				return;
 			}
 
@@ -599,6 +615,7 @@ class SessionList implements Component, Focusable {
 		}
 
 		this.selectionTouched = true;
+		this.pendingSelectedPath = undefined;
 		// Up arrow
 		if (kb.matches(keyData, "tui.select.up")) {
 			this.selectedIndex = Math.max(0, this.selectedIndex - 1);
@@ -630,9 +647,23 @@ class SessionList implements Component, Focusable {
 		}
 		// Pass everything else to search input
 		else {
-			this.searchInput.handleInput(keyData);
-			this.filterSessions(this.searchInput.getValue());
+			this.handleSearchInput(keyData);
 		}
+	}
+
+	/** Applies a key to the search query; a changed, non-empty query selects the top row, the best match. */
+	private handleSearchInput(keyData: string): void {
+		const previousQuery = this.searchInput.getValue();
+		this.searchInput.handleInput(keyData);
+		const query = this.searchInput.getValue();
+		// Cursor keys leave the query as it is and must not move the selection.
+		if (query === previousQuery) return;
+		this.filterSessions(query);
+		if (!query.trim()) return;
+		this.selectedIndex = 0;
+		// Untouched, sessions that are still loading keep the selection on the top row instead of on this session.
+		this.selectionTouched = false;
+		this.pendingSelectedPath = undefined;
 	}
 }
 
@@ -889,7 +920,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		panel.addChild(new Spacer(1));
 		panel.addChild(
 			new Text(
-				theme.fg("muted", `${keyText("tui.select.confirm")} to save · ${keyText("tui.select.cancel")} to cancel`),
+				theme.fg("muted", `${keyText("tui.input.submit")} to save · ${keyText("tui.select.cancel")} to cancel`),
 				1,
 				0,
 			),
@@ -956,7 +987,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 				} else {
 					this.allSessions = sessions;
 				}
-				if (scope === this.scope) this.sessionList.setSessions(sessions, showCwd);
+				if (scope === this.scope) this.sessionList.setSessions(sessions, showCwd, true);
 			}
 			if (scope !== this.scope) return;
 			this.header.setProgress(loaded, total);
@@ -1028,7 +1059,7 @@ export class SessionSelectorComponent extends Container implements Focusable {
 		const loading = (this.scope === "current" ? this.currentLoad : this.allLoad) !== null;
 		this.header.setScope(this.scope);
 		this.header.setLoading(loading);
-		this.sessionList.setSessions(sessions ?? [], this.scope === "all");
+		this.sessionList.setSessions(sessions ?? [], this.scope === "all", loading || sessions === null);
 		this.requestRender();
 		if (sessions === null && !loading) void this.loadScope(this.scope);
 	}

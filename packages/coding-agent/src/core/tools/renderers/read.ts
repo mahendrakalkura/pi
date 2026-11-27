@@ -18,6 +18,7 @@ import { resolveToCwd } from "../path-utils.ts";
 import type { ReadToolDetails } from "../read.ts";
 import { formatReadLineRange, getTextOutput, renderToolPath, replaceTabs, str } from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "../truncate.ts";
+import { declarePathHighlightingRenderers } from "./highlighting.ts";
 
 interface CompactReadClassification {
 	kind: "docs" | "resource" | "skill";
@@ -115,8 +116,12 @@ function formatReadResult(
 	_cwd: string,
 	isError: boolean,
 ): string {
+	const unsupportedBy = result.details?.imageUnsupportedByModel;
+	const imageWarning = unsupportedBy
+		? `\n${theme.fg("warning", `[${unsupportedBy} does not support images; it saw a placeholder instead]`)}`
+		: "";
 	if (!options.expanded && !isError) {
-		return "";
+		return imageWarning;
 	}
 
 	const rawPath = str(args?.file_path ?? args?.path);
@@ -142,7 +147,7 @@ function formatReadResult(
 			text += `\n${theme.fg("warning", `[Truncated: ${truncation.outputLines} lines shown (${formatSize(truncation.maxBytes ?? DEFAULT_MAX_BYTES)} limit)]`)}`;
 		}
 	}
-	return text;
+	return text + imageWarning;
 }
 
 export const readRenderers: Pick<ToolDefinition<any, ReadToolDetails | undefined>, "renderCall" | "renderResult"> = {
@@ -171,3 +176,5 @@ export const readRenderers: Pick<ToolDefinition<any, ReadToolDetails | undefined
 		return text;
 	},
 };
+
+declarePathHighlightingRenderers(readRenderers);

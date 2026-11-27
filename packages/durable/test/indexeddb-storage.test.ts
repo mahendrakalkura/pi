@@ -1,7 +1,8 @@
 /// <reference lib="dom" />
 
-import type { Context, JsonValue } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
+import type { JsonValue } from "@earendil-works/chord/json";
 import { registerStorageConformance } from "@earendil-works/pi-durable/testing";
 import { IDBKeyRange as FakeIDBKeyRange, IDBObjectStore as FakeIDBObjectStore, IDBFactory } from "fake-indexeddb";
 import { describe, expect, it, vi } from "vitest";
@@ -328,7 +329,9 @@ describe("commit", () => {
 				context,
 			);
 			expect(result.stored).toBe(1);
-			expect(String(result.refused)).toBe(`Error: ID ${first} already belongs to entry`);
+			expect(result.kind === "refused" && String(result.refused)).toBe(
+				`Error: ID ${first} already belongs to entry`,
+			);
 			expect(receipts.map(([index]) => index)).toEqual([0]);
 			expect((await storage.entry(first, context))?.commitSeq).toBe(receipts[0]![1]);
 			expect(await storage.entry(after, context)).toBeUndefined();
@@ -370,7 +373,7 @@ describe("commit", () => {
 				() => {},
 				context,
 			);
-			expect(result).toEqual({ stored: 3 });
+			expect(result).toEqual({ kind: "stored", stored: 3 });
 			expect((await storage.document(copyId, "current", context))?.value).toEqual({ count: 2 });
 		}));
 
@@ -408,7 +411,7 @@ describe("commit", () => {
 				context,
 			);
 			expect(result.stored).toBe(1);
-			expect(String(result.refused)).toContain(`Document copy ${copyId} was rejected`);
+			expect(result.kind === "refused" && String(result.refused)).toContain(`Document copy ${copyId} was rejected`);
 			expect(await storage.entry(first, context)).toBeDefined();
 			expect(await storage.task(taskId, context)).toBeUndefined();
 			expect(await storage.document(copyId, "current", context)).toBeUndefined();

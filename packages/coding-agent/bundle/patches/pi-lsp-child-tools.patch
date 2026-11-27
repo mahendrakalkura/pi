@@ -1,0 +1,60 @@
+diff -ruN a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -13,6 +13,10 @@
+ import { setLspStatusLine } from "./statusLine.js";
+ import type { LspExtensionState } from "./state.js";
+ 
++const LSP_TOOL_NAMES = [
++  "lsp_definition", "lsp_diagnostics", "lsp_document_symbols", "lsp_hover", "lsp_more", "lsp_references", "lsp_workspace_symbols",
++];
++
+ export default function piAgentLspExtension(pi: ExtensionAPI): void {
+   let state: LspExtensionState | null = null;
+   let generation = 0;
+@@ -22,7 +26,7 @@
+   registerLspWarmup(pi, () => state);
+ 
+   pi.on("before_agent_start", (event) => {
+-    if (!state) return;
++    if (!state || !LSP_TOOL_NAMES.every((name) => pi.isToolAllowed(name))) return;
+     return {
+       systemPrompt: `${event.systemPrompt}\n\nLSP integration: read-only LSP tools are available for diagnostics, hover/type info, definitions, references, document symbols, and workspace symbol search. Prefer these tools when semantic code understanding would reduce guesswork; they use 1-based line/column inputs and do not mutate files. For hover, definition, and references, place the column on the identifier token itself. When an LSP result says "More available" and includes a resultId, use lsp_more only if you need the next sequential page; re-run the original LSP query if the resultId is missing or expired.`,
+     };
+@@ -34,7 +38,7 @@
+     state = null;
+ 
+     await shutdownState(previousState, ctx, "session_restart");
+-    if (currentGeneration !== generation) return;
++    if (currentGeneration !== generation || !LSP_TOOL_NAMES.some((name) => pi.isToolAllowed(name))) return;
+ 
+     const ownerId = createOwnerId();
+     try {
+diff -ruN a/test/child-tools.test.ts b/test/child-tools.test.ts
+--- a/test/child-tools.test.ts
++++ b/test/child-tools.test.ts
+@@ -0,0 +1,24 @@
++import { describe, expect, it } from "bun:test";
++import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
++import lsp from "../src/index.ts";
++
++const SERVER_COMMANDS = ["before_agent_start", "tool_call", "session_start"];
++
++describe("LSP read-only child", () => {
++  it("does not read LSP config, warm up, or claim tools when none are allowed", async () => {
++    const listeners = new Map<string, (event: unknown, ctx: ExtensionContext) => unknown>();
++    const checked: string[] = [];
++    lsp({
++      on: (name: string, fn: (event: unknown, ctx: ExtensionContext) => unknown) => listeners.set(name, fn),
++      isToolAllowed: (name: string) => { checked.push(name); return name === "read"; },
++      registerCommand: () => {},
++      registerTool: () => {},
++    } as unknown as ExtensionAPI);
++    const ctx = new Proxy({}, { get: (_, key) => { throw new Error(`Read-only child used ${String(key)}`); } }) as ExtensionContext;
++    for (const name of SERVER_COMMANDS) expect(listeners.has(name)).toBe(true);
++    expect(await listeners.get("session_start")?.({}, ctx)).toBeUndefined();
++    expect(listeners.get("before_agent_start")?.({ systemPrompt: "unchanged" }, ctx)).toBeUndefined();
++    expect(listeners.get("tool_call")?.({ toolName: "read", input: { path: "fixture.go" } }, ctx)).toBeUndefined();
++    expect(checked).toContain("lsp_document_symbols");
++  });
++});

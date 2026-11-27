@@ -112,6 +112,14 @@ export { type RenderLatexOptions, renderLatex } from "./latex.ts";
 // Native platform integration
 export { getNativeClipboard, type NativeClipboard } from "./native-platform.ts";
 export { oklabToOkhslLightness } from "./oklab.ts";
+// Program resume reporting (OSC 7577)
+export {
+	formatProgramResume,
+	formatProgramResumeClear,
+	type ProgramResumeCommand,
+	type ProgramResumeSender,
+	takeProgramResumeToken,
+} from "./program-resume.ts";
 // Program status reporting (OSC 7501)
 export { formatProgramStatus, type ProgramStatus } from "./program-status.ts";
 // Input buffering for batch splitting
@@ -148,6 +156,7 @@ export {
 	type ImageProtocol,
 	type ImageRenderOptions,
 	imageFallback,
+	onCapabilitiesChange,
 	renderImage,
 	resetCapabilitiesCache,
 	setCapabilities,
@@ -162,15 +171,30 @@ export {
 	compositeTuiLine,
 	type Focusable,
 	isFocusable,
+	isStableRender,
 	isViewportTUI,
+	LiveLineArray,
+	type LiveLines,
+	markLiveRender,
+	markReportsChanges,
+	markStableRender,
 	type OverlayAnchor,
 	type OverlayBounds,
 	type OverlayHandle,
 	type OverlayMargin,
 	type OverlayOptions,
 	type OverlayUnfocusOptions,
+	renderChildLines,
 	renderFakeCursor,
+	renderLiveLines,
+	renderSharedLines,
+	reportRenderChange,
+	reportsChanges,
 	type SizeValue,
+	setChangeReportsForTest,
+	setRenderClockForTest,
+	setRenderOwner,
+	setSubtreeReportsChanges,
 	type TUI,
 	type TuiInputListener,
 	type TuiInputListenerResult,

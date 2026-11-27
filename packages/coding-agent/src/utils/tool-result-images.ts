@@ -1,5 +1,5 @@
 import type { ImageContent, ModelImageResizeOptions, TextContent } from "@earendil-works/pi-ai";
-import { processImage } from "./image-process.ts";
+import { isProcessedImageBlock, processImage } from "./image-process.ts";
 
 export type ToolResultContent = TextContent | ImageContent;
 
@@ -39,10 +39,14 @@ export async function normalizeToolResultImages(
 			continue;
 		}
 
-		const processed = await processImage(Buffer.from(block.data, "base64"), block.mimeType, {
-			autoResizeImages,
-			resizeOptions: options?.resizeOptions,
-		});
+		const processOptions = { autoResizeImages, resizeOptions: options?.resizeOptions };
+		// The read tool's images were processed with these options already; a second pass returns them unchanged.
+		if (isProcessedImageBlock(block, processOptions)) {
+			normalized.push(block);
+			continue;
+		}
+
+		const processed = await processImage(Buffer.from(block.data, "base64"), block.mimeType, processOptions);
 		if (!processed.ok) {
 			// Unlike `read`, keep the original block. The tool already produced this image and the
 			// failure may just be an unavailable image backend, so passing it through preserves the

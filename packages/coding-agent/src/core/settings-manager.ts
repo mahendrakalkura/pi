@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { dirname, join } from "path";
 import lockfile from "proper-lockfile";
 import { CONFIG_DIR_NAME, getAgentDir } from "../config.ts";
-import { normalizePath, resolvePath } from "../utils/paths.ts";
+import { getFileRevision, normalizePath, resolvePath } from "../utils/paths.ts";
 import { stripBom } from "../utils/text.ts";
 import { DEFAULT_HTTP_IDLE_TIMEOUT_MS, parseHttpIdleTimeoutMs } from "./http-dispatcher.ts";
 import { SETTINGS_DEFAULTS } from "./settings-defaults.ts";
@@ -16,6 +16,7 @@ import type {
 	DefaultProjectTrust,
 	FullscreenExitOutput,
 	MermaidRenderingMode,
+	NoticeSettings,
 	PackageSource,
 	QuietStartup,
 	SessionShareDestination,
@@ -38,6 +39,7 @@ export type {
 	ImageSettings,
 	MarkdownSettings,
 	MermaidRenderingMode,
+	NoticeSettings,
 	PackageSource,
 	ProviderRetrySettings,
 	QuietStartup,
@@ -165,6 +167,8 @@ export interface SettingsManagerCreateOptions {
 
 export interface SettingsStorage {
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void;
+	/** What withLock() would hand its callback, for a caller that only reads. Optional: withLock() is used without it. */
+	read?(scope: SettingsScope): string | undefined;
 }
 
 export interface SettingsError {
@@ -182,6 +186,11 @@ function toSettingsError(scope: SettingsScope, error: unknown, path?: string): S
 		error: error instanceof Error ? error : new Error(String(error)),
 	};
 }
+
+// What each settings file held when it was last read under its lock, with the file's revision at that time. A start reads
+// settings.json four times (three SettingsManagers and a reload), and every read took the lock: a directory made and
+// removed beside the file. An unchanged file is now read once.
+const settingsFileReads = new Map<string, { revision: string; content: string }>();
 
 export class FileSettingsStorage implements SettingsStorage {
 	private globalSettingsPath: string;
@@ -219,6 +228,31 @@ export class FileSettingsStorage implements SettingsStorage {
 		}
 
 		throw (lastError as Error) ?? new Error("Failed to acquire settings lock");
+	}
+
+	read(scope: SettingsScope): string | undefined {
+		const path = scope === "global" ? this.globalSettingsPath : this.projectSettingsPath;
+		const revision = getFileRevision(path);
+		if (revision === undefined) {
+			settingsFileReads.delete(path);
+			return undefined;
+		}
+		const cached = settingsFileReads.get(path);
+		if (cached?.revision === revision) {
+			return cached.content;
+		}
+		let content: string | undefined;
+		this.withLock(scope, (current) => {
+			content = current;
+			return undefined;
+		});
+		// Kept only if the file is what it was before it was read.
+		if (content !== undefined && getFileRevision(path) === revision) {
+			settingsFileReads.set(path, { revision, content });
+		} else {
+			settingsFileReads.delete(path);
+		}
+		return content;
 	}
 
 	withLock(scope: SettingsScope, fn: (current: string | undefined) => string | undefined): void {
@@ -369,10 +403,14 @@ export class SettingsManager {
 		}
 
 		let content: string | undefined;
-		storage.withLock(scope, (current) => {
-			content = current;
-			return undefined;
-		});
+		if (storage.read) {
+			content = storage.read(scope);
+		} else {
+			storage.withLock(scope, (current) => {
+				content = current;
+				return undefined;
+			});
+		}
 
 		if (!content) {
 			return {};
@@ -406,6 +444,20 @@ export class SettingsManager {
 			settings.transport = settings.websockets ? "websocket" : "sse";
 			delete settings.websockets;
 		}
+
+		// Migrate showCacheMissNotices -> notices.*; keys already set in notices win
+		if (typeof settings.showCacheMissNotices === "boolean") {
+			const shown = settings.showCacheMissNotices;
+			const notices = typeof settings.notices === "object" && settings.notices !== null ? settings.notices : {};
+			settings.notices = {
+				cacheMisses: shown,
+				cacheWarming: shown,
+				compactionCosts: shown,
+				reasoningDrops: shown,
+				...notices,
+			};
+		}
+		delete settings.showCacheMissNotices;
 
 		// Migrate old skills object format to new array format
 		if (
@@ -967,10 +1019,6 @@ export class SettingsManager {
 		return this.settings.hideThinkingBlock ?? SETTINGS_DEFAULTS.hideThinkingBlock;
 	}
 
-	getShowCacheMissNotices(): boolean {
-		return this.settings.showCacheMissNotices ?? SETTINGS_DEFAULTS.showCacheMissNotices;
-	}
-
 	getExternalEditorCommand(): string {
 		const configuredEditor = this.settings.externalEditor;
 		if (typeof configuredEditor === "string" && configuredEditor.trim() !== "") {
@@ -986,12 +1034,6 @@ export class SettingsManager {
 	setHideThinkingBlock(hide: boolean): void {
 		this.globalSettings.hideThinkingBlock = hide;
 		this.markModified("hideThinkingBlock");
-		this.save();
-	}
-
-	setShowCacheMissNotices(show: boolean): void {
-		this.globalSettings.showCacheMissNotices = show;
-		this.markModified("showCacheMissNotices");
 		this.save();
 	}
 
@@ -1055,16 +1097,6 @@ export class SettingsManager {
 	setCollapseChangelog(collapse: boolean): void {
 		this.globalSettings.collapseChangelog = collapse;
 		this.markModified("collapseChangelog");
-		this.save();
-	}
-
-	getEnableInstallTelemetry(): boolean {
-		return this.settings.enableInstallTelemetry ?? SETTINGS_DEFAULTS.enableInstallTelemetry;
-	}
-
-	setEnableInstallTelemetry(enabled: boolean): void {
-		this.globalSettings.enableInstallTelemetry = enabled;
-		this.markModified("enableInstallTelemetry");
 		this.save();
 	}
 
@@ -1451,6 +1483,18 @@ export class SettingsManager {
 	setWarnings(warnings: WarningSettings): void {
 		this.globalSettings.warnings = { ...warnings };
 		this.markModified("warnings");
+		this.save();
+	}
+
+	/** Which transcript notices to show, with defaults filled in. */
+	getNotices(): Required<NoticeSettings> {
+		return { ...SETTINGS_DEFAULTS.notices, ...this.settings.notices };
+	}
+
+	/** Show or hide one transcript notice. Writes only that key, so the other notices keep following their defaults. */
+	setNotice(key: keyof NoticeSettings, shown: boolean): void {
+		this.globalSettings.notices = { ...this.globalSettings.notices, [key]: shown };
+		this.markModified("notices", key);
 		this.save();
 	}
 }

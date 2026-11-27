@@ -1,7 +1,8 @@
 /// <reference lib="dom" />
 
-import type { Context, JsonValue } from "@earendil-works/chord";
+import type { Context } from "@earendil-works/chord/context";
 import { apply, type Op } from "@earendil-works/chord/delta";
+import type { JsonValue } from "@earendil-works/chord/json";
 import { StorageRequestError } from "../errors.ts";
 import { idFromNumber, seqFromNumber } from "../ids.ts";
 import type {
@@ -494,7 +495,9 @@ export class IndexedDbStorage implements Storage {
 		});
 		// The transaction completed: the stored batches are durable.
 		for (const [index, seq] of seqs.entries()) receive(index, seq);
-		return refused === undefined ? { stored: seqs.length } : { stored: seqs.length, refused: refused.error };
+		return refused === undefined
+			? { kind: "stored", stored: seqs.length }
+			: { kind: "refused", stored: seqs.length, refused: refused.error };
 	}
 
 	async mintId<I extends Id<string>>(): Promise<I> {

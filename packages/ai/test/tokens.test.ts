@@ -162,7 +162,7 @@ describe("Token Statistics on Abort", () => {
 	});
 
 	describe.skipIf(!hasCloudflareWorkersAICredentials())("Cloudflare Workers AI Provider", () => {
-		const llm = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6");
+		const llm = getModel("cloudflare-workers-ai", "@cf/zai-org/glm-5.3");
 
 		it("should include token stats when aborted mid-stream", { retry: 3, timeout: 30000 }, async () => {
 			await testTokensOnAbort(llm);
@@ -170,7 +170,7 @@ describe("Token Statistics on Abort", () => {
 	});
 
 	describe.skipIf(!hasCloudflareAiGatewayCredentials())("Cloudflare AI Gateway Provider", () => {
-		const llm = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
+		const llm = getModel("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3");
 
 		it("should include token stats when aborted mid-stream", { retry: 3, timeout: 30000 }, async () => {
 			await testTokensOnAbort(llm);
@@ -210,7 +210,7 @@ describe("Token Statistics on Abort", () => {
 	});
 
 	describe.skipIf(!process.env.MISTRAL_API_KEY)("Mistral Provider", () => {
-		const llm = getModel("mistral", "devstral-medium-latest");
+		const llm = getModel("mistral", "mistral-medium-latest");
 
 		it("should include token stats when aborted mid-stream", { retry: 3, timeout: 30000 }, async () => {
 			await testTokensOnAbort(llm);
@@ -310,6 +310,14 @@ describe("Token Statistics on Abort", () => {
 
 	describe.skipIf(!process.env.QWEN_TOKEN_PLAN_CN_API_KEY)("Qwen Token Plan (CN) Provider", () => {
 		const llm = getModel("qwen-token-plan-cn", "qwen3.7-max");
+
+		it("should include token stats when aborted mid-stream", { retry: 3, timeout: 30000 }, async () => {
+			await testTokensOnAbort(llm);
+		});
+	});
+
+	describe.skipIf(!process.env.QWEN_TOKEN_PLAN_CN_API_KEY)("Qwen Token Plan Individual (CN) Provider", () => {
+		const llm = getModel("qwen-token-plan-individual-cn", "qwen3.8-max");
 
 		it("should include token stats when aborted mid-stream", { retry: 3, timeout: 30000 }, async () => {
 			await testTokensOnAbort(llm);

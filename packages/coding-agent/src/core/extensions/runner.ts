@@ -11,7 +11,7 @@ import {
 	type ProviderHeaders,
 } from "@earendil-works/pi-ai";
 import type { KeyId } from "@earendil-works/pi-tui";
-import { type Theme, theme } from "../../modes/interactive/theme/theme.ts";
+import { liveTheme, type Theme } from "../../modes/interactive/theme/theme.ts";
 import type { CacheWarmingAction } from "../cache-warmer.ts";
 import type { ResourceDiagnostic } from "../diagnostics.ts";
 import type { KeybindingsConfig } from "../keybindings.ts";
@@ -161,7 +161,8 @@ function isUserBashEventResult(value: unknown): value is UserBashEventResult {
 		(resultRecord.exitCode === undefined || typeof resultRecord.exitCode === "number") &&
 		typeof resultRecord.cancelled === "boolean" &&
 		typeof resultRecord.truncated === "boolean" &&
-		(resultRecord.fullOutputPath === undefined || typeof resultRecord.fullOutputPath === "string")
+		(resultRecord.fullOutputPath === undefined || typeof resultRecord.fullOutputPath === "string") &&
+		(resultRecord.fullOutputError === undefined || typeof resultRecord.fullOutputError === "string")
 	);
 }
 
@@ -352,7 +353,7 @@ const noOpUIContext: ExtensionUIContext = {
 	setEditorComponent: () => {},
 	getEditorComponent: () => undefined,
 	get theme() {
-		return theme;
+		return liveTheme;
 	},
 	getAllThemes: () => [],
 	getTheme: () => undefined,
@@ -384,6 +385,7 @@ export class ExtensionRunner {
 	private getSystemPromptOptionsFn: () => BuildSystemPromptOptions = () =>
 		normalizeBuildSystemPromptOptions({ cwd: this.cwd });
 	private executeToolFn: ExtensionContextActions["executeTool"];
+	private executeCommandToolFn: ExtensionContextActions["executeCommandTool"];
 	private getCallableToolsFn: () => readonly AgentTool[] = () => [];
 	/** Registered MCP servers already reported as unhandled. */
 	private readonly reportedMcpServers = new Set<string>();
@@ -408,6 +410,10 @@ export class ExtensionRunner {
 	) {
 		this.extensions = extensions;
 		this.runtime = runtime;
+		// A handler still running when its session is replaced must not report into the replacement's UI.
+		this.runtime.reportError = (error) => {
+			if (!this.staleMessage) this.emitError(error);
+		};
 		this.uiContext = noOpUIContext;
 		this.cwd = cwd;
 		this.sessionManager = sessionManager;
@@ -433,6 +439,7 @@ export class ExtensionRunner {
 		this.runtime.getSessionName = actions.getSessionName;
 		this.runtime.setLabel = actions.setLabel;
 		this.runtime.getActiveTools = actions.getActiveTools;
+		this.runtime.isToolAllowed = actions.isToolAllowed;
 		this.runtime.getAllTools = actions.getAllTools;
 		this.runtime.getSettings = actions.getSettings;
 		this.runtime.setActiveTools = actions.setActiveTools;
@@ -458,7 +465,9 @@ export class ExtensionRunner {
 		this.getSystemPromptOptionsFn =
 			contextActions.getSystemPromptOptions ?? (() => normalizeBuildSystemPromptOptions({ cwd: this.cwd }));
 		this.executeToolFn = contextActions.executeTool;
+		this.executeCommandToolFn = contextActions.executeCommandTool;
 		this.getCallableToolsFn = contextActions.getCallableTools ?? (() => []);
+		this.runtime.getCallableToolNames = () => this.getCallableToolsFn().map((tool) => tool.name);
 
 		// Servers registered from now on reach the extension that connects them right away. Servers
 		// registered during loading are read on session_start.
@@ -789,8 +798,15 @@ export class ExtensionRunner {
 		return undefined;
 	}
 
+	/** Markdown transformers in extension load order; each one leaves Markdown of unregistered surfaces unchanged. */
 	getMarkdownTransformers(): MarkdownTransformer[] {
-		return this.extensions.flatMap((ext) => (ext.markdownTransformer ? [ext.markdownTransformer] : []));
+		return this.extensions.flatMap((ext): MarkdownTransformer[] => {
+			if (!ext.markdownTransformer) return [];
+			const { transformer, messageTypes } = ext.markdownTransformer;
+			return [
+				(markdown, context) => (messageTypes.has(context.messageType) ? transformer(markdown, context) : markdown),
+			];
+		});
 	}
 
 	/** Renderers of calls to `toolName`: extension resolvers in load order, then `base`. */
@@ -1002,6 +1018,21 @@ export class ExtensionRunner {
 			{},
 			Object.getOwnPropertyDescriptors(this.createContext()),
 		) as ExtensionCommandContext;
+		Object.defineProperties(context, {
+			tools: {
+				get: () => {
+					this.assertActive();
+					return this.getCallableToolsFn();
+				},
+			},
+			executeTool: {
+				value: (name: string, args: unknown, options: ExecuteToolOptions = {}) => {
+					this.assertActive();
+					if (!this.executeCommandToolFn) throw new Error("Command tool calls are not available in this context");
+					return this.executeCommandToolFn(name, args, options);
+				},
+			},
+		});
 		context.getSystemPromptOptions = () => {
 			this.assertActive();
 			return this.getSystemPromptOptionsFn();
@@ -1094,6 +1125,8 @@ export class ExtensionRunner {
 	}
 
 	async emit<TEvent extends RunnerEmitEvent>(event: TEvent): Promise<RunnerEmitResult<TEvent>> {
+		// Streaming emits an event per delta, and most have no handler: skip building the context and the snapshot.
+		if (!this.hasHandlers(event.type)) return undefined as RunnerEmitResult<TEvent>;
 		const ctx = this.createContext();
 		let result: SessionBeforeEventResult | undefined;
 
@@ -1303,6 +1336,15 @@ export class ExtensionRunner {
 	 * handlers then see the full transcript and their output is used as returned.
 	 */
 	async emitContext(messages: AgentMessage[]): Promise<AgentMessage[]> {
+		// The copy is for handlers, which may edit the messages in place. With none, they go on as they are, as they do when there
+		// are no extensions at all (sdk.ts transformContext): a deep copy of the whole conversation before every request costs
+		// milliseconds that grow with it.
+		const hasHandlers = this.extensions.some(
+			(ext) =>
+				(ext.handlers.get("context")?.length ?? 0) > 0 ||
+				(ext.handlers.get("context_with_system")?.length ?? 0) > 0,
+		);
+		if (!hasHandlers) return messages;
 		const ctx = this.createContext();
 		let currentMessages = structuredClone(messages);
 

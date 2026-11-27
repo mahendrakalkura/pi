@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { Image, setImageTranscoder } from "../src/components/image.ts";
 import {
+	allocateImageId,
 	cropKittyImageLine,
 	deleteAllKittyImages,
 	deleteAllKittyPlacements,
@@ -43,6 +44,7 @@ const ENV_KEYS = [
 	"WEZTERM_PANE",
 	"ITERM_SESSION_ID",
 	"WT_SESSION",
+	"ALACRITTY_WINDOW_ID",
 	"CMUX_WORKSPACE_ID",
 	"WARP_SESSION_ID",
 	"WARP_TERMINAL_SESSION_UUID",
@@ -445,6 +447,15 @@ describe("detectCapabilities", () => {
 		});
 	});
 
+	it("enables hyperlinks for Alacritty without TERM_PROGRAM", () => {
+		withEnv({ TERM: "alacritty", COLORTERM: "truecolor" }, () => {
+			assert.deepStrictEqual(detectCapabilities(), { images: null, trueColor: true, hyperlinks: true });
+		});
+		withEnv({ TERM: "xterm-256color", COLORTERM: "truecolor", ALACRITTY_WINDOW_ID: "1" }, () => {
+			assert.deepStrictEqual(detectCapabilities(), { images: null, trueColor: true, hyperlinks: true });
+		});
+	});
+
 	it("enables Alacritty capabilities for Zed", () => {
 		withEnv({ TERM_PROGRAM: "zed" }, () => {
 			assert.deepStrictEqual(detectCapabilities(), { images: null, trueColor: true, hyperlinks: true });
@@ -498,6 +509,16 @@ describe("iTerm2 image encoding", () => {
 	it("includes the decoded payload size in OSC 1337 metadata", () => {
 		const sequence = encodeITerm2("AAAA", { width: 2, height: "auto" });
 		assert.strictEqual(sequence, "\x1b]1337;File=inline=1;size=3;width=2;height=auto:AAAA\x07");
+	});
+});
+
+describe("Kitty image IDs", () => {
+	// #12548: Konsole parses keys as signed 32-bit integers and reads larger IDs as 0.
+	it("allocates IDs that fit a signed 32-bit integer", (t) => {
+		t.mock.method(Math, "random", () => 0.999999999999);
+		assert.strictEqual(allocateImageId(), 0x7fffffff);
+		t.mock.method(Math, "random", () => 0);
+		assert.strictEqual(allocateImageId(), 1);
 	});
 });
 
@@ -955,5 +976,14 @@ describe("hyperlink", () => {
 		const result = hyperlink("README.md", "file:///home/user/README.md");
 		assert.ok(result.includes("file:///home/user/README.md"));
 		assert.ok(result.includes("README.md"));
+	});
+});
+
+describe("Kitty image controls", () => {
+	it("crops nothing, quickly, in a line of many image commands with no controls end", () => {
+		const line = "\x1b_G".repeat(100_000);
+		const started = performance.now();
+		assert.strictEqual(cropKittyImageLine(line, 1, 1), line);
+		assert.ok(performance.now() - started < 1000);
 	});
 });

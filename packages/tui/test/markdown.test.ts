@@ -124,6 +124,21 @@ describe("Markdown component", () => {
 		});
 	});
 
+	describe("Images", () => {
+		it("keeps hard breaks after an inline image as separate rows", () => {
+			setCapabilities({ images: "kitty", trueColor: false, hyperlinks: false });
+			const image = "\x1b_Ga=T,f=100,q=2,c=20,r=3,C=1;AAAA\x1b\\";
+			const markdown = new Markdown(`\`${image}\`  \n\` \`  \n\` \`\n\n- one`, 0, 0, defaultMarkdownTheme);
+			const lines = markdown.render(80);
+			assert.ok(lines.every((line) => !line.includes("\n")));
+			assert.ok(lines[0].includes(image));
+			assert.deepStrictEqual(
+				lines.slice(1).map((line) => stripAnsi(line).trim()),
+				["", "", "", "- one"],
+			);
+		});
+	});
+
 	describe("Lists", () => {
 		it("should render simple nested list", () => {
 			const markdown = new Markdown(
@@ -477,6 +492,23 @@ describe("Markdown component", () => {
 			assert.ok(plainLines.some((line) => line.includes("Right")));
 			// Check content
 			assert.ok(plainLines.some((line) => line.includes("Long text")));
+		});
+
+		it("should right-align and center cells per the alignment row", () => {
+			const markdown = new Markdown(
+				`| Name | Amount | Mid |
+| :--- | ---: | :---: |
+| Alpha | 1 | x |
+| Beta | 12345 | yy |`,
+				0,
+				0,
+				defaultMarkdownTheme,
+			);
+
+			const plainLines = markdown.render(80).map((line) => stripAnsi(line).trimEnd());
+			// Name is left, Amount is right, Mid is centered; each cell is padded to its column width.
+			assert.ok(plainLines.includes("│ Alpha │      1 │  x  │"), JSON.stringify(plainLines));
+			assert.ok(plainLines.includes("│ Beta  │  12345 │ yy  │"), JSON.stringify(plainLines));
 		});
 
 		it("should handle tables with varying column widths", () => {
@@ -959,6 +991,21 @@ A=
 				.render(80)
 				.map((line) => stripAnsi(line).trimEnd());
 			assert.deepStrictEqual(shellLines, [shellVariables]);
+		});
+
+		it("keeps Markdown after an unclosed currency dollar sign", () => {
+			const cases = [
+				["Costs +$50 for **this** option.", ["Costs +$50 for this option."]],
+				["**A:** costs +$50 (once).\n**B:** next.", ["A: costs +$50 (once).", "B: next."]],
+				["**A:** costs $x + y\n**B:** next.", ["A: costs $x + y", "B: next."]],
+			] as const;
+
+			for (const [source, expected] of cases) {
+				const lines = new Markdown(source, 0, 0, defaultMarkdownTheme)
+					.render(80)
+					.map((line) => stripAnsi(line).trimEnd());
+				assert.deepStrictEqual(lines, expected);
+			}
 		});
 
 		it("preserves unsupported and incomplete LaTeX exactly", () => {
@@ -1834,6 +1881,17 @@ bar`,
 			assert.ok(stripAnsi(output).includes("\x1b]8;;\x1b\\.，后面的中文"));
 		});
 
+		it("should not hyperlink a bare URL that runs into a very long line", () => {
+			// A bare URL ends only at whitespace, so it can swallow a long base64 line. Wrapping re-opens
+			// a hyperlink on every line with the full URL, which made the output quadratic in its length.
+			setCapabilities({ images: null, trueColor: false, hyperlinks: true });
+			const url = `https://example.com/path,data:${"x".repeat(20_000)}`;
+			const output = new Markdown(url, 0, 0, defaultMarkdownTheme).render(80).join("");
+			assert.ok(!output.includes("\x1b]8;"));
+			assert.ok(output.length < 3 * url.length);
+			assert.strictEqual(stripAnsi(output).replace(/\s/g, ""), url);
+		});
+
 		it("should not duplicate URL for autolinked emails", () => {
 			// Hyperlinks capability does not affect the mailto: display check.
 			setCapabilities({ images: null, trueColor: false, hyperlinks: false });
@@ -1970,6 +2028,49 @@ bar`,
 				joinedPlain.includes("<div>") && joinedPlain.includes("</div>"),
 				"Should render HTML in code blocks",
 			);
+		});
+	});
+
+	describe("HTML comments", () => {
+		// Regression tests for https://github.com/earendil-works/pi/issues/11710
+		function renderPlain(text: string): string[] {
+			return new Markdown(text, 0, 0, defaultMarkdownTheme).render(60).map((line) => stripAnsi(line).trimEnd());
+		}
+
+		it("hides block and inline comments without extra spacing", () => {
+			assert.deepStrictEqual(
+				renderPlain(
+					"## [1.0.0]\n\n<!-- release-notes:start -->\nFixed a bug.\n\nSee <!-- todo: link --> the docs.",
+				),
+				renderPlain("## [1.0.0]\n\nFixed a bug.\n\nSee the docs."),
+			);
+		});
+
+		it("drops one blank line around comment-only blocks", () => {
+			assert.deepStrictEqual(
+				renderPlain(
+					"<!-- start -->\n\n## [1.0.0]\n\n<!-- a -->\n\n- item\n\n<!-- b -->\n\n## [0.9.0]\n\n<!-- end -->",
+				),
+				renderPlain("## [1.0.0]\n\n- item\n\n## [0.9.0]"),
+			);
+		});
+
+		it("hides multi-line and unclosed comments", () => {
+			assert.deepStrictEqual(renderPlain("<!--\nmulti\nline\n-->\ntext"), renderPlain("text"));
+			assert.deepStrictEqual(renderPlain("text\n\n<!-- streaming"), renderPlain("text"));
+		});
+
+		it("hides comments in blockquotes and list items", () => {
+			assert.deepStrictEqual(
+				renderPlain("> q\n>\n> <!-- c -->\n>\n> r\n\n- a\n\n  <!-- c -->\n\n  b\n- <!-- c --> item"),
+				renderPlain("> q\n>\n> r\n\n- a\n\n  b\n- item"),
+			);
+		});
+
+		it("keeps other HTML and the text after a comment in a block", () => {
+			assert.deepStrictEqual(renderPlain("with <tag> markers"), ["with <tag> markers"]);
+			assert.deepStrictEqual(renderPlain("<!-- c --> trailing text"), ["trailing text"]);
+			assert.deepStrictEqual(renderPlain("<div>\n<!-- c -->a</div>"), ["<div>", "a</div>"]);
 		});
 	});
 

@@ -1,0 +1,1052 @@
+diff -ruN a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -41,6 +41,7 @@
+ import { createSubagentRuntime } from "#src/runtime";
+ import { publishSubagentsService, unpublishSubagentsService } from "#src/service/service";
+ import { SubagentsServiceAdapter } from "#src/service/service-adapter";
++import { childInlineExtensions } from "#src/session/child-inline-extensions";
+ import { detectEnv } from "#src/session/env";
+ import { resolveModel } from "#src/session/model-resolver";
+ import { createExcludedPackagesStorage } from "#src/session/package-exclusions";
+@@ -73,7 +74,7 @@
+   const registry = new AgentTypeRegistry(() => loadCustomAgents(process.cwd()));
+ 
+   // ---- Runtime: all mutable extension state in one place ----
+-  const runtime = createSubagentRuntime();
++  const runtime = createSubagentRuntime(() => pi.getActiveTools(), () => pi.getCallableToolNames());
+ 
+   // ---- Notification system ----
+   // Owns completion nudges and live-activity cleanup. The widget detects finished
+@@ -117,7 +118,13 @@
+     io: {
+       detectEnv,
+       getAgentDir,
+-      createResourceLoader: (opts) => new DefaultResourceLoader(opts),
++      // The parent's inline extensions reach a child only through this list;
++      // the child's loader cannot discover them on disk.
++      createResourceLoader: ({ extensionFactories = [], loadUnselectedMcp, ...opts }) =>
++        new DefaultResourceLoader({
++          ...opts,
++          extensionFactories: [...extensionFactories, ...childInlineExtensions(extensionFactories, loadUnselectedMcp)],
++        }),
+       deriveSessionDir: deriveSubagentSessionDir,
+       createSessionManager: (cwd, dir) => SessionManager.create(cwd, dir),
+       createSettingsManager: (cwd, dir) => SdkSettingsManager.create(cwd, dir),
+diff -ruN a/src/lifecycle/create-subagent-session.ts b/src/lifecycle/create-subagent-session.ts
+--- a/src/lifecycle/create-subagent-session.ts
++++ b/src/lifecycle/create-subagent-session.ts
+@@ -28,6 +28,7 @@
+ import { AskParentTool, type QuestionRecorder } from "#src/session/ask-parent-tool";
+ import { builtinExtensionsFor } from "#src/session/builtin-extensions";
+ import type { EnvInfo } from "#src/session/env";
++import { childToolAllowlist, hasMainSessionTools, RECURSION_GUARD_TOOLS } from "#src/session/main-session-tools";
+ import { expandMcpToolPatterns } from "#src/session/mcp-tool-patterns";
+ import type { ModelRegistry } from "#src/session/model-resolver";
+ import { NotifyParentTool, type UpdateAnnouncer } from "#src/session/notify-parent-tool";
+@@ -47,7 +48,7 @@
+  * child extension registering a tool of its own. Filtering the active set once
+  * after `bindExtensions` would be undone by that rebuild (#725).
+  */
+-const EXCLUDED_TOOL_NAMES = ["subagent", "get_subagent_result", "steer_subagent"];
++const EXCLUDED_TOOL_NAMES = [...RECURSION_GUARD_TOOLS];
+ 
+ // ── IO boundary ───────────────────────────────────────────────────────────────
+ 
+@@ -77,6 +78,7 @@
+   appendSystemPromptOverride?: (base: string[]) => string[];
+   /** Extensions supplied as code; `builtin` entries are Pi's built-ins, resolved as `builtin:<name>`. */
+   extensionFactories?: InlineExtension[];
++  loadUnselectedMcp?: boolean;
+ }
+ 
+ /** Options passed to SessionFactoryIO.createSession. */
+@@ -87,8 +89,12 @@
+   settingsManager: SettingsManager;
+   modelRegistry: ModelRegistry;
+   model?: Model<any>;
+-  /** Allowlist: only these tool names are enabled in the session. */
+-  tools: string[];
++  /**
++   * Allowlist: only these tool names are enabled in the session. Absent, the
++   * session selects its tools the way a main Pi session does.
++   */
++  tools?: string[];
++  initialActiveTools?: string[];
+   /**
+    * Tool definitions supplied directly rather than by an extension. The SDK
+    * filters these through `tools` too, so every name here must also be listed
+@@ -228,6 +234,7 @@
+     {
+       cwd: snapshot.cwd,
+       parentSystemPrompt: snapshot.systemPrompt,
++      parentActiveTools: snapshot.activeToolNames,
+       parentPortablePrompt: snapshot.portablePrompt,
+       parentModel: snapshot.model,
+       modelRegistry: snapshot.modelRegistry,
+@@ -255,6 +262,19 @@
+   const sessionSettings = deps.io.createSettingsManager(cfg.effectiveCwd, agentDir);
+   const loaderSettings = deps.io.createLoaderSettingsManager(sessionSettings);
+ 
++  const childTools = buildChildTools(params);
++  const parentTools = [...(snapshot.activeToolNames ?? []), ...(snapshot.callableToolNames ?? [])];
++  const allowlist = childToolAllowlist(toolNames, parentTools, childTools.map((tool) => tool.name));
++  // Pi implicitly permits MCP tools when the list names none. For * the parent's
++  // actual selection is authoritative, including when it selected no MCP tools.
++  const excludeTools = [...EXCLUDED_TOOL_NAMES];
++  if (hasMainSessionTools(toolNames) && !allowlist.some((name) => name.startsWith("mcp__"))) {
++    excludeTools.push("mcp__*");
++    for (const name of ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]) {
++      if (!allowlist.includes(name)) excludeTools.push(name);
++    }
++  }
++
+   // Children inherit the parent's skills and every extension the composition
+   // root did not exclude (#696), plus the Pi built-ins their tools call for —
+   // Pi supplies those to its own CLI session only.
+@@ -273,7 +293,8 @@
+     noContextFiles: true,
+     systemPromptOverride: () => cfg.systemPrompt,
+     appendSystemPromptOverride: () => [],
+-    extensionFactories: builtinExtensionsFor(toolNames),
++    extensionFactories: builtinExtensionsFor(allowlist),
++    loadUnselectedMcp: hasMainSessionTools(toolNames),
+   });
+   await loader.reload();
+ 
+@@ -285,7 +306,6 @@
+   sessionManager.newSession({ parentSession: params.parentSession?.parentSessionId });
+   const sessionId = sessionManager.getSessionId();
+ 
+-  const childTools = buildChildTools(params);
+   const { session } = await deps.io.createSession({
+     cwd: cfg.effectiveCwd,
+     agentDir,
+@@ -293,9 +313,12 @@
+     settingsManager: sessionSettings,
+     modelRegistry: snapshot.modelRegistry,
+     model: cfg.model,
+-    tools: [...toolNames, ...childTools.map((tool) => tool.name)],
++    tools: allowlist,
++    initialActiveTools: hasMainSessionTools(toolNames)
++      ? childToolAllowlist(toolNames, snapshot.activeToolNames ?? [], childTools.map((tool) => tool.name))
++      : undefined,
+     customTools: childTools,
+-    excludeTools: EXCLUDED_TOOL_NAMES,
++    excludeTools,
+     resourceLoader: loader,
+     thinkingLevel: cfg.thinkingLevel,
+   });
+diff -ruN a/src/lifecycle/parent-snapshot.ts b/src/lifecycle/parent-snapshot.ts
+--- a/src/lifecycle/parent-snapshot.ts
++++ b/src/lifecycle/parent-snapshot.ts
+@@ -38,6 +38,10 @@
+   cwd: string;
+   /** Parent's effective system prompt (for append-mode agents). */
+   systemPrompt: string;
++  /** Effective tool selection at the time the parent requested the child. */
++  activeToolNames?: readonly string[];
++  /** Callable tools, including codemode and deferred tools not declared to the model. */
++  callableToolNames?: readonly string[];
+   /** Parent's current model instance (fallback when agent config has no model). */
+   model: Model<any> | undefined;
+   /** Model registry for resolving config.model strings and creating sessions. */
+diff -ruN a/src/runtime.ts b/src/runtime.ts
+--- a/src/runtime.ts
++++ b/src/runtime.ts
+@@ -42,6 +42,11 @@
+    */
+   private lastPromptOptions: ParentPromptOptions | undefined = undefined;
+ 
++  constructor(
++    private readonly listActiveTools: () => readonly string[] = () => [],
++    private readonly listCallableTools: () => readonly string[] = () => [],
++  ) {}
++
+   // ── Session-context methods ──────────────────────────────────────────────
+ 
+   /** Store the active Pi session context (called from session_start). */
+@@ -71,7 +76,11 @@
+    */
+   buildSnapshot(inheritContext: boolean): ParentSnapshot {
+ 
+-    return buildParentSnapshot(this.currentCtx!, inheritContext, this.lastPromptOptions);
++    return {
++      ...buildParentSnapshot(this.currentCtx!, inheritContext, this.lastPromptOptions),
++      activeToolNames: [...this.listActiveTools()],
++      callableToolNames: [...this.listCallableTools()],
++    };
+   }
+ 
+   /** Extract model info from the current session context. */
+@@ -96,6 +105,9 @@
+  *
+  * Call once at extension startup; pass the result to factories and handlers.
+  */
+-export function createSubagentRuntime(): SubagentRuntime {
+-  return new SubagentRuntime();
++export function createSubagentRuntime(
++  listActiveTools?: () => readonly string[],
++  listCallableTools?: () => readonly string[],
++): SubagentRuntime {
++  return new SubagentRuntime(listActiveTools, listCallableTools);
+ }
+diff -ruN a/src/session/child-inline-extensions.ts b/src/session/child-inline-extensions.ts
+--- a/src/session/child-inline-extensions.ts
++++ b/src/session/child-inline-extensions.ts
+@@ -0,0 +1,42 @@
++/**
++ * child-inline-extensions.ts - Hand a child every inline extension its parent loaded.
++ *
++ * Pi loads extensions compiled into its binary as inline factories, which a
++ * child's own `DefaultResourceLoader` never discovers on disk. The Pi fork's
++ * `main()` publishes those factories under `Symbol.for("pi:inline-extensions")`,
++ * and a child loads all of them, so it runs the same extensions as its parent.
++ *
++ * Narrow children load the MCP built-in only if their tool list needs it.
++ * pi-subagents itself is excluded: its copy in a child would replace
++ * and then delete the parent's service on `globalThis`. The recursion guard
++ * keeps a child from spawning agents either way.
++ */
++
++import type { InlineExtension } from "@earendil-works/pi-coding-agent";
++
++/** Global key the Pi fork's `main()` publishes its inline extensions under. */
++const INLINE_EXTENSIONS_KEY = Symbol.for("pi:inline-extensions");
++
++/** The name this package carries among the published inline extensions. */
++export const SUBAGENTS_EXTENSION = "@gotgenes/pi-subagents";
++
++/**
++ * Every published inline extension except pi-subagents. A name `loaded`
++ * already holds is skipped, so a Pi built-in the core selected for the child's
++ * tools never loads twice.
++ */
++export function childInlineExtensions(loaded: readonly InlineExtension[] = [], loadUnselectedMcp = false): InlineExtension[] {
++  // A Pi build that publishes nothing leaves the child as it was.
++  const published = (globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY];
++  if (!Array.isArray(published)) return [];
++
++  // Only named extensions can be handed over; a bare factory has no name to check.
++  const skipped = new Set([SUBAGENTS_EXTENSION]);
++  for (const input of loaded) {
++    if (typeof input !== "function") skipped.add(input.name);
++  }
++  return (published as InlineExtension[]).filter(
++    (input) => typeof input !== "function" && !skipped.has(input.name) &&
++      (loadUnselectedMcp || input.name !== "mcp" || input.builtin !== true),
++  );
++}
+diff -ruN a/src/session/main-session-tools.ts b/src/session/main-session-tools.ts
+--- a/src/session/main-session-tools.ts
++++ b/src/session/main-session-tools.ts
+@@ -0,0 +1,19 @@
++/** The `tools:` entry that copies the parent's active selection at spawn. */
++export const MAIN_SESSION_TOOLS = "*";
++
++/** A child cannot use these tools to spawn or control another child. */
++export const RECURSION_GUARD_TOOLS: readonly string[] = ["subagent", "get_subagent_result", "steer_subagent"];
++
++export function hasMainSessionTools(toolNames: readonly string[]): boolean {
++  return toolNames.includes(MAIN_SESSION_TOOLS);
++}
++
++/** Copy the effective parent loadout for `*`; keep all other allowlists as configured. */
++export function childToolAllowlist(
++  toolNames: readonly string[],
++  parentTools: readonly string[],
++  protocolTools: readonly string[],
++): string[] {
++  if (!hasMainSessionTools(toolNames)) return [...toolNames, ...protocolTools];
++  return [...new Set([...parentTools.filter((name) => !RECURSION_GUARD_TOOLS.includes(name)), ...protocolTools])];
++}
+diff -ruN a/src/session/prompts.ts b/src/session/prompts.ts
+--- a/src/session/prompts.ts
++++ b/src/session/prompts.ts
+@@ -3,6 +3,7 @@
+  */
+ 
+ import type { EnvInfo } from "#src/session/env";
++import { RECURSION_GUARD_TOOLS } from "#src/session/main-session-tools";
+ import type { ProjectContextLoader } from "#src/session/project-context";
+ import type { AgentPromptConfig, PromptInheritance } from "#src/types";
+ 
+@@ -24,6 +25,12 @@
+    * such parts.
+    */
+   portablePrompt?: string;
++  /**
++   * Keep the parent's `<tools>` and `<rules>` sections, for a child that
++   * holds the main session's own tool selection (`tools: *`). Absent strips
++   * them, as for every child with a narrower tool list.
++   */
++  toolSurface?: readonly string[];
+ }
+ 
+ /**
+@@ -134,6 +141,7 @@
+       inherited.systemPrompt,
+       inherited.cwd,
+       cwd !== inherited.cwd,
++      inherited.toolSurface,
+     );
+   }
+   // eslint-disable-next-line @typescript-eslint/prefer-nullish-coalescing -- || intentional: a whitespace-only capture must fall back too, which ?? would not do
+@@ -231,6 +239,8 @@
+  * They are as session-resolved as the catalogue, so they are excised rather
+  * than inherited (ADR 0011); the shared prefix then ends at the preamble for a
+  * parent that renders them, and is unchanged for one that does not.
++ * `toolSurface` keeps both for a child that holds the parent's own tool
++ * selection, minus the recursion-guard tools it never holds.
+  *
+  * A prompt carrying no such layer is returned unchanged.
+  *
+@@ -243,16 +253,38 @@
+   prompt: string,
+   parentCwd: string,
+   cutProjectContext: boolean,
++  toolSurface?: readonly string[],
+ ): string {
+   const lines = prompt.split("\n");
+   const tail = sessionResolvedTailStart(lines, parentCwd, cutProjectContext);
+-  if (tail.at === -1) return prompt;
+-  const head = lines.slice(0, tail.at);
+-  const kept = tail.shape === "section" ? withoutToolSurface(head) : head;
++  const head = tail.at === -1 ? lines : lines.slice(0, tail.at);
++  const kept = toolSurface === undefined
++    ? withoutToolSurface(head)
++    : withActiveToolSurface(head, toolSurface);
++  if (kept === lines) return prompt;
+   return kept.join("\n").trimEnd();
+ }
+ 
+ /**
++ * The head with Pi's `<tools>` lines limited to the parent's active selection
++ * minus the recursion guard. The prompt may predate a change in that selection.
++ *
++ * Located the same way `withoutToolSurface` locates the section: above every
++ * later section Pi renders, so a `<tools>` block quoted below is left alone.
++ */
++function withActiveToolSurface(head: readonly string[], toolSurface: readonly string[]): readonly string[] {
++  const span = toolSurfaceSpan(head);
++  if (!span) return head;
++  const allowed = new Set(toolSurface);
++  for (const name of RECURSION_GUARD_TOOLS) allowed.delete(name);
++  return head.filter((line, at) => {
++    if (at <= span.toolsAt || at >= span.toolsCloseAt) return true;
++    const name = /^- ([^:]+): /.exec(line)?.[1];
++    return name === undefined || allowed.has(name);
++  });
++}
++
++/**
+  * The head with Pi's `<tools>` and `<rules>` sections excised, or the
+  * head unchanged when Pi wrote neither there.
+  *
+@@ -268,19 +300,26 @@
+  * without them.
+  */
+ function withoutToolSurface(head: readonly string[]): readonly string[] {
++  const span = toolSurfaceSpan(head);
++  if (!span) return head;
++  const { toolsAt, rulesCloseAt } = span;
++  const spanEnd = head[rulesCloseAt + 1] === "" ? rulesCloseAt + 2 : rulesCloseAt + 1;
++  return [...head.slice(0, toolsAt), ...head.slice(spanEnd)];
++}
++
++function toolSurfaceSpan(head: readonly string[]) {
+   const bound = laterSectionStart(head);
+   const toolsAt = head.indexOf(TOOLS_SECTION_OPEN);
+-  if (toolsAt === -1 || toolsAt >= bound) return head;
++  if (toolsAt === -1 || toolsAt >= bound) return undefined;
+   const toolsCloseAt = head.indexOf(TOOLS_SECTION_CLOSE, toolsAt);
+-  if (toolsCloseAt === -1 || toolsCloseAt >= bound) return head;
++  if (toolsCloseAt === -1 || toolsCloseAt >= bound) return undefined;
+   const rulesAt = toolsCloseAt + 2;
+   if (head[toolsCloseAt + 1] !== "" || head[rulesAt] !== RULES_SECTION_OPEN) {
+-    return head;
++    return undefined;
+   }
+   const rulesCloseAt = head.indexOf(RULES_SECTION_CLOSE, rulesAt);
+-  if (rulesCloseAt === -1 || rulesCloseAt >= bound) return head;
+-  const spanEnd = head[rulesCloseAt + 1] === "" ? rulesCloseAt + 2 : rulesCloseAt + 1;
+-  return [...head.slice(0, toolsAt), ...head.slice(spanEnd)];
++  if (rulesCloseAt === -1 || rulesCloseAt >= bound) return undefined;
++  return { toolsAt, toolsCloseAt, rulesCloseAt };
+ }
+ 
+ /**
+diff -ruN a/src/session/session-config.ts b/src/session/session-config.ts
+--- a/src/session/session-config.ts
++++ b/src/session/session-config.ts
+@@ -13,6 +13,7 @@
+ import type { Model } from "@earendil-works/pi-ai";
+ import type { AgentConfigLookup } from "#src/config/agent-types";
+ import type { EnvInfo } from "#src/session/env";
++import { hasMainSessionTools } from "#src/session/main-session-tools";
+ import type { ModelRegistry } from "#src/session/model-resolver";
+ import type { ProjectContextLoader } from "#src/session/project-context";
+ import type { InheritedPrompt } from "#src/session/prompts";
+@@ -62,6 +63,7 @@
+   cwd: string;
+   /** Parent's effective system prompt (for append-mode agents). */
+   parentSystemPrompt: string;
++  parentActiveTools?: readonly string[];
+   /** Parent's operator-authored parts, for a child on a re-homing provider. */
+   parentPortablePrompt?: string;
+   /**
+@@ -195,6 +197,7 @@
+       cwd: ctx.cwd,
+       strategy: ctx.resolvePromptInheritance?.(model?.provider) ?? "full",
+       portablePrompt: ctx.parentPortablePrompt,
++      toolSurface: hasMainSessionTools(toolNames) ? (ctx.parentActiveTools ?? []) : undefined,
+     },
+     io.loadProjectContext,
+   );
+diff -ruN a/src/tools/agent-tool.ts b/src/tools/agent-tool.ts
+--- a/src/tools/agent-tool.ts
++++ b/src/tools/agent-tool.ts
+@@ -77,7 +77,7 @@
+ 		params: Record<string, unknown>,
+ 		signal: AbortSignal | undefined,
+ 		onUpdate: ((update: AgentToolResult<AgentDetails>) => void) | undefined,
+-		_ctx: ExtensionContext,
++		ctx: ExtensionContext,
+ 	) {
+ 		// Reload custom agents so new .pi/agents/*.md files are picked up without restart
+ 		this.registry.reload();
+@@ -91,6 +91,12 @@
+ 		);
+ 		if ("error" in config) return textResult(config.error);
+ 
++		// Only TUI resumes can run in the background; launches honor the agent's resolved settings.
++		const isTui = ctx.mode === "tui";
++		const runInBackground = params.resume
++			? isTui && params.run_in_background === true
++			: config.execution.runInBackground;
++
+ 		// ---- Boundary extraction (after config so inheritContext is resolved) ----
+ 		const snapshot = this.runtime.buildSnapshot(config.execution.inheritContext);
+ 		const { parentSessionFile, parentSessionId } = this.runtime.getSessionInfo();
+@@ -100,16 +106,16 @@
+ 		if (params.resume) {
+ 			const id = params.resume as string;
+ 			const prompt = params.prompt as string;
+-			// Only the caller's explicit flag: an agent file's run_in_background
++			// Only the caller's explicit flag in the TUI: an agent file's run_in_background
+ 			// default describes how that type spawns, not how a resume is collected.
+-			if (params.run_in_background === true) {
++			if (runInBackground) {
+ 				return this.resumeInBackground(id, prompt, config);
+ 			}
+ 			return this.resumeExisting(id, prompt, signal, onUpdate, config.presentation.detailBase);
+ 		}
+ 
+ 		// ---- Background execution ----
+-		if (config.execution.runInBackground) {
++		if (runInBackground) {
+ 			return spawnBackground(
+ 				this.manager,
+ 				{ config, snapshot, parentSession, settings: this.settings },
+@@ -259,7 +265,7 @@
+ 				resume: Type.Optional(
+ 					Type.String({
+ 						description:
+-							"Optional agent ID to resume from. Continues from previous context. Combine with run_in_background: true to resume without waiting.",
++							"Optional agent ID to resume from. Continues from previous context. In TUI mode, set run_in_background: true to return the ID at once and receive a completion notification. In print, JSON, and RPC modes, the call waits for the resumed result regardless of the flag.",
+ 					}),
+ 				),
+ 				inherit_context: Type.Optional(
+diff -ruN a/test/background-resume.test.ts b/test/background-resume.test.ts
+--- a/test/background-resume.test.ts
++++ b/test/background-resume.test.ts
+@@ -0,0 +1,225 @@
++// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
++
++import { describe, expect, it } from "bun:test";
++import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
++import { AgentTypeRegistry } from "#src/config/agent-types";
++import { ConcurrencyLimiter } from "#src/lifecycle/concurrency-limiter";
++import { SubagentManager } from "#src/lifecycle/subagent-manager";
++import { NotificationManager } from "#src/observation/notification";
++import { SubagentEventsObserver } from "#src/observation/subagent-events-observer";
++import { AgentTool } from "#src/tools/agent-tool";
++import { GetResultTool } from "#src/tools/get-result-tool";
++import type { AgentConfig } from "#src/types";
++
++const AGENT_TYPE = "general-purpose";
++const NOTIFICATION = "subagent-notification";
++
++// Sent is one message the notification layer handed to pi.sendMessage.
++interface Sent {
++  message: { content: string; customType: string };
++  options?: { triggerTurn?: boolean };
++}
++
++// harness wires a real manager, notification layer, Agent tool and get_subagent_result tool around a fake
++// child session per agent whose first run answers "one" at once and whose resumed runs answer only when release() is called.
++function harness(config?: Pick<AgentConfig, "locked" | "runInBackground">) {
++  const sent: Sent[] = [];
++  const resumes: Array<(text: string) => void> = [];
++  const turnBudget = { phase: "within" as const, used: 1 };
++  // newSession builds one agent's session: its first run answers at once, and every later run is a
++  // resume that waits for release().
++  const newSession = () => {
++    let runs = 0;
++    return {
++      getContextPercent: () => null,
++      getSessionStats: () => ({}),
++      outputFile: undefined,
++      runTurnLoop: () => {
++        runs += 1;
++        if (runs === 1) return Promise.resolve({ responseText: "one", turnBudget });
++        return new Promise((resolve) => resumes.push((responseText: string) => resolve({ responseText, turnBudget })));
++      },
++      subscribe: () => () => {},
++    };
++  };
++  const registry = new AgentTypeRegistry(() => config ? new Map([[AGENT_TYPE, {
++    name: AGENT_TYPE,
++    displayName: "General Purpose",
++    description: "Test agent",
++    systemPrompt: "",
++    promptMode: "append",
++    ...config,
++  }]]) : new Map());
++  const notifications = new NotificationManager((message, options) => sent.push({ message, options }));
++  const manager = new SubagentManager({
++    baseCwd: "/tmp",
++    createSubagentSession: async () => newSession() as never,
++    limiter: new ConcurrencyLimiter(() => 4),
++    observer: new SubagentEventsObserver({ appendEntry: () => {}, emit: () => {}, notifications }),
++    registry,
++  });
++  const runtime = {
++    buildSnapshot: () => ({}) as never,
++    getModelInfo: () => ({ modelRegistry: undefined, parentModel: undefined }),
++    getSessionInfo: () => ({ parentSessionFile: "", parentSessionId: "parent" }),
++  };
++  const agentTool = new AgentTool(manager, runtime, { defaultMaxTurns: undefined, maxConcurrent: 4 }, registry, "/tmp");
++  const getResult = new GetResultTool(manager, registry);
++
++  // call runs the subagent tool and returns its text and details.
++  async function call(params: Record<string, unknown>, mode: ExtensionContext["mode"] = "print") {
++    const ctx = { mode, hasUI: mode === "tui" || mode === "rpc" } as ExtensionContext;
++    const result = await agentTool.toToolDefinition().execute("call", { description: "count", prompt: "say one", subagent_type: AGENT_TYPE, ...params }, undefined, undefined, ctx);
++    const first = result.content[0];
++    return { details: result.details as { agentId?: string; status?: string } | undefined, text: first?.type === "text" ? first.text : "" };
++  }
++
++  // release answers the oldest pending resumed run.
++  function release(text: string): void {
++    resumes.shift()?.(text);
++  }
++
++  return { call, getResult, manager, notifications: () => sent.filter(({ message }) => message.customType === NOTIFICATION), release, resumes };
++}
++
++// settle lets every pending promise callback run.
++async function settle(): Promise<void> {
++  for (let round = 0; round < 5; round += 1) await new Promise((resolve) => setTimeout(resolve, 0));
++}
++
++describe("launch routing after agent config resolution", () => {
++  it.each<Pick<AgentConfig, "locked" | "runInBackground">>([
++    { locked: ["run_in_background"], runInBackground: false },
++    { locked: ["run_in_background"] },
++    { locked: true, runInBackground: false },
++  ])("runs an effective foreground launch in the foreground in every mode (%j)", async (config) => {
++    const { call } = harness(config);
++    for (const mode of ["tui", "print", "json", "rpc"] as const) {
++      const result = await call({ run_in_background: true }, mode);
++      expect(result.details?.status).toBe("completed");
++      expect(result.text).toContain("parameter was ignored");
++    }
++  });
++
++  it.each<Pick<AgentConfig, "locked" | "runInBackground">>([
++    { runInBackground: false },
++    { locked: ["run_in_background"], runInBackground: true },
++  ])("routes an effective background launch through the background runner in TUI (%j)", async (config) => {
++    const { call, getResult, manager } = harness(config);
++    const result = await call({ run_in_background: true }, "tui");
++    expect(result.details?.status).toBe("background");
++    const id = result.details?.agentId ?? "";
++    await getResult.execute("call", { agent_id: id, wait: true }, new AbortController().signal, undefined, undefined);
++    expect(manager.getRecord(id)?.result).toBe("one");
++  });
++});
++
++describe("TUI resume", () => {
++  it("waits for a resume without run_in_background in the foreground", async () => {
++    const { call, getResult, manager, release, resumes } = harness();
++    const spawned = await call({ prompt: "say one", run_in_background: true });
++    const id = spawned.details?.agentId ?? "";
++    await getResult.execute("call", { agent_id: id, wait: true }, new AbortController().signal, undefined, undefined);
++    expect(manager.getRecord(id)?.result).toBe("one");
++
++    let returned = false;
++    const pending = call({ prompt: "say two", resume: id }, "tui").then((result) => {
++      returned = true;
++      return result;
++    });
++    await settle();
++    expect(resumes).toHaveLength(1);
++    expect(returned).toBe(false);
++
++    release("two");
++    const resumed = await pending;
++    expect(resumed.details).toMatchObject({ agentId: id, status: "completed" });
++    expect(resumed.text).toContain("two");
++  });
++
++  it("returns at once with the agent ID and announces the resumed run when it ends", async () => {
++    const { call, getResult, manager, notifications, release } = harness();
++    const spawned = await call({ prompt: "say one", run_in_background: true });
++    const id = spawned.details?.agentId ?? "";
++    await getResult.execute("call", { agent_id: id, wait: true }, new AbortController().signal, undefined, undefined);
++    expect(manager.getRecord(id)?.result).toBe("one");
++    const before = notifications().length;
++
++    const resumed = await call({ prompt: "say two", resume: id, run_in_background: true }, "tui");
++    expect(resumed.text).toContain("Agent resumed in background.");
++    expect(resumed.text).toContain(`Agent ID: ${id}`);
++    expect(resumed.text).toContain("You will be notified when this agent completes.");
++    expect(resumed.details).toMatchObject({ agentId: id, status: "background" });
++    expect(manager.getRecord(id)?.status).toBe("running");
++    expect(notifications()).toHaveLength(before);
++
++    release("two");
++    await settle();
++    expect(manager.getRecord(id)?.result).toBe("two");
++    const nudges = notifications().slice(before);
++    expect(nudges).toHaveLength(1);
++    expect(nudges[0].message.content).toContain("two");
++    expect(nudges[0].options?.triggerTurn).toBe(true);
++  });
++
++  it("announces a resumed run of an agent that first ran in the foreground", async () => {
++    const { call, manager, notifications, release } = harness();
++    await call({ prompt: "say one" });
++    const id = manager.listAgents()[0]?.id ?? "";
++    expect(manager.getRecord(id)?.claimed).toBe(true);
++
++    const resumed = await call({ prompt: "say two", resume: id, run_in_background: true }, "tui");
++    expect(resumed.text).toContain("Agent resumed in background.");
++    release("two");
++    await settle();
++    expect(notifications().map(({ message }) => message.content).join("\n")).toContain("two");
++  });
++
++  it("refuses a background resume of an agent that is still running", async () => {
++    const { call, release } = harness();
++    const spawned = await call({ prompt: "say one", run_in_background: true });
++    const id = spawned.details?.agentId ?? "";
++    await settle();
++    await call({ prompt: "say two", resume: id, run_in_background: true }, "tui");
++
++    const refused = await call({ prompt: "say three", resume: id, run_in_background: true }, "tui");
++    expect(refused.text).toContain("is still running");
++    release("two");
++    await settle();
++  });
++});
++
++describe.each(["json", "print", "rpc"] as const)("resume in %s mode", (mode) => {
++  it.each([
++    ["omitted", {}],
++    ["false", { run_in_background: false }],
++    ["true", { run_in_background: true }],
++  ] as const)("waits and returns the result without a notification (run_in_background: %s)", async (_label, flags) => {
++    const { call, manager, notifications, release, resumes } = harness();
++    const spawned = await call({ prompt: "say one", run_in_background: true }, mode);
++    expect(spawned.details?.status).toBe("background");
++    const id = spawned.details?.agentId ?? "";
++    await manager.waitForAll();
++    const before = notifications().length;
++
++    let returned = false;
++    const pending = call({ prompt: "say two", resume: id, ...flags }, mode).then((result) => {
++      returned = true;
++      return result;
++    });
++    await settle();
++    const started = resumes.length;
++    const returnedBeforeRelease = returned;
++
++    release("two");
++    const resumed = await pending;
++    expect(started).toBe(1);
++    expect(returnedBeforeRelease).toBe(false);
++    expect(resumed.details).toMatchObject({ agentId: id, status: "completed" });
++    expect(resumed.text).toContain(`Agent ID: ${id}`);
++    expect(resumed.text).toContain("two");
++    await settle();
++    expect(notifications()).toHaveLength(before);
++  });
++});
+diff -ruN a/test/child-inline-extensions.test.ts b/test/child-inline-extensions.test.ts
+--- a/test/child-inline-extensions.test.ts
++++ b/test/child-inline-extensions.test.ts
+@@ -0,0 +1,84 @@
++// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
++
++import { afterEach, describe, expect, it } from "bun:test";
++import type { ExtensionAPI, InlineExtension } from "@earendil-works/pi-coding-agent";
++import { childInlineExtensions, SUBAGENTS_EXTENSION } from "#src/session/child-inline-extensions";
++
++const INLINE_EXTENSIONS_KEY = Symbol.for("pi:inline-extensions");
++
++// factory stands in for an extension factory; the filter never calls it.
++const factory = () => {};
++
++// names lists the names of the given inline extensions, "" for a bare factory.
++function names(inputs: readonly InlineExtension[]): string[] {
++  return inputs.map((input) => (typeof input === "function" ? "" : input.name));
++}
++
++// publish sets what the Pi fork's main() would publish.
++function publish(value: unknown): void {
++  (globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY] = value;
++}
++
++describe("childInlineExtensions", () => {
++  afterEach(() => {
++    delete (globalThis as Record<symbol, unknown>)[INLINE_EXTENSIONS_KEY];
++  });
++
++  it("gives a child every published extension except pi-subagents", () => {
++    publish([
++      { factory, name: "llama.cpp", builtin: true },
++      { factory, name: "codemode", builtin: true },
++      { factory, name: SUBAGENTS_EXTENSION },
++      { factory, name: "pi-lsp-adapter" },
++      { factory, name: "browser" },
++      { factory, name: "status" },
++    ]);
++    expect(names(childInlineExtensions())).toEqual(["llama.cpp", "codemode", "pi-lsp-adapter", "browser", "status"]);
++  });
++
++  it("skips a name the core already loads for the child's tools", () => {
++    publish([
++      { factory, name: "browser" },
++      { factory, name: "codemode", builtin: true },
++    ]);
++    const loaded = [{ factory, name: "codemode", builtin: true }];
++    expect(names(childInlineExtensions(loaded))).toEqual(["browser"]);
++  });
++
++  it("skips a bare factory, which has no name to check", () => {
++    publish([factory, { factory, name: "browser" }]);
++    expect(names(childInlineExtensions())).toEqual(["browser"]);
++  });
++
++  it("does not start the fake MCP connector for a narrow child without MCP tools", () => {
++    let connects = 0;
++    const connect = () => { connects++; };
++    const mcp = { name: "mcp", builtin: true, factory: (pi: ExtensionAPI) => pi.on("session_start", connect) };
++    const ordinary = { name: "ordinary", factory };
++    const events: Array<() => void> = [];
++    const api = { on: (_name: string, fn: () => void) => events.push(fn) } as unknown as ExtensionAPI;
++    const start = (selected: readonly InlineExtension[]) => {
++      for (const entry of selected) if (typeof entry !== "function") entry.factory(api);
++      for (const event of events.splice(0)) event();
++    };
++    publish([mcp, ordinary]);
++
++    const readOnly = childInlineExtensions();
++    expect(names(readOnly)).toEqual(["ordinary"]);
++    start(readOnly);
++    expect(connects).toBe(0);
++
++    start([mcp, ...childInlineExtensions([mcp])]);
++    expect(connects).toBe(1);
++
++    start(childInlineExtensions([], true));
++    expect(connects).toBe(2);
++  });
++
++  it("gives nothing when Pi published nothing", () => {
++    expect(childInlineExtensions()).toEqual([]);
++    publish("not a list");
++    expect(childInlineExtensions()).toEqual([]);
++  });
++});
+diff -ruN a/test/main-session-tools.test.ts b/test/main-session-tools.test.ts
+--- a/test/main-session-tools.test.ts
++++ b/test/main-session-tools.test.ts
+@@ -0,0 +1,209 @@
++// Tests for the Pi fork's pi-subagents patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
++
++import { describe, expect, it } from "bun:test";
++import type { AgentSession, SettingsManager } from "@earendil-works/pi-coding-agent";
++import type { AgentConfigLookup } from "#src/config/agent-types";
++import {
++  type CreateSessionOptions,
++  createSubagentSession,
++  type SubagentSessionDeps,
++} from "#src/lifecycle/create-subagent-session";
++import type { ParentSnapshot } from "#src/lifecycle/parent-snapshot";
++import { childToolAllowlist, MAIN_SESSION_TOOLS } from "#src/session/main-session-tools";
++import { buildAgentPrompt } from "#src/session/prompts";
++import { assembleSessionConfig } from "#src/session/session-config";
++
++const PROTOCOL_TOOLS = ["ask_parent", "notify_parent"];
++const RECURSION_GUARD = ["subagent", "get_subagent_result", "steer_subagent"];
++
++const ENV = { branch: "", isGitRepo: false, platform: "linux" };
++const PARENT_CWD = "/work";
++
++// PARENT_PROMPT is a main session's prompt as Pi renders it, with the subagent tools listed.
++const PARENT_PROMPT = [
++  "You are a coding assistant running inside pi.",
++  "",
++  "<tools>",
++  "- read: Read file contents",
++  "- subagent: Launch a specialized agent.",
++  "- get_subagent_result: Check a background agent.",
++  "- steer_subagent: Redirect a running agent.",
++  "- browser_click: Clicks on the provided element",
++  "- edit: Stale prompt entry the parent deactivated",
++  "",
++  "Additional tools may be available.",
++  "</tools>",
++  "",
++  "<rules>",
++  "- Use ast_grep for syntax-aware code searches",
++  "- Be concise in your responses",
++  "</rules>",
++  "",
++  "<project_context>",
++  "Project-specific instructions and guidelines:",
++  "Follow AGENTS.md.",
++  "</project_context>",
++  "",
++  "<skills>",
++  "The following skills provide specialized instructions for specific tasks.",
++  "<available_skills>",
++  "</available_skills>",
++  "</skills>",
++  "",
++  "<cwd>",
++  PARENT_CWD,
++  "</cwd>",
++].join("\n");
++
++// childPrompt assembles the prompt of an append-mode child with the given tools: list.
++function childPrompt(toolNames: string[], parentPrompt = PARENT_PROMPT): string {
++  const registry: AgentConfigLookup = {
++    getToolNamesForType: () => toolNames,
++    resolveAgentConfig: (type) => ({ description: type, name: type, promptMode: "append", systemPrompt: "", toolNames }),
++  };
++  return assembleSessionConfig(
++    "general-purpose",
++    { cwd: PARENT_CWD, modelRegistry: { find: () => undefined } as never, parentSystemPrompt: parentPrompt, parentActiveTools: ["read", "browser_click", ...RECURSION_GUARD] },
++    {},
++    ENV,
++    registry,
++    { buildAgentPrompt, loadProjectContext: () => undefined },
++  ).systemPrompt;
++}
++
++describe("child prompt tool surface", () => {
++  it("keeps the parent's <tools> and <rules> for an agent that lists *, without the guarded tools", () => {
++    const prompt = childPrompt([MAIN_SESSION_TOOLS]);
++    expect(prompt).toContain("<tools>\n- read: Read file contents\n- browser_click: Clicks on the provided element\n");
++    expect(prompt).toContain("<rules>\n- Use ast_grep for syntax-aware code searches\n- Be concise in your responses\n</rules>");
++    expect(prompt).toContain("<project_context>");
++    expect(prompt).not.toContain("- edit:");
++    for (const name of RECURSION_GUARD) expect(prompt).not.toContain(`- ${name}: `);
++    expect(prompt).not.toContain("<skills>");
++    expect(prompt).not.toContain("<cwd>");
++  });
++
++  it("strips <tools> and <rules> for an agent that names its tools", () => {
++    const prompt = childPrompt(["read"]);
++    expect(prompt).not.toContain("<tools>");
++    expect(prompt).not.toContain("<rules>");
++    expect(prompt).toContain("<project_context>");
++  });
++});
++
++describe("missing <cwd> anchor", () => {
++  const prompt = PARENT_PROMPT.split("\n<skills>")[0]!;
++  it("filters stale and recursion tools without cutting project context", () => {
++    const inherited = childPrompt([MAIN_SESSION_TOOLS], prompt);
++    expect(inherited).toContain("<tools>\n- read:");
++    expect(inherited).toContain("<rules>");
++    expect(inherited).not.toContain("- subagent:");
++    expect(inherited).not.toContain("- edit:");
++    expect(inherited).toContain("Follow AGENTS.md.");
++  });
++  it("still strips the tool list and rules for narrow agents", () => {
++    const inherited = childPrompt(["read"], prompt);
++    expect(inherited).not.toContain("<tools>");
++    expect(inherited).not.toContain("<rules>");
++    expect(inherited).toContain("Follow AGENTS.md.");
++  });
++});
++
++describe("childToolAllowlist", () => {
++  it("uses the parent's selected tools and excludes the recursion guard for *", () => {
++    expect(childToolAllowlist([MAIN_SESSION_TOOLS], ["read", "codemode", ...RECURSION_GUARD], PROTOCOL_TOOLS))
++      .toEqual(["read", "codemode", ...PROTOCOL_TOOLS]);
++    expect(childToolAllowlist([MAIN_SESSION_TOOLS], [], PROTOCOL_TOOLS)).toEqual(PROTOCOL_TOOLS);
++  });
++
++  it("appends protocol tools to a narrower list without intersecting it with the parent", () => {
++    expect(childToolAllowlist(["read", "browser_*"], ["edit"], PROTOCOL_TOOLS)).toEqual([
++      "read", "browser_*", ...PROTOCOL_TOOLS,
++    ]);
++  });
++});
++
++describe("createSubagentSession tool selection", () => {
++  // spawn creates a child of an agent with the given tools: list and returns what reached createSession.
++  async function spawn(toolNames: string[], activeToolNames: string[] = ["read", "codemode", ...RECURSION_GUARD], callableToolNames: string[] = []): Promise<CreateSessionOptions> {
++    let captured: CreateSessionOptions | undefined;
++    const session = {
++      bindExtensions: async () => {},
++      messages: [],
++      subscribe: () => () => {},
++    } as unknown as AgentSession;
++    const registry: AgentConfigLookup = {
++      getToolNamesForType: () => toolNames,
++      resolveAgentConfig: (type) => ({
++        description: type,
++        name: type,
++        promptMode: "append",
++        systemPrompt: "",
++        toolNames,
++      }),
++    };
++    const deps: SubagentSessionDeps = {
++      exec: (async () => ({ code: 0, killed: false, stderr: "", stdout: "" })) as never,
++      io: {
++        assemblerIO: { buildAgentPrompt: () => "prompt", loadProjectContext: () => undefined } as never,
++        createLoaderSettingsManager: (parent) => parent,
++        createResourceLoader: () => ({ reload: async () => {} }),
++        createSession: async (options) => {
++          captured = options;
++          return { session };
++        },
++        createSessionManager: () => ({
++          getSessionFile: () => undefined,
++          getSessionId: () => "child",
++          newSession: () => {},
++        }),
++        createSettingsManager: () => ({}) as SettingsManager,
++        deriveSessionDir: () => "/tmp",
++        detectEnv: async () => ({ branch: "", isGitRepo: false, platform: "linux" }),
++        getAgentDir: () => "/tmp",
++      },
++      lifecycle: { bound: () => {}, completed: () => {}, disposed: () => {}, sessionCreated: () => {}, spawning: () => {} },
++      listParentToolNames: () => [],
++      registry,
++      resolvePromptInheritance: () => "full",
++    };
++    const snapshot: ParentSnapshot = {
++      activeToolNames,
++      callableToolNames,
++      cwd: "/tmp",
++      model: undefined,
++      modelRegistry: { find: () => undefined } as never,
++      systemPrompt: "parent",
++    };
++    await createSubagentSession({ askParent: () => {}, snapshot, type: "general-purpose" }, deps);
++    if (!captured) throw new Error("createSession was not called");
++    return captured;
++  }
++
++  it("gives an agent that lists * the main session's selection, the guard, and ask_parent", async () => {
++    const options = await spawn([MAIN_SESSION_TOOLS]);
++    expect(options.tools).toEqual(["read", "codemode", "ask_parent"]);
++    expect(options.excludeTools).toEqual([...RECURSION_GUARD, "mcp__*", "list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]);
++    expect(options.customTools?.map((tool) => tool.name)).toEqual(["ask_parent"]);
++  });
++
++  it("keeps codemode-only and deferred tool names without copying guarded tools", async () => {
++    const result = await spawn([MAIN_SESSION_TOOLS], ["read"], ["via_codemode", "via_deferred", "subagent"]);
++    expect(result.tools).toEqual(["read", "via_codemode", "via_deferred", "ask_parent"]);
++    expect(result.initialActiveTools).toEqual(["read", "ask_parent"]);
++    expect(result.excludeTools).toContain("subagent");
++  });
++
++  it("carries selected MCP names without letting any others through", async () => {
++    const options = await spawn([MAIN_SESSION_TOOLS], ["mcp__server__selected"]);
++    expect(options.tools).toEqual(["mcp__server__selected", "ask_parent"]);
++    expect(options.excludeTools).toEqual(RECURSION_GUARD);
++  });
++
++  it("keeps the allowlist of an agent that names its tools", async () => {
++    const options = await spawn(["read", "browser_*"]);
++    expect(options.tools).toEqual(["read", "browser_*", "ask_parent"]);
++    expect(options.excludeTools).toEqual(RECURSION_GUARD);
++  });
++});
+diff -ruN a/test/model-tag.test.ts b/test/model-tag.test.ts
+--- a/test/model-tag.test.ts
++++ b/test/model-tag.test.ts
+@@ -0,0 +1,59 @@
++// Tests for the Pi fork's pi-subagents patch: the agents widget tags each agent with its
++// model as provider/id, even when the model carries a catalog display name.
++// Run: cd packages/coding-agent/bundle/node_modules/@gotgenes/pi-subagents && bun test ./test
++
++import { describe, expect, it } from "bun:test";
++import { AgentTypeRegistry } from "#src/config/agent-types";
++import { renderFinishedLine, renderRunningLines, type WidgetAgent } from "#src/ui/widget-renderer";
++
++const THEME = { fg: (_color: string, text: string) => text, bold: (text: string) => text };
++const REGISTRY = new AgentTypeRegistry(() => new Map([["general-purpose", {
++  name: "general-purpose",
++  displayName: "General Purpose",
++  description: "test",
++  systemPrompt: "",
++  promptMode: "append",
++}]]));
++
++// A live agent's model is the full catalog Model, which carries `name` beside provider and id.
++const OPUS = { provider: "jg-anthropic", id: "claude-opus-5-5", name: "Claude Opus 5.5" };
++
++function widgetAgent(model: WidgetAgent["model"]): WidgetAgent {
++  return {
++    id: "a",
++    type: "general-purpose",
++    status: "running",
++    description: "do work",
++    toolUses: 3,
++    startedAt: 1000,
++    compactionCount: 0,
++    activeTools: new Map(),
++    responseText: "",
++    contextPercent: null,
++    turnBudget: { used: 3, maxTurns: 60, phase: "within" },
++    model,
++  };
++}
++
++describe("agents widget model tag", () => {
++  it("renders provider/id on a running line, never the catalog name", () => {
++    const [header] = renderRunningLines(widgetAgent(OPUS), REGISTRY, 0, THEME);
++    expect(header).toContain("[jg-anthropic/claude-opus-5-5]");
++    expect(header).not.toContain("Claude Opus 5.5");
++  });
++
++  it("renders provider/id on a finished line, never the catalog name", () => {
++    const line = renderFinishedLine(
++      { ...widgetAgent(OPUS), status: "completed", completedAt: 5000 },
++      REGISTRY,
++      THEME,
++    );
++    expect(line).toContain("[jg-anthropic/claude-opus-5-5]");
++    expect(line).not.toContain("Claude Opus 5.5");
++  });
++
++  it("renders no tag when the model is unknown", () => {
++    const [header] = renderRunningLines(widgetAgent(undefined), REGISTRY, 0, THEME);
++    expect(header).not.toContain("[");
++  });
++});

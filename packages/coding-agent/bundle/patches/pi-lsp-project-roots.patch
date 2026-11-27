@@ -1,0 +1,627 @@
+diff -ruN a/src/config/loadConfig.ts b/src/config/loadConfig.ts
+--- a/src/config/loadConfig.ts
++++ b/src/config/loadConfig.ts
+@@ -11,6 +11,7 @@
+ export interface LoadLspConfigInput {
+   cwd: string;
+   projectRoot?: string;
++  userOnly?: boolean;
+ }
+ 
+ export interface LoadLspConfigResult {
+@@ -63,7 +64,6 @@
+   let installMode: InstallMode = "prompt";
+   let warmup = true;
+   const projectRoot = input.projectRoot ?? input.cwd;
+-  const projectTrusted = await isProjectTrusted(projectRoot);
+ 
+   const sources: ConfigSource[] = [
+     {
+@@ -72,13 +72,15 @@
+       kind: "global",
+       trustedProjectOverrides: true,
+     },
+-    {
++  ];
++  if (!input.userOnly) {
++    sources.push({
+       label: "project config",
+       path: getProjectConfigPath(projectRoot),
+       kind: "project",
+-      trustedProjectOverrides: projectTrusted,
+-    },
+-  ];
++      trustedProjectOverrides: await isProjectTrusted(projectRoot),
++    });
++  }
+ 
+   for (const source of sources) {
+     const config = await readConfig(source, warnings);
+diff -ruN a/src/index.ts b/src/index.ts
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -49,7 +49,9 @@
+           ? async ({ server, command }) => ctx.ui.confirm(`Install ${server.displayName}?`, `Run ${command}?`)
+           : undefined,
+       });
++      const externalConfig = await loadLspConfig({ cwd: ctx.cwd, userOnly: true });
+       const runtimeManager = new LspRuntimeManager({
++        externalConfig,
+         cwd: ctx.cwd,
+         ownerId,
+         config,
+diff -ruN a/src/lsp/checked-source.ts b/src/lsp/checked-source.ts
+--- a/src/lsp/checked-source.ts
++++ b/src/lsp/checked-source.ts
+@@ -0,0 +1,16 @@
++import { constants } from "node:fs";
++import { open, realpath } from "node:fs/promises";
++
++/** Read the same regular file that root discovery checked. */
++export async function readCheckedSource(path: string, identity: { dev: bigint; ino: bigint }): Promise<string> {
++  const source = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
++  try {
++    const opened = await source.stat({ bigint: true });
++    if (!opened.isFile() || opened.dev !== identity.dev || opened.ino !== identity.ino || (await realpath(path)) !== path) {
++      throw new Error(`LSP file changed before it could be read: ${path}.`);
++    }
++    return await source.readFile("utf8");
++  } finally {
++    await source.close();
++  }
++}
+diff -ruN a/src/lsp/runtimeManager.ts b/src/lsp/runtimeManager.ts
+--- a/src/lsp/runtimeManager.ts
++++ b/src/lsp/runtimeManager.ts
+@@ -1,5 +1,6 @@
+-import { readFile } from "node:fs/promises";
+-import { isAbsolute, relative, resolve } from "node:path";
++import { realpath, stat } from "node:fs/promises";
++import { homedir } from "node:os";
++import { isAbsolute, parse, relative, resolve, sep } from "node:path";
+ import { delay } from "../util/helpers.js";
+ import type {
+   Definition,
+@@ -18,12 +19,16 @@
+ import type { InstalledServerMetadata, ServerDefinition } from "../registry/schema.js";
+ import { resolveServerConfig } from "../resolve/resolveServer.js";
+ import type { LspProcessRegistry } from "./processRegistry.js";
++import { readCheckedSource } from "./checked-source.js";
+ import { LspClient, type LspConnectionFactory, type LspDiagnosticsResult, type LspServerSpawner } from "./client.js";
+ 
+ export interface LspRuntimeManagerOptions {
+   cwd: string;
++  /** The home directory, which no project root outside the workspace may be or lie above. Defaults to the user's. */
++  homeDir?: string;
+   ownerId: string;
+   config: LoadLspConfigResult;
++  externalConfig?: LoadLspConfigResult;
+   installManager: LspInstallManager;
+   processRegistry: LspProcessRegistry;
+   spawner?: LspServerSpawner;
+@@ -58,19 +63,25 @@
+   result: SymbolInformation[] | WorkspaceSymbol[] | null;
+ }
+ 
+-interface SelectedServer {
+-  server: ServerDefinition;
++/** The marker that makes any git checkout a project root for a file outside the workspace. */
++const GIT_ROOT_MARKER = ".git";
++
++interface SelectedRoot {
+   rootDir: string;
+   rootMarker?: string;
++  external?: boolean;
++}
++
++interface SelectedServer extends SelectedRoot {
++  server: ServerDefinition;
+   filetype: string;
+   filePath: string;
+   text: string;
+ }
+ 
+-interface ClientTarget {
++interface ClientTarget extends SelectedRoot {
+   client: LspClient;
+   serverId: string;
+-  rootDir: string;
+   started: boolean;
+ }
+ 
+@@ -84,10 +95,8 @@
+   allowAutoInstall?: boolean;
+ }
+ 
+-interface EnsureClientInput {
++interface EnsureClientInput extends SelectedRoot {
+   server: ServerDefinition;
+-  rootDir: string;
+-  rootMarker?: string;
+   allowPromptInstall: boolean;
+   allowAutoInstall?: boolean;
+ }
+@@ -106,6 +115,7 @@
+       | "declined"
+       | "start-failed"
+       | "outside-workspace"
++      | "closed"
+       | "invalid-position",
+   ) {
+     super(message);
+@@ -115,8 +125,10 @@
+ 
+ export class LspRuntimeManager {
+   private readonly cwd: string;
++  private readonly homeDir: string;
+   private readonly ownerId: string;
+   private readonly config: LoadLspConfigResult;
++  private readonly externalConfig?: LoadLspConfigResult;
+   private readonly installManager: LspInstallManager;
+   private readonly processRegistry: LspProcessRegistry;
+   private readonly spawner?: LspServerSpawner;
+@@ -127,12 +139,15 @@
+   private readonly shutdownGraceMs: number;
+   private readonly clients = new Map<string, LspClient>();
+   private readonly starting = new Map<string, Promise<ClientTarget>>();
+-  private readonly filetypeCache = new Map<string, string>();
++  private shutdownPromise?: Promise<void>;
++  private closed = false;
+ 
+   constructor(options: LspRuntimeManagerOptions) {
+     this.cwd = options.cwd;
++    this.homeDir = resolve(options.homeDir ?? homedir());
+     this.ownerId = options.ownerId;
+     this.config = options.config;
++    this.externalConfig = options.externalConfig;
+     this.installManager = options.installManager;
+     this.processRegistry = options.processRegistry;
+     this.spawner = options.spawner;
+@@ -180,8 +195,17 @@
+     return this.startServer(serverId, options);
+   }
+ 
+-  async shutdown(): Promise<void> {
+-    this.filetypeCache.clear();
++  shutdown(): Promise<void> {
++    if (this.shutdownPromise) return this.shutdownPromise;
++    this.closed = true;
++    this.shutdownPromise = this.finishShutdown();
++    return this.shutdownPromise;
++  }
++
++  private async finishShutdown(): Promise<void> {
++    // Closing prevents further starts. Starts already in flight either stop before
++    // spawning or shut down their provisional client without publishing it.
++    await Promise.allSettled([...this.starting.values()]);
+     await this.shutdownClients(() => true);
+   }
+ 
+@@ -197,6 +221,7 @@
+         server: selected.server,
+         rootDir: selected.rootDir,
+         rootMarker: selected.rootMarker,
++        external: selected.external,
+         allowPromptInstall: false,
+         allowAutoInstall: false,
+       });
+@@ -290,6 +315,7 @@
+       : this.workspaceSymbolClients();
+     const results: LspWorkspaceSymbolsResult[] = [];
+     for (const target of clients) {
++      this.assertOpen();
+       results.push({
+         serverId: target.client.serverId,
+         rootDir: target.client.rootDir,
+@@ -335,6 +361,7 @@
+       server: selected.server,
+       rootDir: selected.rootDir,
+       rootMarker: selected.rootMarker,
++      external: selected.external,
+       allowPromptInstall: false,
+     });
+     const uri = await target.client.syncFile(selected.filePath, selected.filetype, selected.text);
+@@ -342,18 +369,33 @@
+   }
+ 
+   private async selectServerForFile(filePath: string): Promise<SelectedServer> {
+-    const resolvedPath = this.resolvePath(filePath);
+-    const text = await readFile(resolvedPath, "utf8");
+-    const cached = this.filetypeCache.get(resolvedPath);
+-    const filetype = cached ?? detectFiletype({ path: resolvedPath, content: text });
+-    if (cached === undefined) {
+-      if (filetype) this.filetypeCache.set(resolvedPath, filetype);
++    this.assertOpen();
++    const { path: resolvedPath, identity } = await this.resolvePath(filePath);
++    let filetype = detectFiletype({ path: resolvedPath });
++    let text: string | undefined;
++    if (!filetype) {
++      // A file without a known suffix still needs a valid project scope before a content read.
++      const catalog = this.externalConfig?.catalog ?? this.config.catalog;
++      const markers = Object.values(catalog.servers).flatMap((server) => server.rootMarkers);
++      const probe = await this.selectRoot(resolvedPath, markers);
++      if (!probe) throw new LspRuntimeError(`No LSP project root for ${resolvedPath}; use ast_grep or grep.`, "outside-workspace");
++      await this.assertCanonicalRoot(probe);
++      this.assertOpen();
++      text = await readCheckedSource(resolvedPath, identity);
++      filetype = detectFiletype({ path: resolvedPath, content: text });
+     }
+     if (!filetype) {
+       throw new LspRuntimeError(`No LSP filetype detected for ${resolvedPath}.`, "no-filetype");
+     }
+-
+-    const server = Object.values(this.config.catalog.servers).find((entry) => entry.filetypes.includes(filetype));
++    let server = Object.values(this.config.catalog.servers).find((entry) => entry.filetypes.includes(filetype));
++    let root = server && await this.selectRoot(resolvedPath, server.rootMarkers);
++    if (!root || root.external) {
++      // An external checkout uses only user-level server definitions. It does
++      // not inherit either checkout's project config or installation policy.
++      server = Object.values(this.externalConfig?.catalog.servers ?? {}).find((entry) => entry.filetypes.includes(filetype));
++      root = server && await this.selectRoot(resolvedPath, server.rootMarkers);
++      if (root) root = { ...root, external: true };
++    }
+     if (!server) {
+       throw new LspRuntimeError(
+         `No configured LSP server handles filetype ${filetype} for ${resolvedPath}.`,
+@@ -361,16 +403,11 @@
+       );
+     }
+ 
+-    const root = await detectRoot(resolvedPath, server.rootMarkers);
+-    const rootDir = root && isPathInside(this.cwd, root.rootDir) ? root.rootDir : this.cwd;
+-    return {
+-      server,
+-      rootDir,
+-      rootMarker: rootDir === root?.rootDir ? root.marker : undefined,
+-      filetype,
+-      filePath: resolvedPath,
+-      text,
+-    };
++    if (!root) throw new LspRuntimeError(`No LSP project root for ${resolvedPath}; use ast_grep or grep.`, "outside-workspace");
++    await this.assertCanonicalRoot(root);
++    this.assertOpen();
++    text ??= await readCheckedSource(resolvedPath, identity);
++    return { ...root, server, filetype, filePath: resolvedPath, text };
+   }
+ 
+   private async startServerAtRoot(
+@@ -413,7 +450,14 @@
+ 
+   private async ensureClient(input: EnsureClientInput): Promise<ClientTarget> {
+     const server = input.server;
+-    const rootDir = resolve(input.rootDir);
++    this.assertOpen();
++    await this.assertNotBroadRoot(resolve(input.rootDir));
++    const rootDir = await realpath(input.rootDir);
++    if (rootDir !== input.rootDir && input.rootMarker) {
++      throw new LspRuntimeError(`LSP project root changed: ${input.rootDir}.`, "outside-workspace");
++    }
++    await this.assertCanonicalRoot({ ...input, rootDir });
++    this.assertOpen();
+     const key = clientKey(server.id, rootDir);
+     const existing = this.clients.get(key);
+     if (existing && !existing.isExited) {
+@@ -435,14 +479,18 @@
+   private async startClient(input: StartClientInput): Promise<ClientTarget> {
+     const install = await this.ensureInstalled(input.server.id, {
+       allowPromptInstall: input.allowPromptInstall,
+-      allowAutoInstall: input.allowAutoInstall,
++      allowAutoInstall: input.external ? false : input.allowAutoInstall,
+     });
++    this.assertOpen();
++    await this.assertCanonicalRoot(input);
+     const resolved = await resolveServerConfig({
+       server: input.server,
+       rootDir: input.rootDir,
+       rootMarker: input.rootMarker,
+       install,
+     });
++    await this.assertCanonicalRoot(input);
++    this.assertOpen();
+     let client: LspClient | undefined;
+     try {
+       client = new LspClient({
+@@ -456,10 +504,13 @@
+         shutdownGraceMs: this.shutdownGraceMs,
+       });
+       await client.start();
++      await this.assertCanonicalRoot(input);
++      this.assertOpen();
+       this.clients.set(input.key, client);
+       return { client, serverId: input.server.id, rootDir: input.rootDir, started: true };
+     } catch (error) {
+       await client?.shutdown().catch(() => false);
++      if (error instanceof LspRuntimeError) throw error;
+       throw new LspRuntimeError(
+         `Failed to start ${input.server.id}: ${error instanceof Error ? error.message : String(error)}`,
+         "start-failed",
+@@ -501,15 +552,58 @@
+     return stopped;
+   }
+ 
+-  private resolvePath(filePath: string): string {
+-    const resolvedPath = isAbsolute(filePath) ? resolve(filePath) : resolve(this.cwd, filePath);
+-    if (!isPathInside(this.cwd, resolvedPath)) {
+-      throw new LspRuntimeError(
+-        `Refusing to start LSP for ${resolvedPath}; target is outside workspace ${this.cwd}.`,
+-        "outside-workspace",
+-      );
++  private assertOpen(): void {
++    if (this.closed) throw new LspRuntimeError("The LSP session is shutting down.", "closed");
++  }
++
++  private async resolvePath(filePath: string) {
++    const lexical = resolve(this.cwd, filePath);
++    const raw = isAbsolute(filePath) ? filePath : `${this.cwd}${sep}${filePath}`;
++    const canonical = await realpath(raw);
++    // Reject spellings that collapse to a forbidden root, even if an earlier
++    // symlink would have taken that spelling elsewhere.
++    await this.assertNotBroadRoot(lexical);
++    await this.assertNotBroadRoot(canonical);
++    const identity = await stat(canonical, { bigint: true });
++    if (!identity.isFile()) throw new Error(`LSP requires a regular file: ${canonical}.`);
++    return { path: canonical, identity };
++  }
++
++  private async selectRoot(filePath: string, rootMarkers: readonly string[]): Promise<SelectedRoot | undefined> {
++    const markers = [...new Set([...rootMarkers, GIT_ROOT_MARKER])];
++    const root = await detectRoot(filePath, markers);
++    const cwd = await realpath(this.cwd);
++    if (!root) return isPathInside(cwd, filePath) ? { rootDir: cwd } : undefined;
++    const rootDir = await realpath(root.rootDir);
++    if (rootDir !== root.rootDir) {
++      throw new LspRuntimeError(`LSP project root changed: ${root.rootDir}.`, "outside-workspace");
++    }
++
++    // A nested checkout is a different project even inside the current cwd.
++    const cwdProbe = `${cwd}${sep}.lsp-root-probe`;
++    const [cwdRoot, cwdGit, targetGit] = await Promise.all([
++      detectRoot(cwdProbe, markers),
++      detectRoot(cwdProbe, [GIT_ROOT_MARKER]),
++      detectRoot(filePath, [GIT_ROOT_MARKER]),
++    ]);
++    const sameGit = cwdGit !== undefined && cwdGit.rootDir === targetGit?.rootDir;
++    const local = isPathInside(cwd, filePath) &&
++      (cwdRoot?.rootDir === rootDir || (sameGit && isPathInside(cwdGit.rootDir, rootDir)));
++    return { rootDir, rootMarker: root.marker, external: !local };
++  }
++
++  private async assertNotBroadRoot(path: string): Promise<void> {
++    const canonicalHome = await realpath(this.homeDir).catch(() => this.homeDir);
++    if (path === parse(path).root || path === this.homeDir || path === canonicalHome) {
++      throw new LspRuntimeError(`LSP refuses the filesystem root or home directory: ${path}.`, "outside-workspace");
++    }
++  }
++
++  private async assertCanonicalRoot(root: SelectedRoot): Promise<void> {
++    await this.assertNotBroadRoot(root.rootDir);
++    if (await realpath(root.rootDir) !== root.rootDir) {
++      throw new LspRuntimeError(`LSP project root changed: ${root.rootDir}.`, "outside-workspace");
+     }
+-    return resolvedPath;
+   }
+ }
+ 
+@@ -519,7 +613,7 @@
+ 
+ function isPathInside(rootDir: string, targetPath: string): boolean {
+   const relativePath = relative(resolve(rootDir), resolve(targetPath));
+-  return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
++  return relativePath === "" || (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
+ }
+ 
+ function validatePosition(selected: SelectedServer, line: number, character: number): void {
+diff -ruN a/test/workspace-roots.test.ts b/test/workspace-roots.test.ts
+--- a/test/workspace-roots.test.ts
++++ b/test/workspace-roots.test.ts
+@@ -0,0 +1,210 @@
++// Tests for the Pi fork's pi-lsp-adapter patch. The bundle installs no vitest, so these run under Bun:
++// cd packages/coding-agent/bundle/node_modules/pi-lsp-adapter && bun test ./test
++
++import { afterEach, beforeEach, describe, expect, it } from "bun:test";
++import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { dirname, join } from "node:path";
++import type { LoadLspConfigResult } from "../src/config/loadConfig.ts";
++import { createInstalledServerMetadata } from "../src/install/lockfile.ts";
++import type { LspInstallManager } from "../src/install/manager.ts";
++import { readCheckedSource } from "../src/lsp/checked-source.ts";
++import type { LspConnection, LspServerProcess } from "../src/lsp/client.ts";
++import type { LspProcessRegistry } from "../src/lsp/processRegistry.ts";
++import { LspRuntimeError, LspRuntimeManager } from "../src/lsp/runtimeManager.ts";
++import { BUILTIN_CATALOG } from "../src/registry/builtin.ts";
++import { EventEmitter } from "node:events";
++
++// FAKE_PID is the pid the fake server reports; nothing signals it.
++const FAKE_PID = 4_000_000;
++class FakeServer extends EventEmitter implements LspServerProcess {
++  readonly pid = FAKE_PID;
++  kill() { return true; }
++}
++
++const GO_SOURCE = "package main\n\nfunc main() {}\n";
++
++describe("LspRuntimeManager project roots", () => {
++  let base: string;
++  let home: string;
++  let spawned: string[];
++  let workspace: string;
++
++  beforeEach(() => {
++    base = mkdtempSync(join(tmpdir(), "pi-lsp-roots-"));
++    home = join(base, "home");
++    workspace = join(home, "Repositories", "project");
++    spawned = [];
++    write(join(workspace, "go.mod"), "module project\n");
++  });
++
++  afterEach(() => {
++    rmSync(base, { force: true, recursive: true });
++  });
++
++  // write creates a file and every directory above it.
++  function write(path: string, content = GO_SOURCE): string {
++    mkdirSync(dirname(path), { recursive: true });
++    writeFileSync(path, content);
++    return path;
++  }
++
++  // gitCheckout creates a checkout with a .git directory and one Go file in a subpackage.
++  function gitCheckout(root: string): string {
++    mkdirSync(join(root, ".git"), { recursive: true });
++    return write(join(root, "pkg", "main.go"));
++  }
++
++  // manager returns a runtime manager for the workspace whose gopls starts a fake server and records its root.
++  function manager(initialize?: () => Promise<void>): LspRuntimeManager {
++    const lockfilePath = join(base, "lsp-lock.json");
++    const metadata = createInstalledServerMetadata({ binDir: join(base, "bin"), installer: "system", resolvedCommand: ["gopls"] });
++    writeFileSync(lockfilePath, JSON.stringify({ servers: { gopls: metadata } }));
++    const config: LoadLspConfigResult = {
++      catalog: { servers: { gopls: { ...BUILTIN_CATALOG.servers.gopls, filetypes: ["go", "javascript"] } } },
++      installMode: "off",
++      warmup: false,
++      warnings: [],
++    } as unknown as LoadLspConfigResult;
++    const processRegistry = { register: async () => {}, unregister: async () => {} } as unknown as LspProcessRegistry;
++    return new LspRuntimeManager({
++      config,
++      externalConfig: config,
++      connectionFactory: (process) => ({
++        dispose: () => {},
++        end: () => {},
++        listen: () => {},
++        onNotification: () => ({ dispose: () => {} }),
++        onRequest: () => ({ dispose: () => {} }),
++        sendNotification: async (method: string) => {
++          if (method === "exit") (process as FakeServer).emit("exit", 0, null);
++        },
++        sendRequest: async <R>(method: string) => {
++          if (method === "initialize") await initialize?.();
++          return (method === "initialize" ? { capabilities: { documentSymbolProvider: true } } : []) as R;
++        },
++      } satisfies LspConnection),
++      cwd: workspace,
++      homeDir: home,
++      installManager: {} as LspInstallManager,
++      lockfileOptions: { lockfilePath },
++      ownerId: "test",
++      processRegistry,
++      spawner: (resolved) => {
++        spawned.push(resolved.rootDir);
++        return new FakeServer();
++      },
++    });
++  }
++
++  // refusal returns the error code a documentSymbols call on path fails with.
++  async function refusal(runtime: LspRuntimeManager, path: string): Promise<string | undefined> {
++    try {
++      await runtime.documentSymbols(path);
++      return undefined;
++    } catch (error) {
++      return error instanceof LspRuntimeError ? error.code : String(error);
++    }
++  }
++
++  it("keeps the workspace behavior for a file inside it", async () => {
++    const runtime = manager();
++    const result = await runtime.documentSymbols(write(join(workspace, "cmd", "main.go")));
++    expect(result.rootDir).toBe(workspace);
++  });
++
++  it("serves a file in a review checkout below the home directory at the checkout's git root", async () => {
++    const checkout = join(home, ".cache", "recon", "checkouts", "dashboard-pr-54");
++    const runtime = manager();
++    const result = await runtime.documentSymbols(gitCheckout(checkout));
++    expect(result.rootDir).toBe(checkout);
++  });
++
++  it("serves a file in a /tmp clone at the clone's root marker", async () => {
++    const clone = join(base, "pr47");
++    write(join(clone, "go.mod"), "module pr47\n");
++    const runtime = manager();
++    const result = await runtime.documentSymbols(gitCheckout(clone));
++    expect(result.rootDir).toBe(clone);
++    expect(result.rootDir.startsWith(tmpdir())).toBe(true);
++  });
++
++  it("detects a Node shebang on an extensionless script in another checkout", async () => {
++    const root = join(base, "scripts-checkout");
++    gitCheckout(root);
++    const file = write(join(root, "script"), "#!/usr/bin/env node\nconst greeting = 1;\n");
++    const runtime = manager();
++    expect((await runtime.documentSymbols(file)).rootDir).toBe(root);
++    expect(spawned).toEqual([root]);
++  });
++
++  it("runs one server per root", async () => {
++    const first = join(base, "first");
++    const second = join(base, "second");
++    const file = gitCheckout(first);
++    symlinkSync(first, join(base, "alias"));
++    const runtime = manager();
++    await runtime.documentSymbols(file);
++    await runtime.documentSymbols(join(base, "alias", "pkg", "main.go"));
++    await runtime.documentSymbols(write(join(first, "other.go")));
++    await runtime.documentSymbols(gitCheckout(second));
++    await runtime.documentSymbols(write(join(workspace, "main.go")));
++    expect(spawned).toEqual([first, second, workspace]);
++    expect(runtime.activeClients().map((client) => client.rootDir)).toEqual([first, second, workspace]);
++  });
++
++  it("refuses a file outside the workspace that sits in no project", async () => {
++    const runtime = manager();
++    expect(await refusal(runtime, write(join(home, "notes", "main.go")))).toBe("outside-workspace");
++    expect(await refusal(runtime, write(join(base, "loose", "main.go")))).toBe("outside-workspace");
++    expect(spawned).toEqual([]);
++  });
++
++  it("refuses a file whose only root is the home directory", async () => {
++    mkdirSync(join(home, ".git"), { recursive: true });
++    const runtime = manager();
++    expect(await refusal(runtime, write(join(home, "notes", "main.go")))).toBe("outside-workspace");
++    expect(spawned).toEqual([]);
++  });
++
++  it("rejects forbidden root aliases and non-regular targets", async () => {
++    const runtime = manager();
++    symlinkSync(home, join(base, "home-link"));
++    symlinkSync("/", join(base, "root-link"));
++    for (const path of ["home-link", "root-link"]) {
++      await expect(runtime.documentSymbols(join(base, path))).rejects.toThrow("filesystem root or home directory");
++    }
++    mkdirSync(join(workspace, "dir.go"));
++    await expect(runtime.documentSymbols("dir.go")).rejects.toThrow("requires a regular file");
++    expect(spawned).toEqual([]);
++  });
++
++  it("checks the descriptor against the file that was selected before a path replacement", async () => {
++    const source = write(join(workspace, "checked.go"));
++    const identity = statSync(source, { bigint: true });
++    expect(await readCheckedSource(source, identity)).toBe(GO_SOURCE);
++    renameSync(source, join(workspace, "previous.go"));
++    write(source, "replacement");
++    await expect(readCheckedSource(source, identity)).rejects.toThrow("LSP file changed");
++  });
++
++  it("closes a provisional server without publishing it when shutdown wins initialization", async () => {
++    const reached = Promise.withResolvers<void>();
++    const release = Promise.withResolvers<void>();
++    const runtime = manager(async () => {
++      reached.resolve();
++      await release.promise;
++    });
++    const source = write(join(workspace, "slow.go"));
++    const running = runtime.documentSymbols(source).catch((error) => error);
++    await reached.promise;
++    const shutdown = runtime.shutdown();
++    expect(runtime.shutdown()).toBe(shutdown);
++    await expect(runtime.documentSymbols(source)).rejects.toThrow("shutting down");
++    release.resolve();
++    expect(await running).toMatchObject({ code: "closed" });
++    await shutdown;
++    expect(runtime.activeClients()).toEqual([]);
++    expect(spawned).toEqual([workspace]);
++  });
++});

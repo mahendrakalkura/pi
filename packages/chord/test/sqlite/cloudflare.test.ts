@@ -1,11 +1,11 @@
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import { BACKGROUND_CONTEXT } from "../../src/context/index.ts";
-import { sqliteBackend } from "../../src/next/store/backend.ts";
-import { refusalOf } from "../../src/next/store/refusal.ts";
-import type { StagedWrite } from "../../src/next/store/step.ts";
-import { type ChordStore, openStore } from "../../src/next/store/store.ts";
 import { DurableObjectSqliteDatabase } from "../../src/sqlite/cloudflare.ts";
+import { sqliteBackend } from "../../src/store/backend.ts";
+import { refusalOf } from "../../src/store/refusal.ts";
+import type { StagedWrite } from "../../src/store/step.ts";
+import { openStore } from "../../src/store/store.ts";
 import { durableObjectStorage, RUN_CHANGES, runChanges } from "./helpers.ts";
 
 describe("Durable Object SQLite driver", () => {
@@ -176,10 +176,7 @@ describe("the outcome of a transaction (slice 6b D4)", () => {
 				},
 			},
 		};
-		const store = (await openStore(
-			sqliteBackend(new DurableObjectSqliteDatabase(withoutCodes)),
-			BACKGROUND_CONTEXT,
-		)) as ChordStore;
+		const store = await openStore(sqliteBackend(new DurableObjectSqliteDatabase(withoutCodes)), BACKGROUND_CONTEXT);
 		await store.read(
 			(executor) => executor.exec('CREATE TABLE "checked" (n INTEGER CHECK (n < 10))'),
 			BACKGROUND_CONTEXT,

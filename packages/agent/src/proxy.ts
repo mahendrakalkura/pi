@@ -52,6 +52,7 @@ type ProxySerializableStreamOptions = Pick<
 	| "reasoning"
 	| "cacheRetention"
 	| "sessionId"
+	| "disableContinuation"
 	| "headers"
 	| "metadata"
 	| "transport"
@@ -95,6 +96,7 @@ function buildProxyRequestOptions(options: ProxyStreamOptions): ProxySerializabl
 		reasoning: options.reasoning,
 		cacheRetention: options.cacheRetention,
 		sessionId: options.sessionId,
+		disableContinuation: options.disableContinuation,
 		headers: options.headers,
 		metadata: options.metadata,
 		transport: options.transport,
@@ -197,8 +199,9 @@ export function streamProxy(
 					throw new Error("Request aborted by user");
 				}
 
-				buffer += decoder.decode(value, { stream: true });
-				const lines = buffer.split("\n");
+				// Split only the new text, so a long line arriving in many chunks is not rescanned per chunk.
+				const lines = decoder.decode(value, { stream: true }).split("\n");
+				lines[0] = buffer + lines[0];
 				buffer = lines.pop() || "";
 
 				for (const line of lines) {

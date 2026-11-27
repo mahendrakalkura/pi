@@ -615,7 +615,7 @@ describe("Generate E2E Tests", () => {
 	describe.skipIf(!hasCloudflareWorkersAICredentials())(
 		"Cloudflare Workers AI Provider (Kimi K2.6 via OpenAI Completions)",
 		() => {
-			const llm = getModel("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6");
+			const llm = getModel("cloudflare-workers-ai", "@cf/zai-org/glm-5.3");
 
 			it("should complete basic text generation", { retry: 3 }, async () => {
 				await basicTextGeneration(llm);
@@ -642,7 +642,7 @@ describe("Generate E2E Tests", () => {
 	describe.skipIf(!hasCloudflareAiGatewayCredentials())(
 		"Cloudflare AI Gateway → Workers AI (Kimi K2.6 via /compat)",
 		() => {
-			const llm = getModel("cloudflare-ai-gateway", "workers-ai/@cf/moonshotai/kimi-k2.6");
+			const llm = getModel("cloudflare-ai-gateway", "workers-ai/@cf/zai-org/glm-5.3");
 
 			it("should complete basic text generation", { retry: 3 }, async () => {
 				await basicTextGeneration(llm);
@@ -970,8 +970,8 @@ describe("Generate E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!process.env.MISTRAL_API_KEY)("Mistral Provider (devstral-medium-latest)", () => {
-		const llm = getModel("mistral", "devstral-medium-latest");
+	describe.skipIf(!process.env.MISTRAL_API_KEY)("Mistral Provider (mistral-medium-latest)", () => {
+		const llm = getModel("mistral", "mistral-medium-latest");
 
 		it("should complete basic text generation", { retry: 3 }, async () => {
 			await basicTextGeneration(llm);
@@ -996,8 +996,8 @@ describe("Generate E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!process.env.MISTRAL_API_KEY)("Mistral Provider (pixtral-12b with image support)", () => {
-		const llm = getModel("mistral", "pixtral-12b");
+	describe.skipIf(!process.env.MISTRAL_API_KEY)("Mistral Provider (ministral-14b-latest with image support)", () => {
+		const llm = getModel("mistral", "ministral-14b-latest");
 
 		it("should complete basic text generation", { retry: 3 }, async () => {
 			await basicTextGeneration(llm);
@@ -1305,8 +1305,39 @@ describe("Generate E2E Tests", () => {
 		});
 	});
 
-	describe.skipIf(!process.env.ANT_LING_API_KEY)("Ant Ling Provider (Ling 2.6 Flash via OpenAI Completions)", () => {
-		const llm = getModel("ant-ling", "Ling-2.6-flash");
+	describe.skipIf(!process.env.QWEN_TOKEN_PLAN_CN_API_KEY)(
+		"Qwen Token Plan Individual Provider (Qwen3.8-Max, CN region)",
+		() => {
+			const llm = getModel("qwen-token-plan-individual-cn", "qwen3.8-max");
+			const thinkingOptions = {
+				thinkingEnabled: true,
+				reasoningEffort: "high",
+			} satisfies StreamOptionsWithExtras;
+
+			it("should complete basic text generation", { retry: 3 }, async () => {
+				await basicTextGeneration(llm);
+			});
+
+			it("should handle tool calling", { retry: 3 }, async () => {
+				await handleToolCall(llm);
+			});
+
+			it("should handle streaming", { retry: 3 }, async () => {
+				await handleStreaming(llm);
+			});
+
+			it("should handle thinking mode", { retry: 3 }, async () => {
+				await handleThinking(llm, thinkingOptions);
+			});
+
+			it("should handle multi-turn with thinking and tools", { retry: 3 }, async () => {
+				await multiTurn(llm, thinkingOptions);
+			});
+		},
+	);
+
+	describe.skipIf(!process.env.ANT_LING_API_KEY)("Ant Ling Provider (Ling 3.1 Flash via OpenAI Completions)", () => {
+		const llm = getModel("ant-ling", "Ling-3.1-flash");
 
 		it("should complete basic text generation", { retry: 3 }, async () => {
 			await basicTextGeneration(llm);
@@ -1321,8 +1352,7 @@ describe("Generate E2E Tests", () => {
 		});
 
 		it("should handle thinking mode", { retry: 3 }, async () => {
-			const ringModel = getModel("ant-ling", "Ring-2.6-1T");
-			await handleThinking(ringModel, { reasoningEffort: "high" });
+			await handleThinking(llm, { reasoningEffort: "high" });
 		});
 	});
 

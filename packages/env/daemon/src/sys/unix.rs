@@ -153,7 +153,8 @@ pub fn remove_file(path: &str) -> io::Result<()> {
 pub trait Pipe: io::Read + std::os::fd::AsRawFd {}
 impl<T: io::Read + std::os::fd::AsRawFd> Pipe for T {}
 
-/// Read `pipe` until it ends, `on_data` returns false, or `stop` is set; the pipe closes when this returns.
+/// Read `pipe` until it ends, `on_data` returns false, or `stop` is set (looked at every 100 ms, also while no output
+/// arrives); the pipe closes when this returns.
 pub fn read_pipe(mut pipe: impl Pipe, stop: &AtomicBool, mut on_data: impl FnMut(&[u8]) -> bool) {
     let fd = pipe.as_raw_fd();
     // SAFETY: fcntl on a descriptor this thread owns.
@@ -195,8 +196,44 @@ pub fn read_pipe(mut pipe: impl Pipe, stop: &AtomicBool, mut on_data: impl FnMut
     }
 }
 
-/// Readers poll `stop` every 100 ms.
-pub fn interrupt_reader(_reader: &std::thread::JoinHandle<()>) {}
+/// A pipe a writer thread can poll, so that it stops when the program settles.
+pub trait WritePipe: io::Write + std::os::fd::AsRawFd {}
+impl<T: io::Write + std::os::fd::AsRawFd> WritePipe for T {}
+
+/// Write all of `bytes`, waiting while the program does not read; false once the pipe is closed or `stop` is set
+/// (looked at every 100 ms, also while the write waits).
+pub fn write_pipe(pipe: &mut impl WritePipe, mut bytes: &[u8], stop: &AtomicBool) -> bool {
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl on a descriptor this thread owns; only the daemon's end of the pipe becomes nonblocking.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+    while !bytes.is_empty() {
+        if stop.load(Ordering::SeqCst) {
+            return false;
+        }
+        match pipe.write(bytes) {
+            Ok(0) => return false,
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let mut poll = libc::pollfd {
+                    fd,
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd.
+                let ready = unsafe { libc::poll(&mut poll, 1, 100) };
+                if ready < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                    return false;
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+    true
+}
 
 /// The program an argv command runs; `Command` searches `PATH` like `execvp`, as libuv does.
 pub fn resolve_program(
@@ -306,7 +343,10 @@ pub fn on_exit_signal(on_signal: impl FnOnce(i32) + Send + 'static) {
     });
 }
 
-/// Kill the command's process group, or the process if the group is gone.
+/// Kill the command's session: its process group (or the process if the group is gone), then every other group in the
+/// session. Commands start in a session of their own (`setsid`), and a shell with job control puts each background job
+/// in a group of its own, so a terminal's `sleep 9 &` is reached too; only what left the session (`setsid`) is not.
+/// Call it only while `pid` is not reaped: until then it names no other process, and no other session has its id.
 pub fn kill_tree(pid: u32) {
     let pid = pid as i32;
     // SAFETY: plain signal delivery.
@@ -314,6 +354,133 @@ pub fn kill_tree(pid: u32) {
         if libc::kill(-pid, libc::SIGKILL) != 0 {
             libc::kill(pid, libc::SIGKILL);
         }
+    }
+    // A member may fork while the others are killed: again until none is found, or only the same ones (killed, not
+    // reaped yet).
+    let mut last = Vec::new();
+    for _ in 0..8 {
+        let members = session_members(pid);
+        if members.is_empty() || members == last {
+            return;
+        }
+        for member in &members {
+            kill_member(*member, pid);
+        }
+        last = members;
+    }
+}
+
+/// Kills `member` if it is still of session `sid` when the signal goes: a pid found earlier may name another process
+/// since. On Linux a pidfd (`pidfd_open`, Linux 5.3) holds the process while it is checked; without one (an older
+/// kernel, Android, whose seccomp may forbid the call, macOS) the check is made right before the signal, a window of a
+/// few instructions.
+fn kill_member(member: i32, sid: i32) {
+    #[cfg(target_os = "linux")]
+    // SAFETY: plain system calls on a descriptor this function owns and closes.
+    unsafe {
+        let fd = libc::syscall(libc::SYS_pidfd_open, member, 0) as libc::c_int;
+        if fd >= 0 {
+            // The descriptor names the process `member` named when it was opened: if that one exited and the pid was
+            // reused before the check, the signal goes to the gone process and does nothing.
+            if libc::getsid(member) == sid {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd,
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                );
+            }
+            libc::close(fd);
+            return;
+        }
+    }
+    // SAFETY: plain process queries and signal delivery.
+    unsafe {
+        if libc::getsid(member) == sid {
+            libc::kill(member, libc::SIGKILL);
+        }
+    }
+}
+
+/// The processes of session `sid`, by their session id.
+fn session_members(sid: i32) -> Vec<i32> {
+    // SAFETY: `getsid` only reads; a process gone meanwhile answers -1.
+    let mut members: Vec<i32> = all_pids()
+        .into_iter()
+        .filter(|&pid| pid > 0 && unsafe { libc::getsid(pid) } == sid)
+        .collect();
+    members.sort_unstable();
+    members
+}
+
+/// Every process id this user may see: `/proc` on Linux and Android.
+#[cfg(not(target_vendor = "apple"))]
+fn all_pids() -> Vec<i32> {
+    std::fs::read_dir("/proc")
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Every process id this user may see: the kernel's list on macOS.
+#[cfg(target_vendor = "apple")]
+fn all_pids() -> Vec<i32> {
+    // SAFETY: a null buffer asks for the count; then a buffer of that many (and room for a few new ones) is filled.
+    unsafe {
+        let count = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        if count <= 0 {
+            return Vec::new();
+        }
+        let mut pids = vec![0i32; count as usize + 64];
+        let bytes = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+        let filled = libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes);
+        pids.truncate(filled.max(0) as usize);
+        pids
+    }
+}
+
+/// The process group of a `process` program: what the program started there is killed once it exits.
+pub struct Group {
+    pid: u32,
+}
+
+/// The group of a program just started; `configure` already made it a process group of its own.
+pub fn group(child: &Child) -> io::Result<Group> {
+    Ok(Group { pid: child.id() })
+}
+
+impl Group {
+    /// Wait until the program has exited, leaving it unreaped: its pid, which is the group's id, names no other
+    /// process until it is reaped.
+    pub fn wait_for_exit(&self, child: &mut Child) -> io::Result<()> {
+        loop {
+            // SAFETY: a zeroed siginfo_t for waitid to fill; WNOWAIT leaves the program unreaped.
+            let waited = unsafe {
+                let mut info: libc::siginfo_t = std::mem::zeroed();
+                libc::waitid(
+                    libc::P_PID,
+                    child.id() as libc::id_t,
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if waited == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// Kill what is left in the group, the program too if it still runs.
+    pub fn end(&self) {
+        kill_tree(self.pid);
     }
 }
 
@@ -343,4 +510,88 @@ pub fn read_dir(path: &str) -> io::Result<std::fs::ReadDir> {
 /// Device and inode of `path`; the metadata already has them.
 pub fn path_identity(_path: &str, metadata: &Metadata, _follow: bool) -> (u64, u64) {
     identity(metadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn ending_a_group_kills_what_the_program_left_running() {
+        // A wrapper that starts a background process in its group, prints its pid and exits, as `npx` can.
+        let mut command = Command::new("/bin/sh");
+        command.stdout(Stdio::piped());
+        let script = "sleep 30 </dev/null >/dev/null 2>&1 & echo $!";
+        configure(
+            &mut command,
+            &["-c".to_string(), script.to_string()],
+            &Map::new(),
+            true,
+        );
+        let mut child = command.spawn().unwrap();
+        let group = group(&child).unwrap();
+        let mut stdout = String::new();
+        child
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_string(&mut stdout)
+            .unwrap();
+        let sleeper: i32 = stdout.trim().parse().unwrap();
+        group.wait_for_exit(&mut child).unwrap();
+        group.end();
+        assert!(child.wait().unwrap().success());
+        // The killed sleeper is an orphan; it is gone once init has reaped it.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(sleeper, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: as above.
+        assert_ne!(unsafe { libc::kill(sleeper, 0) }, 0);
+    }
+
+    #[test]
+    fn killing_a_session_kills_its_jobs_in_groups_of_their_own() {
+        // A shell with job control, as a terminal's is: its background job gets a process group of its own (bash: a
+        // POSIX `sh` may not do job control without a terminal).
+        let mut command = Command::new("bash");
+        command.stdout(Stdio::piped());
+        let script = "set -m; sleep 30 </dev/null >/dev/null 2>&1 & echo $!; wait";
+        configure(
+            &mut command,
+            &["-c".to_string(), script.to_string()],
+            &Map::new(),
+            true,
+        );
+        let mut child = command.spawn().unwrap();
+        let mut line = Vec::new();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut byte = [0u8; 1];
+        while stdout.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+            line.push(byte[0]);
+        }
+        let job: i32 = String::from_utf8(line).unwrap().trim().parse().unwrap();
+        // SAFETY: plain process queries.
+        assert_ne!(
+            unsafe { libc::getpgid(job) },
+            child.id() as i32,
+            "the job has a group of its own"
+        );
+        kill_tree(child.id());
+        let _ = child.wait();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // SAFETY: signal 0 only checks that the process exists.
+        while unsafe { libc::kill(job, 0) } == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // SAFETY: as above.
+        assert_ne!(
+            unsafe { libc::kill(job, 0) },
+            0,
+            "the job ended with its session"
+        );
+    }
 }

@@ -39,13 +39,6 @@ function describeSetDifference(expected: readonly string[], actual: readonly str
 		.join("; ");
 }
 
-export function assertExactModelIds(label: string, expected: Iterable<string>, actual: Iterable<string>): void {
-	const expectedIds = Array.from(new Set(expected)).sort();
-	const actualIds = Array.from(new Set(actual)).sort();
-	if (sameStrings(expectedIds, actualIds)) return;
-	throw new Error(`${label} model IDs do not match (${describeSetDifference(expectedIds, actualIds)})`);
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -200,6 +193,18 @@ function validateModelValue(
 			const cost = value.cost[field];
 			if (typeof cost !== "number" || !Number.isFinite(cost)) {
 				errors.push(`${label} has invalid cost.${field}`);
+			}
+		}
+	}
+	if (
+		(expectedApi === "google-generative-ai" || expectedApi === "google-vertex") &&
+		isRecord(value.thinkingLevelMap)
+	) {
+		const supported = new Set(["minimal", "low", "medium", "high", "xhigh"]);
+		for (const [level, mapped] of Object.entries(value.thinkingLevelMap)) {
+			if (level === "off" || mapped === null || mapped === undefined) continue;
+			if (typeof mapped !== "string" || !supported.has(mapped.toLowerCase())) {
+				errors.push(`${label} has unsupported Google thinkingLevelMap.${level} ${JSON.stringify(mapped)}`);
 			}
 		}
 	}

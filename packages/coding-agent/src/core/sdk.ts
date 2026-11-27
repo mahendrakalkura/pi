@@ -85,6 +85,8 @@ export interface CreateAgentSessionOptions {
 	 * These entries take exact names. Mixing them with plain entries throws.
 	 */
 	tools?: string[];
+	/** Initial declarations when the allowlist also includes tools callable only through other tools. */
+	initialActiveTools?: string[];
 	/**
 	 * Optional denylist of tool names or patterns to disable. Applies after `tools` when both are
 	 * provided, MCP tools included.
@@ -291,7 +293,9 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		: (options.tools ?? (options.noTools === "all" ? [] : undefined));
 	const excludedToolNames = options.excludeTools;
 	const isExcludedTool = excludedToolNames ? createToolNameMatcher(excludedToolNames) : undefined;
-	const initialActiveToolNames = (selectedToolNames ?? defaultToolNames).filter((name) => !isExcludedTool?.(name));
+	const initialActiveToolNames = (options.initialActiveTools ?? selectedToolNames ?? defaultToolNames).filter(
+		(name) => !isExcludedTool?.(name),
+	);
 
 	// Create convertToLlm wrapper that filters images if blockImages is enabled (defense-in-depth)
 	const convertToLlmWithBlockImages = (messages: AgentMessage[]): Message[] => {
@@ -348,8 +352,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			websocketConnectTimeoutMs: options.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs(),
 			maxRetries: options.maxRetries ?? providerRetrySettings.maxRetries,
 			maxRetryDelayMs: options.maxRetryDelayMs ?? providerRetrySettings.maxRetryDelayMs,
-			// Replaces the agent loop's default identity; read per request so telemetry changes apply at once.
-			identity: getClientIdentity(settingsManager),
+			// Replaces the agent loop's default identity.
+			identity: getClientIdentity(),
 			transformHeaders: async (headers) =>
 				headerRunner?.hasHandlers("before_provider_headers")
 					? headerRunner.emitBeforeProviderHeaders(headers)
@@ -466,6 +470,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		usesDefaultTools: (options.tools === undefined || toolModifiers !== undefined) && !options.noTools,
 		defaultToolModifiers: toolModifiers,
 		allowedToolNames,
+		allowedAutoActivationNames: options.initialActiveTools,
 		excludedToolNames,
 		extensionRunnerRef,
 		sessionStartEvent: options.sessionStartEvent,

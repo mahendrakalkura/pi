@@ -14,6 +14,7 @@ import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/t
 import type { BashToolDetails } from "../bash.ts";
 import { getTextOutput, invalidArgText, startToolTimer, str, toolTimerText } from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
+import { declarePlainRenderers } from "./highlighting.ts";
 
 const BASH_PREVIEW_LINES = 5;
 export const BASH_UPDATE_THROTTLE_MS = 100;
@@ -39,26 +40,28 @@ function rebuildBashResultRenderComponent(
 	let output = getTextOutput(result as any, showImages).trim();
 	const truncation = result.details?.truncation;
 	const fullOutputPath = result.details?.fullOutputPath;
-	if (!options.isPartial && truncation?.truncated && fullOutputPath && output.endsWith("]")) {
+	const fullOutputError = result.details?.fullOutputError;
+	// The model's footer names the file or why it could not be saved; the warning below says the same.
+	const footerMarker = fullOutputPath ?? fullOutputError;
+	if (!options.isPartial && truncation?.truncated && footerMarker && output.endsWith("]")) {
 		const footerStart = output.lastIndexOf("\n\n[");
-		if (footerStart !== -1 && output.slice(footerStart).includes(fullOutputPath)) {
+		if (footerStart !== -1 && output.slice(footerStart).includes(footerMarker)) {
 			output = output.slice(0, footerStart).trimEnd();
 		}
 	}
 
 	if (output) {
-		const styledOutput = output
-			.split("\n")
-			.map((line) => theme.fg("toolOutput", line))
-			.join("\n");
-
+		const styleLine = (line: string) => theme.fg("toolOutput", line);
 		if (options.expanded) {
+			const styledOutput = output.split("\n").map(styleLine).join("\n");
 			component.addChild(new Text(`\n${styledOutput}`, 0, 0));
 		} else {
+			// (Collapsed: only the lines shown are styled and wrapped.)
 			component.addChild(new Spacer(1));
 			component.addChild(
 				new VisualLinePreview({
-					text: styledOutput,
+					lines: output.split("\n"),
+					styleLine,
 					maxVisualLines: BASH_PREVIEW_LINES,
 					keep: "end",
 					formatHint: (hidden) =>
@@ -69,10 +72,12 @@ function rebuildBashResultRenderComponent(
 		}
 	}
 
-	if (truncation?.truncated || fullOutputPath) {
+	if (truncation?.truncated || fullOutputPath || fullOutputError) {
 		const warnings: string[] = [];
 		if (fullOutputPath) {
 			warnings.push(`Full output: ${fullOutputPath}`);
+		} else if (fullOutputError) {
+			warnings.push(`Could not save the full output: ${fullOutputError}`);
 		}
 		if (truncation?.truncated) {
 			if (truncation.truncatedBy === "lines") {
@@ -91,7 +96,7 @@ function rebuildBashResultRenderComponent(
 
 /** Shell renderers are shared by bash and powershell, which differ only in the prompt they display. */
 export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> {
-	return {
+	const renderers: Pick<ToolDefinition<any, any>, "renderCall" | "renderResult"> = {
 		renderCall(args, _theme, context) {
 			startToolTimer(context);
 			const text = (context.lastComponent as Text | undefined) ?? new Text("", 0, 0);
@@ -106,4 +111,6 @@ export function createShellRenderers(prompt: string): Pick<ToolDefinition<any, a
 			return component;
 		},
 	};
+	declarePlainRenderers(renderers);
+	return renderers;
 }

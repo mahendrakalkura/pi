@@ -9,6 +9,7 @@ import type {
 	ClassifierContext,
 	ImageContent,
 	ImagesContext,
+	ImagesOptions,
 	ModelType,
 	ModelTypeMap,
 	TextContent,
@@ -27,7 +28,7 @@ import {
 import { getCodemodeWorkerSpecifier, getQuickJSWasmPath } from "../../config.ts";
 import type { ExtensionToolContext, ToolNamespace } from "../../core/extensions/types.ts";
 import type { SessionEntry } from "../../core/session-manager.ts";
-import { formatSize } from "../../core/tools/truncate.ts";
+import { formatSize, sliceHead, sliceTail } from "../../core/tools/truncate.ts";
 import { combineUsage } from "../../core/usage-totals.ts";
 import { writeOutputFile } from "../../utils/output-files.ts";
 import { Bm25Ranker, createToolSearchDocument, DEFAULT_TOOL_SEARCH_LIMIT } from "../tool-search/tool.ts";
@@ -112,7 +113,7 @@ function releaseCodemodeWorker(): void {
 const MODEL_TYPES: ReadonlySet<string> = new Set<ModelType>(["chat", "image", "classifier"]);
 
 function truncateText(text: string, maxChars: number): string {
-	return text.length > maxChars ? `${text.slice(0, maxChars - 3)}...` : text;
+	return text.length > maxChars ? `${sliceHead(text, maxChars - 3)}...` : text;
 }
 
 function previewArgs(args: unknown): string {
@@ -253,6 +254,39 @@ function checkImagesContext(context: unknown): ImagesContext {
 		throw fail(`context.input[${index}] must be a text or image block, got ${describeValue(block)}`);
 	});
 	return context as unknown as ImagesContext;
+}
+
+type CodemodeImagesOptions = Pick<ImagesOptions, "aspectRatio" | "size">;
+
+const IMAGES_OPTION_KEYS = new Set(["aspectRatio", "size"]);
+
+/** Validate optional generation options from a script; unknown keys throw, so typos and request fields such as `apiKey` never pass silently. */
+function checkImagesOptions(options: unknown): CodemodeImagesOptions | undefined {
+	if (options === undefined || options === null) return undefined;
+	const fail = (problem: string) =>
+		new Error(
+			`models.generateImages() ${problem}. Expected options: { aspectRatio?, size? }. See "Generate images" in ${CODEMODE_DOCS_PATH}.`,
+		);
+	if (typeof options !== "object" || Array.isArray(options)) {
+		throw fail(`expects an options object as its third argument, got ${describeValue(options)}`);
+	}
+	const record = options as Record<string, unknown>;
+	const unknownKey = Object.keys(record).find((key) => !IMAGES_OPTION_KEYS.has(key));
+	if (unknownKey !== undefined) throw fail(`does not accept options.${unknownKey}`);
+	const checked: CodemodeImagesOptions = {};
+	if (record.aspectRatio !== undefined) {
+		if (typeof record.aspectRatio !== "string" || record.aspectRatio.trim().length === 0) {
+			throw fail(`options.aspectRatio must be a non-empty string, got ${describeValue(record.aspectRatio)}`);
+		}
+		checked.aspectRatio = record.aspectRatio.trim();
+	}
+	if (record.size !== undefined) {
+		if (typeof record.size !== "string" || record.size.trim().length === 0) {
+			throw fail(`options.size must be a non-empty string, got ${describeValue(record.size)}`);
+		}
+		checked.size = record.size.trim();
+	}
+	return Object.keys(checked).length > 0 ? checked : undefined;
 }
 
 /** The fields of `ClassifierResult` and `AssistantImages` that a nested call row reports. */
@@ -457,8 +491,8 @@ async function truncateOutput(
 	const headChars = Math.floor(budget / 2);
 	const tailChars = budget - headChars;
 	const removed = combined.length - headChars - tailChars;
-	const head = combined.slice(0, headChars);
-	const tail = tailChars > 0 ? combined.slice(-tailChars) : "";
+	const head = sliceHead(combined, headChars);
+	const tail = sliceTail(combined, tailChars);
 	let text = `Warning: truncated output (original token count: ${Math.ceil(combined.length / CHARS_PER_TOKEN)})\nTotal output lines: ${combined.split("\n").length}\n\n${head}…${Math.ceil(removed / CHARS_PER_TOKEN)} tokens truncated…${tail}`;
 	const spilled = await spillOutput(combined);
 	text +=
@@ -833,18 +867,20 @@ function createModelGlobals(
 			runModelCall("models.classify", "classifier", args as unknown[], checkClassifierContext, (resolved, context) =>
 				models.classify(resolved, context, { signal }),
 			),
-		"models.generateImages": (args, { signal }) =>
-			runModelCall(
+		"models.generateImages": (args, { signal }) => {
+			const [, , rawOptions] = args as unknown[];
+			return runModelCall(
 				"models.generateImages",
 				"image",
 				args as unknown[],
-				checkImagesContext,
-				async (resolved, context) => {
-					const result = await models.generateImages(resolved, context, { signal });
+				(context) => ({ context: checkImagesContext(context), options: checkImagesOptions(rawOptions) }),
+				async (resolved, { context, options }) => {
+					const result = await models.generateImages(resolved, context, { ...options, signal });
 					addGeneratedImages(result.output.filter((block) => block.type === "image").length);
 					return result;
 				},
-			),
+			);
+		},
 	};
 	return Object.entries(implementations).map(([name, execute]) => ({ name, spread: true, execute }));
 }

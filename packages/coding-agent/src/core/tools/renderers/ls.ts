@@ -13,6 +13,7 @@ import type { ToolDefinition, ToolRenderResultOptions } from "../../extensions/t
 import type { LsToolDetails } from "../ls.ts";
 import { getTextOutput, renderToolPath, str } from "../render-utils.ts";
 import { DEFAULT_MAX_BYTES, formatSize } from "../truncate.ts";
+import { declarePlainRenderers } from "./highlighting.ts";
 
 function formatLsCall(args: { path?: string; limit?: number } | undefined, theme: Theme, cwd: string): string {
 	const limit = args?.limit;
@@ -68,3 +69,5 @@ export const lsRenderers: Pick<ToolDefinition<any, any>, "renderCall" | "renderR
 		return text;
 	},
 };
+
+declarePlainRenderers(lsRenderers);

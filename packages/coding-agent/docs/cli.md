@@ -12,6 +12,8 @@ pi uninstall <source> [options]
 pi update [target] [options]
 pi list
 pi config [options]
+pi auth login <provider> [--api-key] [--no-browser]
+pi auth logout <provider>
 pi auth <check|print-api-key|print-bearer-token> [options]
 pi mcp <add|remove|list|login|logout> [options]
 ```
@@ -95,6 +97,8 @@ See [Sessions and Context](sessions.md) for resuming, forking, naming, and stori
   Forks a session, chosen by file path or full/partial ID, into a new session in the current directory.
 - `--session-dir <dir>`<br>
   Overrides storage and lookup. It takes precedence over `PI_CODING_AGENT_SESSION_DIR` and the `sessionDir` setting.
+- `--agent-dir <dir>`<br>
+  Uses `<dir>` as the config directory (settings, auth, models, resources, and the default session storage) instead of `~/.pi/agent`. It takes precedence over `PI_CODING_AGENT_DIR` and is passed on to processes Pi starts. Works with subcommands too, such as `pi --agent-dir <dir> install <source>`.
 - `--no-session`<br>
   Uses an in-memory session that is not persisted.
 - `-n`, `--name <name>`<br>
@@ -171,7 +175,7 @@ This keeps `read`, `bash`, `edit`, and `write` and adds `codemode`. For one invo
 pi --tools +codemode
 ```
 
-Codemode is useful without MCP: scripts can run several tool calls in parallel, filter large output before it reaches the model, call classifier models such as TypeSafe's Jev through `models.classify()` (see [Classifier models](models.md#use-classifier-models)), and generate images through `models.generateImages()` (see [Image models](models.md#use-image-models)).
+Codemode is useful without MCP: scripts can run several tool calls in parallel, filter large output before it reaches the model, call decision models such as TypeSafe's Jev through `models.classify()` (see [Use decision models](models.md#use-decision-models)), and generate images through `models.generateImages()` (see [Use image models](models.md#use-image-models)).
 
 ### How codemode works
 
@@ -302,11 +306,22 @@ export PI_SELF_UPDATE_COMMAND="mise use -g npm:{packageName}@{version}"
 
 ## Credential commands
 
+`pi auth login <provider>` logs in to a provider in the terminal and exits, without starting a session. It signs in with an account and opens the browser, like `/login <provider>`. Providers without account sign-in ask for an API key. Logging in to Radius also adds the Radius MCP server to `~/.pi/agent/mcp.json` when no global server uses that login yet. It requires an interactive terminal.
+
+| Option | Description |
+|---|---|
+| `--api-key` | Save an API key instead of signing in with an account; the key is read without echoing it |
+| `--no-browser` | Do not open a browser; use the provider's other sign-in method, such as a device code, for example over SSH. Asks when there are several. Not allowed with `--api-key` |
+
+`pi auth logout <provider>` removes the credentials that `pi auth login` or `/login` stored, like `/logout`. Environment variables and `models.json` config are unchanged. It exits with status `0` when nothing is stored, so it is safe to repeat.
+
 ```sh
+pi auth login radius
+pi auth logout radius
 pi auth check --provider openai --json
 ```
 
-Authentication commands require `--provider <provider>` or `--model <model>`. See [Providers](providers.md) for supported methods.
+The other authentication commands require `--provider <provider>` or `--model <model>`. See [Providers](providers.md) for supported methods.
 
 | Command | Description |
 |---|---|

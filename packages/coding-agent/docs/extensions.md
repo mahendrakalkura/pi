@@ -355,7 +355,7 @@ The model request runs these hooks in order:
 2. `context_with_system` (can modify the full transcript)
 3. `before_provider_headers` (can mutate headers)
 4. `before_provider_request` (can inspect or replace the payload)
-5. `after_provider_response` (status and headers, before the stream is consumed)
+5. `after_provider_response` (status and headers of each HTTP response, including errors and retried attempts; successful responses fire before their stream is consumed)
 6. `provider_stream_event` (raw parsed stream events) and `message_start` / `message_update` / `message_end` for the assistant message
 
 A tool call that executes runs these hooks in order:
@@ -878,9 +878,11 @@ pi.on("before_provider_request", (event, ctx) => {
 
 This is mainly useful for debugging provider serialization and cache behavior.
 
+The payload is the full request. Providers that continue from a previous response (OpenAI Codex over WebSocket, Anthropic message threads) may send only the part that is new since the previous request.
+
 #### after_provider_response
 
-Fired after an HTTP response is received and before its stream body is consumed. Handlers run in extension load order.
+Fired for each HTTP response the provider receives, including error responses (4xx/5xx) and responses to retried attempts, so one request can fire it more than once. Successful responses fire before their stream body is consumed. Handlers run in extension load order.
 
 ```typescript
 pi.on("after_provider_response", (event, ctx) => {
@@ -892,7 +894,7 @@ pi.on("after_provider_response", (event, ctx) => {
 });
 ```
 
-Header availability depends on provider and transport. Providers that abstract HTTP responses may not expose headers.
+Coverage depends on provider and transport. Some providers report empty headers or only some responses. It does not fire for errors that arrive inside an already started SSE stream, or for WebSocket transports, including a WebSocket connection that fails to open.
 
 #### provider_stream_event
 
@@ -1223,7 +1225,7 @@ Use `ctx.modelRegistry.streamSimple(model, context, options)` for provider-neutr
 
 `streamSimple()` returns an `AssistantMessageEventStream`. Iterate it for response events and await `.result()` for the final message. Setup failures produce error events and error results.
 
-For non-chat models, `findOfType()`, `getModelsOfType()`, `getAvailableOfType()`, and `getModelOfType()` look up image and classifier models, and `classify()` and `generateImages()` call them. See [Use classifier models](models.md#use-classifier-models) and [Use image models](models.md#use-image-models).
+For non-chat models, `findOfType()`, `getModelsOfType()`, `getAvailableOfType()`, and `getModelOfType()` look up image and decision (`"classifier"`) models, and `classify()` and `generateImages()` call them. See [Use decision models](models.md#use-decision-models) and [Use image models](models.md#use-image-models).
 
 ### ctx.signal
 
@@ -1259,7 +1261,7 @@ Control flow helpers. `ctx.isIdle()` is false while Pi is processing an agent ru
 Request a graceful shutdown of pi.
 
 - **Interactive mode:** Deferred until the agent becomes idle (after processing all queued steering and follow-up messages).
-- **RPC mode:** Deferred until the next idle state (after completing the current command response, when waiting for the next command).
+- **RPC mode:** Runs right away when the session is idle and no command is being handled. Otherwise deferred until the current command finishes (including its response) or the active run settles. (A request made while an extension-started compaction is running waits for the next command or run to finish.)
 - **Print mode:** No-op. The process exits automatically when all prompts are processed.
 
 Emits `session_shutdown` event to all extensions before exiting. Available in all contexts (event handlers, tools, commands, shortcuts).
@@ -1318,6 +1320,8 @@ pi.on("before_agent_start", (event, ctx) => {
 ## ExtensionCommandContext
 
 Command handlers receive `ExtensionCommandContext`, which extends `ExtensionContext` with session control methods. These are only available in commands because they can deadlock if called from event handlers.
+
+Command handlers can also call tools listed in `ctx.tools` with `await ctx.executeTool(name, args, { signal, onUpdate })`. Command calls use the same argument validation, `tool_call` and `tool_result` hooks, and callable-tool exposure rules as nested tool calls. Their results return to the command without adding transcript entries, even in print mode.
 
 ### ctx.getSystemPromptOptions()
 
@@ -1804,16 +1808,25 @@ mode and would not execute if sent via `prompt`.
 
 Register a custom TUI renderer for custom messages with your `customType`. Custom messages are created with `pi.sendMessage()` and participate in LLM context. See [Custom UI](#custom-ui).
 
-### pi.registerMarkdownTransformer(transformer)
+### pi.registerMarkdownTransformer(transformer, options?)
 
-Register a transformer for the Markdown in normal user text, assistant text, and thinking blocks. Transformers run in extension load order, and each transformer receives the Markdown returned by the previous transformer. After the chain finishes, Pi renders the transformed content with its built-in renderer.
+Register a transformer for Markdown before Pi renders it in interactive mode. Transformers run in extension load order, and each transformer receives the Markdown returned by the previous transformer. After the chain finishes, Pi renders the transformed content with its built-in renderer.
+
+By default a transformer runs on normal user text, assistant text, and thinking blocks. `options.messageTypes` lists the surfaces it runs on instead:
+
+| `messageType` | Surface |
+|---------------|---------|
+| `"user"`, `"assistant"`, `"assistant-thinking"` | Transcript messages (default) |
+| `"custom"` | Custom messages from `pi.sendMessage()` without a registered message renderer, and expanded skill blocks (their content, without Pi's header) |
+| `"summary"` | Expanded branch and compaction summaries (the summary, without Pi's header) |
+| `"changelog"` | Pi's changelog ("What's New" at startup and `/changelog`), the startup "Extension Updates" notice, and the release note of the "Update Available" notice |
 
 The transformer receives the Markdown string and a context with:
 
-- `messageType` — `"user"`, `"assistant"`, or `"assistant-thinking"`
-- `isStreaming` — `true` for partial assistant updates; `false` for user, finalized assistant, and restored messages
+- `messageType` — one of the surfaces above
+- `isStreaming` — `true` for partial assistant updates; `false` otherwise
 - `availableWidth` — exact terminal columns available for the transformed Markdown content
-- `messageId`, `timestamp` — session-entry ID and ISO timestamp when rendering from persisted session entries; `undefined` for live messages
+- `messageId`, `timestamp` — session-entry ID and ISO timestamp when rendering from persisted session entries; `undefined` for live messages and notices
 
 Return the transformed Markdown:
 
@@ -1822,9 +1835,14 @@ pi.registerMarkdownTransformer((markdown, { messageType, isStreaming }) => {
   if (isStreaming || messageType === "assistant-thinking") return markdown;
   return markdown.replaceAll("-->", "→");
 });
+
+// Show :warning: shortcodes in changelogs as a symbol.
+pi.registerMarkdownTransformer((markdown) => markdown.replaceAll(":warning:", "⚠"), {
+  messageTypes: ["changelog"],
+});
 ```
 
-If a transformer throws, Pi keeps the Markdown produced so far and continues with the next transformer. The hook is display-only: the original message remains unchanged in the session and model context. It runs for new user messages, assistant streaming updates, restored session messages, and terminal width changes, so transformers should remain synchronous and inexpensive.
+If a transformer throws, Pi keeps the Markdown produced so far and continues with the next transformer. The hook is display-only: the original message remains unchanged in the session and model context. It runs for new messages, assistant streaming updates, restored session messages, and terminal width changes, so transformers should remain synchronous and inexpensive. An extension has one transformer; registering again replaces it.
 
 ### pi.registerEntryRenderer(customType, renderer)
 
@@ -1887,7 +1905,7 @@ const result = await pi.exec("git", ["status"], { signal, timeout: 5000 });
 // result.stdout, result.stderr, result.code, result.killed, result.truncated
 ```
 
-Options: `signal` and `timeout` terminate the command, `cwd` sets the working directory, and `maxBuffer` limits stdout and stderr combined (default 256 MiB). When output exceeds `maxBuffer`, pi terminates the command and returns the output up to the limit with `truncated: true`, `killed: true`, and a nonzero `code`. `killed` is true whenever pi terminated the command: timeout, abort, or `maxBuffer`. A command that ignores SIGTERM gets SIGKILL after 5 seconds.
+Options: `signal` and `timeout` terminate the command, `cwd` sets the working directory, and `maxBuffer` limits stdout and stderr combined (default 256 MiB). When output exceeds `maxBuffer`, pi terminates the command and returns the output up to the limit with `truncated: true`, `killed: true`, and a nonzero `code`. `killed` is true whenever pi terminated the command: timeout, abort, or `maxBuffer`. A command that ignores SIGTERM gets SIGKILL after 5 seconds. A command terminated by a signal, by pi or otherwise, reports 128 + the signal number as `code`, like a shell: 143 for SIGTERM, 137 for SIGKILL.
 
 ### pi.getActiveTools() / pi.getAllTools() / pi.setActiveTools(names)
 
@@ -1920,6 +1938,14 @@ Typical `sourceInfo` values:
 - extension source metadata for tools registered by extensions
 
 `pi.setActiveTools()` ignores unknown and `hidden` tools. Tools with `codemode` or `deferred` exposure stay callable from codemode scripts whether active or not.
+
+### pi.getCallableToolNames()
+
+`pi.getCallableToolNames()` returns the current session's tool names callable through `ctx.executeTool()`, including tools with `codemode` or `deferred` exposure. Use it with `pi.getActiveTools()` when copying a session's tool selection. Like `pi.getActiveTools()`, this method requires a bound session.
+
+### pi.isToolAllowed(name)
+
+`pi.isToolAllowed(name)` checks the session's tool-name filter, including `--tools` and `--exclude-tools`. The check works during `session_start`, before the named tool registers. It does not register or activate a tool, and a `true` result does not guarantee the tool exists, is active, or will pass execution hooks. Like `pi.getActiveTools()`, this method throws if called during extension loading before the session binds.
 
 ### pi.setModel(model)
 
@@ -1973,7 +1999,7 @@ import { createProvider, openAICompletionsApi } from "@earendil-works/pi-ai/comp
 const provider = createProvider({
   id: "local-server",
   name: "Local Server",
-  baseUrl: "http://localhost:8080/v1",
+  baseUrl: "http://localhost:9931/v1",
   auth: {
     apiKey: {
       name: "Local server setup",
@@ -2017,11 +2043,11 @@ pi.registerProvider("my-proxy", {
 
 // Register a live llama.cpp catalog without persisting discovered models
 pi.registerProvider("llama.cpp", {
-  baseUrl: "http://localhost:8080/v1",
+  baseUrl: "http://localhost:9931/v1",
   apiKey: "local",
   api: "openai-completions",
   async refreshModels({ signal }) {
-    const response = await fetch("http://localhost:8080/v1/models", { signal });
+    const response = await fetch("http://localhost:9931/v1/models", { signal });
     const { data } = (await response.json()) as { data: Array<{ id: string }> };
     return data.map(({ id }) => ({
       id,
@@ -2398,9 +2424,13 @@ pi.registerTool({
 });
 ```
 
+`ReadOperations.createReadStream` is optional. When it returns the file as an async iterable of chunks (a Node `Readable` works), `read` keeps only the lines it shows in memory, so large files can be read with `offset`/`limit`; without it, `read` loads the whole file through `readFile`.
+
 The `create*ToolDefinition()` factories, such as `createReadToolDefinition()`, return complete tool definitions, including the built-in prompt snippet and guidelines, for the same purpose. Rendering does not need copying: a tool registered under a built-in name inherits the built-in renderer for each slot it leaves out (see [Overriding Built-in Tools](#overriding-built-in-tools)).
 
 **Operations interfaces:** `ReadOperations`, `WriteOperations`, `EditOperations`, `BashOperations`, `PowerShellOperations`, `LsOperations`, `GrepOperations`, `FindOperations`
+
+`GrepOperations` only covers the directory check: grep always runs the local `rg`. To search a remote system, override grep's `execute()` instead, as the [Gondolin example](../examples/extensions/gondolin/index.ts) does.
 
 For `user_bash`, extensions can reuse Pi's local shell backend via `createLocalBashOperations()` (or `createLocalPowerShellOperations()`) instead of reimplementing local process spawning, shell resolution, and process-tree termination.
 
@@ -2867,6 +2897,16 @@ if (confirmed) {
 ```
 
 See [examples/extensions/timed-confirm.ts](../examples/extensions/timed-confirm.ts) for complete examples.
+
+#### Program Status Kind
+
+While a dialog waits, terminals that support [program status](terminal-setup.md#program-status) show pi as blocked, with the first line of the title as the message. `confirm()` reports `"permission"`, `select()` and `input()` report `"question"`. Pass `blockedKind` when the dialog asks for something else, for example a select that approves an action:
+
+```typescript
+const choice = await ctx.ui.select("Deploy to production?", ["Deploy", "Deploy and tag", "Cancel"], {
+  blockedKind: "permission", // "permission" | "question" | "auth"
+});
+```
 
 ### Widgets, Status, and Footer
 

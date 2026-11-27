@@ -608,6 +608,21 @@ describe("StdinBuffer", () => {
 			assert.deepStrictEqual(emittedSequences, []);
 		});
 
+		it("should find an end marker split across chunks at any position", () => {
+			const input = "\x1b[200~ab\x1b[201~c";
+			for (let chunkSize = 1; chunkSize <= input.length; chunkSize++) {
+				buffer.destroy();
+				buffer = new StdinBuffer({ timeout: 10 });
+				const pastes: string[] = [];
+				const sequences: string[] = [];
+				buffer.on("paste", (data) => pastes.push(data));
+				buffer.on("data", (sequence) => sequences.push(sequence));
+				for (let i = 0; i < input.length; i += chunkSize) buffer.process(input.slice(i, i + chunkSize));
+				assert.deepStrictEqual(pastes, ["ab"], `chunk size ${chunkSize}`);
+				assert.deepStrictEqual(sequences, ["c"], `chunk size ${chunkSize}`);
+			}
+		});
+
 		it("should handle paste with input before and after", () => {
 			processInput("a");
 			processInput("\x1b[200~pasted\x1b[201~");
@@ -629,6 +644,29 @@ describe("StdinBuffer", () => {
 
 			assert.deepStrictEqual(emittedPaste, ["Hello 世界 🎉"]);
 			assert.deepStrictEqual(emittedSequences, []);
+		});
+
+		it("should find the paste end split across chunks at every position", () => {
+			const end = "\x1b[201~";
+			for (let cut = 1; cut < end.length; cut++) {
+				emittedPaste = [];
+				emittedSequences = [];
+				processInput("\x1b[200~abc");
+				processInput(`def${end.slice(0, cut)}`);
+				assert.deepStrictEqual(emittedPaste, [], `cut ${cut}`);
+				processInput(`${end.slice(cut)}x`);
+				assert.deepStrictEqual(emittedPaste, ["abcdef"], `cut ${cut}`);
+				assert.deepStrictEqual(emittedSequences, ["x"], `cut ${cut}`);
+			}
+		});
+
+		it("should keep a large paste that arrives in many small chunks", () => {
+			const chunk = "0123456789abcdef".repeat(256);
+			processInput("\x1b[200~");
+			for (let i = 0; i < 512; i++) processInput(chunk);
+			processInput("\x1b[201~");
+			assert.strictEqual(emittedPaste.length, 1);
+			assert.strictEqual(emittedPaste[0], chunk.repeat(512));
 		});
 	});
 
