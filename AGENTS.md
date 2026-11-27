@@ -251,6 +251,8 @@ env -i PATH="$PATH" HOME="$HOME" mise exec node@24 -- bash ./test.sh
 # test.sh must not see the provider API keys the Fish shell exports: with keys present, Pi's
 # test harness sees hundreds of available models and the selector tests assert on a short list.
 # test.sh passes in full under fish, the account shell on both machines; any failure stops the sync.
+# Chord's `test/host/route-admission.test.ts` fails on Node 24.21.0 and passes on 24.22.3 (2026-11-27 sync).
+# `mise exec node@24` runs the newest installed 24.x, so run `mise install node@24` before the gate.
 
 # 4. Extension packages, then the binary with the dotfiles extensions compiled in.
 (cd packages/coding-agent/bundle && mise exec node@24 -- npm install --no-audit --no-fund)
